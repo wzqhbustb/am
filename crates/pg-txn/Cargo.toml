@@ -1,0 +1,39 @@
+[package]
+name = "pg-txn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust transaction layer — XID, CLOG, Snapshot, Visibility Oracle, Lock Manager"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+
+# concurrency primitives
+parking_lot = "0.12"
+
+# Stage P resolved the wait/wake choice: parking_lot::Condvar (sync engine;
+# no tokio runtime in the storage/txn layers).
+
+# error types
+thiserror = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+# inline small collections (Snapshot.xip, §16 approved)
+smallvec = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Snapshot.xip construction in integration tests
+smallvec = "1"
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "clog_buffer_hit_rate"
+harness = false

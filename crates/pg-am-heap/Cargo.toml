@@ -1,0 +1,56 @@
+[package]
+name = "pg-am-heap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust heap access method — slotted page, tuple encoding, TOAST"
+
+[dependencies]
+# pg-storage: page format + physical types, buffer pool, WAL, redo dispatch.
+pg-storage = { path = "../pg-storage" }
+# pg-txn (Stage I): Snapshot + visibility for heap scan. No cycle — pg-txn
+# depends only on pg-storage, and this crate does not expose its types back to
+# pg-txn (is_visible takes primitive TxnId fields).
+pg-txn = { path = "../pg-txn" }
+
+# error types
+thiserror = "2"
+
+# logging / tracing (warnings on skipped corrupt tuples in vacuum scans)
+tracing = "0.1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+# t_trace_id / Uuid column values (tech-selection §16 dependency list)
+uuid = "1"
+
+[dev-dependencies]
+# property-based testing
+# Pinned to ~1.4 to avoid proptest 1.5+ -> rand 0.9 -> getrandom 0.3 -> wasip2,
+# which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
+proptest = "~1.4"
+
+# integration tests drive a real StorageEngine on a temp data dir
+tempfile = "3"
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "tuple_ops"
+harness = false
+
+[[bench]]
+name = "heap_insert"
+harness = false
+
+[[bench]]
+name = "txn_commit_concurrent"
+harness = false
+
+[[bench]]
+name = "heap_mixed"
+harness = false

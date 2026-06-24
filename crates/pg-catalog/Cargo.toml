@@ -1,0 +1,33 @@
+[package]
+name = "pg-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust catalog layer — system tables, bootstrap, AccessMethod traits"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+pg-txn = { path = "../pg-txn" }
+# Stage H addition to the tech-selection §一 dependency graph: bootstrap
+# writes system-table content as heap tuples, which requires the tuple
+# codec and slotted-page operations. No cycle — pg-am-heap depends only on
+# pg-storage.
+pg-am-heap = { path = "../pg-am-heap" }
+
+# error types
+thiserror = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+# logging / tracing (self-healing path logs the first validation failure)
+tracing = "0.1"
+
+[dev-dependencies]
+# For serde round-trip tests
+bincode = { version = "2.0.1", features = ["serde"] }
+
+# temporary data directories for bootstrap integration tests
+tempfile = "3"
