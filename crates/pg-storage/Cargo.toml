@@ -1,0 +1,79 @@
+[package]
+name = "pg-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust storage engine — Phase 1 M1 (Page, WAL, BufferPool, LSN)"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+
+# concurrency primitives
+parking_lot = "0.12"
+
+# zero-copy buffers
+bytes = "1"
+
+# checksumming
+crc32fast = "1.3"
+
+# error types
+thiserror = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+# NOTE: bincode 2.x API differs from 1.x; use bincode::serde::encode_to_vec / decode_from_slice
+bincode = { version = "2.0.1", features = ["serde"] }
+
+# logging / tracing
+tracing = "0.1"
+
+# deterministic concurrency modeling (Stage Q); only enabled via the `loom`
+# feature, which also turns on `--cfg loom` for this crate (see build.rs)
+loom = { version = "0.7", optional = true }
+
+[features]
+default = []
+page-size-16k = []
+# Model-test build: swap parking_lot/std sync primitives for loom's
+# instrumented ones (crate::sync) so exhaustive interleaving models can drive
+# the real latch choreography. Test-only; never enable in production builds.
+loom = ["dep:loom"]
+
+[dev-dependencies]
+# property-based testing
+# Pinned to ~1.4 to avoid proptest 1.5+ -> rand 0.9 -> getrandom 0.3 -> wasip2,
+# which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
+proptest = "~1.4"
+
+# temp directories for tests
+tempfile = "3"
+
+# benchmarks (added in Stage K)
+criterion = "0.5"
+
+# tracing subscriber for tests / examples
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "wal_group_commit"
+harness = false
+
+[[bench]]
+name = "buffer_pool_random_read"
+harness = false
+
+[[bench]]
+name = "page_allocator"
+harness = false
+
+[[bench]]
+name = "freelist_crc"
+harness = false
+
+[[bench]]
+name = "buffer_pool_concurrent_flush"
+harness = false

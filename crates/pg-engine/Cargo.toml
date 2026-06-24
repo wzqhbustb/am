@@ -1,0 +1,56 @@
+[package]
+name = "pg-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust engine — top-level assembly of storage, txn, catalog, and AMs"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+pg-txn = { path = "../pg-txn" }
+pg-catalog = { path = "../pg-catalog" }
+pg-am-heap = { path = "../pg-am-heap" }
+pg-am-btree = { path = "../pg-am-btree" }
+
+# error types
+thiserror = "2"
+
+# logging / tracing (warnings on skipped half-created catalog entries and
+# best-effort abort failures)
+tracing = "0.1"
+
+# poisoning-free Mutex/RwLock (registry, ddl_lock, commit barrier)
+parking_lot = "0.12"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# integration tests drive a real engine on a temp data dir
+tempfile = "3"
+
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "m2a_100_threads"
+harness = false
+
+[[bench]]
+name = "m2b_perf"
+harness = false
+
+[[bench]]
+name = "m2c_locks"
+harness = false
+
+[[bench]]
+name = "m2c_btree_tps"
+harness = false
+
+[[bench]]
+name = "m2c_100_conn"
+harness = false

@@ -1,0 +1,37 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test data
+/pg_rust_data/
+/tmp/
+
+# Reference repositories (not part of pg_rust source tree)
+/supabase/
+/neon/
+/postgres/
+/duckdb/
+
+# AI tool session data and extracted notes (not part of pg_rust source tree)
+.qoder/
+.extracted_data_*.txt
+
+# Research/process artifacts (not part of pg_rust source tree)
+ROADMAP-changes.md
+architecture-multimodal-unified-kernel.md
+pdf-2.1.2-agent-native-database-pg_rust.md
+pg_rust0706.pdf
+rust-rewrite-postgres-agent-native-2026-06-10.md
+
+# We commit Cargo.lock for the binary workspace, so do not ignore it.

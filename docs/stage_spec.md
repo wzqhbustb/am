@@ -1,0 +1,718 @@
+# Stage Spec — 各阶段实现规格与 PG 对照
+
+> 记录每个 Stage 的交付内容、设计决策理由、以及与 PostgreSQL 的取舍。
+> 本文档与 `docs/phase1-m2-tech-selection.md`（设计选型）、`docs/phase1-m2-coding-plan.md`（编码计划）配套：选型文档记录"打算怎么做"，本文档记录"实际怎么做的"。
+
+---
+
+## Stage L：Snapshot + curcid + Disk ClogBuffer + VisibilityOracle
+
+**状态**：✅ 完成（M2b，commit `ad0395a`）
+**工期**：预估 7–10 天
+**验收**：§7.2 六用例 oracle 测试 7/7；ClogBuffer 集成测试 13/13；TP 负载 8 帧命中率 ≥95%（criterion）
+
+### 交付内容
+
+1. **Snapshot（`pg-txn/snapshot.rs`）**
+   - §7.1 全字段：`xmin / xmax / xip`（SmallVec 32 内联槽）/ `current_xid` / `curcid`
+   - 纯 XID 判定，无 LSN 参与（v2 修订 P2-8 移除 v1 的 `snapshot_lsn`）
+   - `TxnManager::snapshot()` 在同一把 active-set 锁内同读 XID 时钟与活跃集合，`xmin <= xip[i] < xmax` 结构不变式由构造保证
+
+2. **Disk ClogBuffer（`clog_buffer.rs` + `clog_file.rs`）**
+   - 段文件 `clog/clog-{segment:08}.log`，128 MiB/段 = 2.68 亿 XID；首次 touch 稀疏预分配，未触碰区域读零即 `InProgress`，无需存在性检查
+   - 4-bit/XID（高 nibble = 偶数 XID）：`0=InProgress / 1=Committed / 2=Aborted / 3=SubCommitted`（M3 保留）
+   - SLRU：8 KiB 页 × N 帧 clock-sweep（默认 8 帧 = 12.8 万 XID 窗口，可配 [4, 1024]）；第一轮只逐干净帧，脏帧给第二次机会，整圈无解才带写回逐脏帧
+   - 持久性（§6.4 / v2.3-21）：`set_state` 只标脏；驱逐写回**不 fsync**；唯一 fsync 点是 checkpoint Begin/End 之间的 `flush_dirty()`（`ClogFlush` trait 钩子）；`unsynced_segments` 兜底"驱逐写回但从未 fsync"的段（L 评审 P1 修复）
+   - 崩溃丢失的 bit 由 `TxnCommit/TxnAbort` WAL redo 幂等重建
+   - 单把 `RwLock` 护全部帧（"正确但粗"，分片是 Phase 7b）；自带 hits/misses 可观测量
+
+3. **VisibilityOracle（`visibility.rs`）**
+   - `Visibility` 三态（`Visible / Invisible / Uncertain`）；`Uncertain` 为 M2c 行锁等待预留，M2b 永不返回
+   - `PgVisibilityOracle` 实现 §7.2 全判定**含 curcid 分支**——但 L 时仅在 oracle 层 + 单测；heap 实际调用的自由函数 `is_visible` 仍是 M2a 兼容版（无 `t_cid` 参数），executor 接线归 Stage O
+   - hint bits：四变体枚举 + `set_hint_bit` trait 就位，默认 no-op（回写通道 Phase 7）
+
+4. **begin 原子性修复（L 评审 P1）**
+   - XID 时钟分配与活跃集插入合并到同一把锁内（对标 PG"释放 XidGenLock 前先注册 ProcArray"），消除"alloc 了但没 insert"的 SI 违例窗口，附确定性回归测试
+
+5. **Engine 集成**
+   - 装配顺序：ClogBuffer → storage recovery（注入同一 CLOG，redo 幂等写入终态）→ checkpoint ClogFlush 钩子 → M2a `clog-snapshot.bin` 一次性迁移（缺失 = no-op，损坏 = 硬错误）→ Catalog → HeapAM/TxnManager
+   - M2a 的内存 `TrackingClog`（225 行）整体删除
+   - commit/checkpoint barrier 保留承重：防"commit WAL 落在 begin_lsn 之前（replay 不重放）但 `set_state` 落在 checkpoint CLOG flush 之后"的两不沾窗口
+
+### 设计理由
+
+**1. 为什么 4-bit/XID 而非 PG 的 2-bit？**
+每 XID 独占 nibble，无位掩码竞态、无跨 XID 读改写。代价是段密度减半（128MB/2.68 亿 XID vs PG 32MB/2.56 亿），磁盘换简单。不存 commit_lsn——判定纯靠 XID 关系。
+
+**2. 为什么独立 ClogBuffer 而不复用 M1 BufferPool？**
+CLOG 页无 `pd_lsn`/`pd_checksum`，混进按 `PageId` 索引、带 checksum/redo 路径的 BufferPool 会破坏其语义。
+
+**3. 为什么 fsync 收紧到 checkpoint 单点？**
+commit 路径持久性全靠 WAL 记录；CLOG bit 的 fsync 全部摊到 checkpoint。配合 commit barrier 保证"已 checkpoint 回收的 WAL 前缀对应的 bit 必然已 fsync"。崩溃丢失由 redo 重建，语义闭合。
+
+**4. 为什么 curcid 在语句开始前 +1？**
+同语句 self-scan 共享同一 curcid，`t_cid < curcid` 对本语句写入为假 → 跳过自身，天然 Halloween 保护；下一语句递增后前语句写入变为可见（§7.1 Q4 / v2.3-3）。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage L) | 取舍理由 |
+|---|---|---|---|
+| XID | 32-bit + wraparound/freeze | **64-bit**，无 wraparound、永不 freeze | xmin/xmax 各 8B（PG 4B）；无 vacuum freeze 概念 |
+| CLOG 编码 | 2-bit/XID，位级 CAS | **4-bit/XID**，nibble 直读直写 | 密度减半换无锁简单 |
+| SLRU 结构 | pg_clog SLRU，commit 路径也可能写回 | 结构同构（8KB 页/段/clock-sweep），fsync 收紧 checkpoint 单点 | 崩溃丢失由 WAL redo 重建兜底 |
+| 快照一致性 | ProcArray 细粒度协议 | 单把 active-set 互斥锁 | M2b 规模够用；分片 Phase 7b |
+| cmin/cmax | 双字段 + combo CID | **单 `t_cid`** + 分支对称判定 | combo CID 场景（同语句插删对外可见性）不处理，M2b 裁剪 |
+| SSI | 可选可串行化 | **不做** | Phase 7d |
+
+### 已知残留与后续归队
+
+- engine scan/auto-commit 仍用 `Snapshot::everything()`，oracle/curcid 协议就位但未接线 → **Stage O 落地**
+- 自由函数 `is_visible` 无 curcid 分支、heap 不盖 `t_cid`（Halloween 保护在生产路径未激活）→ **Stage O 落地**
+- `txn_manager()` 后门绕过 commit barrier（注释声明 UB）→ M2c 下沉 barrier 进 TxnManager
+- ClogBuffer 全局单锁 → Phase 7b 分片；hint bit 回写 → Phase 7
+- 无 checkpoint ATT 快照 → **Stage N 加 AttProvider**
+
+---
+
+## Stage M：B+Tree AM 单线程 + Split 三步 WAL + 阻塞式 CREATE INDEX
+
+**状态**：✅ 完成（M2b，414 个测试全绿，含 3 个崩溃点恢复测试）
+**工期**：预估 10–14 天
+**验收**：`btree_split_crash` 3/3；100 万 INSERT + CREATE INDEX ~14.9s（≤ 30s）；redo 幂等重放 10 次一致
+
+### 交付内容
+
+1. **页格式与 key 编码**
+   - 复用 Stage G 的 slotted page（"一种页格式服务所有 AM"兑现）
+   - 16B special 区：`btpo_prev`(0..8) / `btpo_next`(8..16)（Blink 兄弟链）
+   - `pd_flags` bit 8..11 = `btpo_level`（0=leaf）、bit 12..15 = `btpo_flags`（LEAF / ROOT / DELETED / SPLIT_INCOMPLETE）
+   - 保序 key 编码：Int4/Int8 用 sign-bit 翻转大端序；Text/Bytea 用原始字节序
+   - 内部页 entry = `key ++ child_page_id(8B)`；叶子页 entry = `key ++ tid(10B)`；无 64B TupleHeader（索引条目无 xmin/xmax，§7.3）
+   - LP 数组按 entry 保序（支持页内二分），重复 key 以 `(key, tid)` 全序决胜
+
+2. **Split 三步 WAL 协议**（核心交付）
+   - `BTreeSplitPrepare=5`：锚点 + `SPLIT_INCOMPLETE` 置位 + `left_old_next`（补 spec 的洞：左页 post-Prepare 镜像落盘后原 next 读不回，必须随 payload 携带）
+   - `BTreeSplitCopy=51`：payload 极简（`copy_start_slot + left_page_pre_lsn`），redo 从 left_page **重算**搬运内容，幂等锚点 `left_page.pd_lsn == pre_lsn`
+   - `BTreeSplitCommit=52`：父页插入 `(separator_key, right_page)` 分隔键 + 清 `SPLIT_INCOMPLETE`
+   - 落盘纪律：**右页先 flush 才释放左页 latch**——保证左页 pre-copy 镜像永远可恢复，"左已截断但右缺拷贝"在结构上不可能（出现即 `MetadataCorrupted` 硬失败，不静默）
+   - Copy 应用 = 左页重建压实（非裸截断 LP 数组——裸截断的死空间会让触发 split 的 insert 仍放不下），在线/redo 共用同一函数保证字节级一致
+
+3. **读/写路径**
+   - 点查：meta → root → 下降到叶（latch coupling 骨架），叶子内二分
+   - 范围扫：叶链 `btpo_next` walk；下降过程内部层右跳、叶层**双向 sibling walk**（stale 分隔键兜底——兄弟链是 ground truth，分隔键只是提示）
+   - 内部页 slot 0 = ∅(-inf) 标记（PG P_HIKEY 惯例，见下"设计理由"）
+   - 单线程全路径独占 latch；`validate()` 做全序子树边界校验（`last < first`）
+
+4. **阻塞式 CREATE INDEX（bulk load）**
+   - 全表扫 → `(key, tid)` 全序排序 → 叶子 100% 写满自左向右 → 内部层自底向上（slot 0 = ∅）→ 每页一条 post-image FPI（~22MB WAL / 1M entries）→ **meta 记录最后写**（中途崩溃只剩孤儿页，零半成品）
+   - 实测：1M entries ≈ 1.02s，比逐条 insert 快约两个数量级
+
+5. **Engine 集成**
+   - `Engine::create_index(table, column) -> Oid` / `index_lookup(table, column, key) -> Option<Tid>`
+   - catalog 写入：`pg_class`(relkind='i', relam=403) + `pg_attribute`(兼任"索引哪列") + `pg_index`(page 5) + `pg_rust_relpages`(meta 页位置)
+   - **DML 事务内同步维护索引**（review 后补齐）：insert/delete/update 与被维护表的索引在同一 auto-commit 事务内原子完成（NULL key 跳过）
+   - redo registry 追加 5 个 btree handler（Insert/Delete/SplitPrepare/SplitCopy/SplitCommit）
+
+6. **Review 修复清单**（三轮对抗审查后）
+   - DML 同步维护索引（P1：修复前索引"建成即陈旧"）
+   - `split_prepare` 的 `SPLIT_INCOMPLETE` 防护（禁止对未完成分裂的页二次分裂，否则旧右孪生永久孤儿化、毁掉 M2c CLR 收尾前提）
+   - root 代际校验（防止旧句柄创建第二 root 覆写 meta 导致半树不可达）
+   - Copy redo 静默跳过分支硬化（右页已持拷贝→重建左页；双侧不符→硬失败）
+   - CatalogFull 预检前移（build 前按真实编码预检 4 行）
+   - `create_new_root` 的 level ≥ 0x0F 显式报错（4-bit 溢出变契约）
+   - `set_flag` 静默吞错改 `Result`；`apply_prepare/commit_left` 补全零页 init 守卫
+
+### 设计理由
+
+**1. 为什么 split 用"声明意图 → 可重算执行 → 提交"三步？**
+分裂是跨页多步操作（左截断 + 右搬运 + 父插入），崩溃可落任意中间点。三步把"原子性"翻译成 WAL 语义：Prepare 给幂等锚点；Copy 利用"给定左页状态 + 起始 slot，搬运内容确定"的事实让 payload 保持 O(20B)（半页数据可能 10KB，记进 WAL 太奢侈）；Commit 显式标记不归点。配合 `SPLIT_INCOMPLETE`，崩溃后的任何前缀都能被 redo 精确续上或安全跳过。
+
+**2. 为什么 Copy 的 redo 是"重算"而非"搬运"？**
+redo 不是把 WAL 里的数据抄回页面，而是重新执行搬运操作。WAL 体积最小化 + 重放天然幂等（`pd_lsn == pre_lsn` 说明"还没动过"才执行）。代价是必须严格维护"左页 pre-image 可恢复"的落盘纪律——这个前提在 review 后从注释升级为有硬失败背书的协议。
+
+**3. 为什么内部页 slot 0 用 ∅(-inf) 标记？**
+内部页分隔键会 stale（删除推高孩子 low key、分裂改变边界）。真实 low key 作标记会 stale-high（逆序插入时把孩子藏到标记左边），∅ 标记只会 stale-low，由叶层双向 sibling walk 兜底。Blink 的设计核心是"分隔键是提示不是真理，兄弟链才是 ground truth"——`validate()` 因此检查全序链而非父键区间。
+
+**4. 为什么 bulk load 不用 split 协议而直接铺页 + FPI？**
+split 的 Copy redo 语义是"从既有左页重算搬运"，bulk load 的页是全新内容，语义不符。每页一条 post-image FPI 比逐条 insert 快两个数量级；meta 最后写让中途崩溃只剩孤儿页、零半成品。
+
+**5. 为什么索引条目不参与可见性判定？**
+索引只有 `(key, tid)`，没有 xmin/xmax。悬空引用（指向已删/abort 的行）由 heap 层可见性判定天然屏蔽（§7.3 契约）。索引不复制 MVCC 状态。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage M) | 取舍理由 |
+|---|---|---|---|
+| Split WAL | 单条 `xl_btree_split` 记录，右页内容随记录携带（block data） | **三条记录**，右页内容不记、redo 重算 | WAL 体积更小；借鉴 PG 全部锚点语义（`firstrightoff`↔`copy_start_slot`、incomplete-split 标志）但骨架自构 |
+| 并发 | Blink latch coupling 读 + 乐观/悲观写 | **M2b 全单线程**（整路径独占），M2c 才做 Blink 并发（Stage Q，含 loom） | 先把协议骨架和恢复正确性做对，并发后上 |
+| 内部页分隔键 | high key 完整键 + tid tiebreaker（PG ≥12） | key-only 分隔 + ∅ 左脊柱 + sibling walk 兜底 | 简单；已知残留：重复 key 跨内部页边界（~20 万同 key）退化，M2c 上 tid 分隔符根治 |
+| CREATE INDEX | 在线建索引（读写不阻塞） | **阻塞式**（全表扫+排序+bulk load），无表锁（扫描期间新写入不进索引，已文档声明） | M2b 规模下正确性优先；在线建索引归 Phase 7 |
+| 页合并 | 有（balance merge） | **不做**（只分裂不合并） | M2b 明确裁剪；删除只回收 tuple 不回收页 |
+| 唯一索引 | 执行层唯一性检查 | `indisunique` 字段就位**不执行** | 归 Stage O/后续 |
+| 索引维护 | DML 自动维护所有索引 | review 前"建成即快照"，**修复后** DML 事务内同步 | 对抗审查抓出后补齐，避免语义炸弹 |
+| DROP INDEX | 支持 | **不支持** | 后续 stage |
+| MVCC 集成 | 索引无可见性，靠 heap 回查 | 同 PG（§7.3 契约） | 一致，无取舍 |
+
+### 已知残留与后续归队
+
+- 重复 key 跨内部页边界（~20 万+ 相同 key 门槛）：结构可读但退化 → ~~M2c tid 分隔符根治~~ **延期**（M2c 未交付；Stage T 改由"完整 (key,tid) 链序落位 + locate 空页左跳"在线兜底跨边界重复 run 场景；根治归 M2c+/Phase 7）
+- ~~`BTreeSplitCLR` / `finish_incomplete_split`（未完成分裂收尾）→ M2c undo（Stage S）~~ **已交付**（Stage S + 修复轮的 Move/NoMove/Unlink 三态与级联）
+- ~~BTreeDelete 在线语义（现在只有 redo handler；trait delete 为 O(n) 链扫兜底）→ M2c~~ **已交付**（Stage Q 并发化 delete：归属重验证 + 有界重试；Stage T 边界修复进一步加强）
+- 唯一索引执行、DROP INDEX、多列索引 → 后续 stage
+- SQL 层入口（`CREATE INDEX` 语句、planner 索引选择）→ Stage O
+
+---
+
+## Stage N：ARIES Analysis + Redo + CheckpointEnd v1/v2 迁移
+
+**状态**：✅ 完成（M2b，commit `3435ce6`；448 测试全绿）
+**工期**：预估 5–7 天
+**验收**：`aries_analysis_redo` 8/8（10 万 record analysis+redo 2.24s ≤ 10s）；`checkpoint_v1_v2` 迁移测试通过
+
+### 交付内容
+
+1. **Analysis（`pg-storage/analysis.rs`）**
+   - `find_latest_checkpoint_end`：从 superblock `checkpoint_lsn` 起扫，取最后一个**已完成**的 CheckpointEnd（悬空 Begin 天然忽略）
+   - `run_analysis`：ATT/DPT 快照文件 seed 基线 + 扫到 WAL 尾；带 `txn_id` 的记录入 ATT、Commit/Abort 移除；DPT `or_insert` 保留首次脏页 LSN
+   - `for_each_touched_page`：bincode 前缀解码只取 PageId，不解 tuple/FPI 全载荷（11 种 page-modifying 类型逐一比对字段序）
+
+2. **Redo 统一分发**（Stage D 机制，本 stage 接线验证）：严格 LSN 序；FPI 与其他 handler 同一 `RedoRegistry`；未注册类型硬失败（v2.3-24）
+
+3. **CheckpointEnd v2**
+   - 6 字段：`checkpoint_lsn / next_page_id / next_txn_id / next_oid / att_file / dpt_file`
+   - v1/v2 分派 `flags >> 4`（M1 冻结的记录头 `flags` 是 u8，版本号占高 4 位，低 4 位留记录级 flag）；未知版本硬错误（前向 crash 保护，v2.3-17）
+   - v1 默认 `next_oid=16384`；权威源仍是 superblock，record 值永不消费（write-only，防未来误信）
+   - v1 记录永不改写，升级靠 M2 自己 emit v2 自然完成
+
+4. **ATT/DPT 快照文件**
+   - `meta/{att,dpt}-{lsn:016}.snapshot`，bincode + CRC32，`write_atomic`（temp + fsync + rename + 目录 fsync）
+   - 三步硬序：`fsync(快照文件) → wal.append(CheckpointEnd) → flush_to(end_lsn)`，superblock 最后更新（与 §3 P1-5 commit 硬序同风格）
+   - prune 保留最近 3 组 + **superblock 当前组**（防连续夭折 checkpoint 的孤儿组挤出有效基线）；文件名解析接受任意长度数字串
+   - 快照缺失/CRC 损坏 → 独立降级为空基线全扫描
+
+5. **B+Tree split redo 四态硬化**（review 修复）
+   - `== anchor` 正常重放，应用后 **`pool.flush(right)`**——redo 路径补齐线上"右页先落盘才放左 latch"纪律，关闭"恢复期间部分刷盘再崩溃变砖"窗口
+   - both-past 幂等跳过（修掉旧代码误截 post-copy 插入的真 bug）；左落后右已有 → 重建左页；其余 → 硬失败
+   - 删除错误的 `apply_split_move_to_right_only`（其前提状态不可达，可达时反把硬失败降级为静默损坏）
+
+6. **WAL 全零洞防护**（Stage B 遗留，review 抓出）
+   - `reserve_and_append` 原子化：单次锁持内完成时钟推进 + 写段，消除 reserve→append 窗口
+   - reader 遇全零 header 前探一个 header 宽度，后有非零数据 → `MetadataCorrupted` 硬失败（不再静默截断、不再让新 WAL 覆盖洞后已提交记录）
+
+7. **Buffer pool 两处竞态修复**
+   - P2-1：`pin_mut` 持 guard 期间即标脏——fuzzy checkpoint 不再漏"已写 WAL 但 guard 未 drop"的页
+   - P2-2：flush 失败 `first_dirty_lsn` 改 min-merge 恢复（取最旧锚点，防 rec_lsn 高估跳 redo）；`flush_frame` 对 replayed-LSN 页跳过 `flush_to`
+
+8. **ATT 正确性接线**
+   - `AttProvider` trait + `TxnManager` 实现；recovered ATT 在 redo 重建 CLOG 后过滤（去已知终结成员，闭合 §11.4 快照竞态）
+   - pg-engine `commit_barrier`：commit 硬序与 checkpoint 互斥；无 barrier 的 storage-only 路径文档明确标注 unsafe（M2c 下沉进 TxnManager）
+
+### 设计理由
+
+**1. 为什么 redo LSN 恒等于 `checkpoint_lsn`（而非 `min(DPT.rec_lsn)`）？**
+双向钳制（coding plan Stage N 实现修订注）：不能更晚——redo point 与首个脏页记录之间的 `TxnCommit/Abort` 必须重放以重建 CLOG；不能更早——DPT 快照摄于 CheckpointBegin，条目 rec_lsn 均 < begin_lsn，而完成的 checkpoint 在 emit End 前已将这些页全部刷盘，其 WAL 段可能已被回收。DPT 仍完整返回（观测 + 未来 Undo 用）。
+
+**2. 为什么不做显式 Heap Undo？**
+无终止记录的 XID 在重建 CLOG 中读作 `InProgress`，MVCC 下与显式 `Aborted` 等效——"过滤"替代"补偿"，省掉整个 undo/CLR 子系统（B+Tree 结构变更的 CLR 收尾归 M2c Stage S）。
+
+**3. 为什么 ATT/DPT 存独立文件而非塞进 CheckpointEnd payload？**
+大 ATT（10 万级 XID）进单条 WAL 记录太奢侈；CheckpointEnd 只带文件名引用，快照文件独立 atomic write + 独立降级。
+
+**4. CheckpointEnd 新于 superblock 怎么办（crash 在 flush_to 与 superblock 写之间）？**
+不用 WAL 里更新的 End，而是合成 v1 等价空基线锚点、从 superblock redo point 全量重建——保守但确保两个 redo point 之间的记录全覆盖。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage N) | 取舍理由 |
+|---|---|---|---|
+| 恢复模型 | 无 ATT/DPT 概念，从 checkpoint redo 点全量重放 | 教科书 ARIES Analysis 建 ATT/DPT，但 redo 起点恒等于 `checkpoint_lsn` | 效果与 PG 等价；DPT 为 M2c Undo/CLR 预留观测面 |
+| Heap Undo | 不做（abort = CLOG 标记，非教科书 ARIES） | 同 PG：不做，`InProgress ≡ Aborted` | 语义等效，省掉补偿日志 |
+| Checkpoint 元数据 | `pg_control` 内嵌 checkpoint 记录 | superblock（双副本）+ CheckpointEnd v2 + ATT/DPT 独立快照文件 | ATT/DPT 独立文件支持大事务数；PG 无此需求 |
+| 格式迁移 | 大版本 `pg_upgrade` 离线迁移 | v1/v2 在线 decode 分派，v1 永不改写 | 单文件格式内渐进升级 |
+| CLOG 持久化 | checkpoint 时 CheckPointCLOG | 同（Begin/End 之间 `flush_dirty`） | 一致，无取舍 |
+| 恢复扫描 | 单遍 redo | 三遍（find_latest / analysis / replay） | 可读性优先；合并是已知优化项 |
+
+### 已知残留与后续归队
+
+- ATT 空基线降级对"begin 前已无 WAL 活动的空闲事务"不完整（崩溃后空闲事务无 WAL 记录可扫描；**核销说明（Stage T)**：该情形无实际危害——空闲事务无任何写入需要补偿，CLOG 读作 InProgress 语义等价，Stage S undo 落地后此边角无消费者；降序重试旧快照仍是可选项）
+- `open_at` 起始段缺失时硬失败，文档承诺的 warn + 空基线降级未实现（灾难-only 路径，多段丢失无测试）
+- `reserve_and_append` 时钟推进后 encode/IO 失败可留 >32B 洞，reader 前探（仅 32B）漏检（待修：推进前校验 payload 长度 + IO 失败毒化 writer）
+- analysis/replay 的 catch-all 对 `MetadataCorrupted`/`WalReadFailed` 仍 warn+break（engine 路径由 writer open 先行拦截，pub API 直接调用有静默截断风险）
+- 恢复三遍全量扫描可合并（find_latest 可短路）
+- both-past 跳过的回归测试输入不含 post-copy 插入，对新旧行为不可区分（待补强）
+- 测试缺口：小段 + 段回收、快照 CRC 损坏降级、孤儿快照、checkpoint 介入 split 三步、恢复中二次崩溃
+- `evict_frame` 刷盘失败帧泄漏（pre-existing，非本 stage 引入）→ **已修复**（Stage Q 终审：改为先刷盘后摘映射）
+- coding plan Stage N 表格 `flags >> 12` 系笔误（实现为 `>> 4`），待回写
+- ~~kill -9 撕裂尾部被误判 WAL corrupted~~ **已修复（Stage T 压测抓出）**：writer 被 kill 时记录只写了前缀、预分配段的未写部分读回全零 → CRC 失败被当中段损坏。修复：`is_torn_tail` 双重判定（header LSN == 读取位置 + 记录之后全零）放行撕裂尾部，中段真损坏维持硬报错；真实现场前后对照验证 + 两个确定性单测
+
+---
+
+## Stage O：SQL parser + M2b 综合验证（M2b 出口）
+
+**状态**：✅ 完成（496 测试全绿；M2b 出口，`phase1-m2b` tag 待打）
+**工期**：预估 7–10 天
+**验收**：`m2b_integration` 20/20 + `si_isolation_50_txn`（50 线程 SI 硬断言）；§7.2 SQL 层 4 用例（2 个 RETURNING 用例子集 N/A，由 pg-txn 单测覆盖）；INSERT+COMMIT **4.24ms**（≤5ms）；索引点查 **~927K QPS**（≥100K，criterion `m2b_perf`）
+
+### 交付内容
+
+1. **硬编码 SQL parser（`pg-engine/sql.rs`）**
+   - 子集：`BEGIN / COMMIT / ROLLBACK / CREATE TABLE / INSERT（多行，可选列清单）/ SELECT [WHERE eq/lt/gt] [ORDER BY 单列 ASC|DESC] [LIMIT N] / UPDATE (WHERE) / DELETE (WHERE) / CREATE INDEX`
+   - tokenizer → AST → Datum 全程无字符串拼接（无注入面）；标识符统一折叠小写（同 PG 未加引号语义）；可选单末尾分号
+   - 不支持清单（`--`/块注释、quoted identifier、多语句、RETURNING、JOIN、聚合、`<=/>=/<>`）在模块文档如实列出
+
+2. **`exec(Option<&TxnHandle>, sql)` + `TxnHandle`**
+   - auto-commit 传 `None`，显式事务传 handle；`commit/abort` consume self（abort 后不可用是**编译期**保证）；`RefCell<Snapshot>` 使 handle `!Sync`
+   - Drop 自动 best-effort abort（持 `commit_barrier` + 失败 warn 日志）；`instance_id` 校验防跨 Engine 实例混用
+   - `exec(None)` 收到 BEGIN/COMMIT/ROLLBACK 显式报错（review 修复：原静默 Ok 是"测试全绿、数据悄悄持久化"型 footgun）
+   - 显式事务内 DDL 显式拒绝；语句中途失败无语句级回滚，唯一安全操作是 `abort()`（已文档化）
+
+3. **curcid executor 接线**（Stage L 协议落地）
+   - 每语句开始前 `advance_curcid()`；新 tuple `t_cid = curcid`；`stamp_deleted` 盖删除时 curcid
+   - 自由函数 `is_visible` 重写为完整 §7.2（`xmin==self / xmax==self` 分支激活，v2.3-3 / Q4）
+   - `begin_txn` 一次快照全事务复用（SI）；auto-commit 每语句新快照（等价 RC）
+
+4. **Halloween 双保险**：UPDATE/DELETE 先物化全量扫描再逐行写 + `t_cid == curcid` 分支
+
+5. **索引事务性**（review 拦路虎修复）
+   - `index_lookup` 可见性掩码：`lookup_all` 走叶子链枚举重复 key 全部 TID，逐个回堆 §7.2 判定，第一个可见胜出
+   - per-txn 索引 undo 日志：`Inserted/Deleted` 按 XID 记录（UPDATE = 两条），abort / Drop / auto-commit 失败三处**逆序**回放（Inserted → `(key,tid)` 精确删，Deleted → 重插）；commit 丢弃；undo 失败 best-effort + warn
+   - **恢复侧 loser 补偿**（Stage T 压测发现，并发 crash 轮 + checkpoint 线程复现）：在线 abort 有 undo 日志兜底，但 kill -9 落在"索引维护已落 WAL、commit/abort 记录未落"的窗口时，恢复后 loser 的索引**删除**无补偿——索引条目物理消失（xid=0 记录无条件重放）而堆元组经 CLOG 过滤仍可见，可见行丢索引项（loser 的插入方向由可见性掩码兜底，无需处理）。修复：open 时扫描 WAL，收集 loser 的 HeapDelete/非 HOT HeapUpdate 受害 tid，按堆页字节重算 `(key, chain_root_tid)` 幂等重插（存在性检查防重复；回归 `m2b_index_txn.rs::crash_mid_delete/update_compensates_index_entry`，修复前红）。扫描起点（复核追加）：redo_start 只对 DPT 采样时仍脏的页回拉，受害页被驱逐后可落在 redo_start 之前、同一 retained 段内——记录可跨段、段首非边界，故经 CRC resync 探针回卷到段内首个记录（回归 `crash_loser_delete_before_redo_start_compensated`）。已知边界：记录所在段已被回收时不可补偿（需跨多 checkpoint 的手持长事务）
+   - 8 个专项测试（`m2b_index_txn.rs`）：insert/delete/update-abort 三向发散全部钉死，修复前必然失败
+
+6. **崩溃自动化**：`m2b_crash_rounds` 子进程 kill -9；偶数轮全量精确比对，奇数轮前缀持久性验证（"至多 1 行多余"由 seed 设计保证逻辑严密）；默认 25 轮（CI），`M2B_CRASH_ROUNDS=1000` 为验收配置（~30–60 分钟，手动）
+
+7. **Review 修复清单**（四轮对抗审查后）
+   - 索引事务性（见 5）；`exec(None)` 事务语句报错；i64→i32 静默截断改 `try_from` 报错（插入错值 + WHERE 查错行双危害）
+   - Drop abort 补 barrier + warn；标识符大小写规则统一；尾部分号；`instance_id`；`lookup_all` 跨 7 叶 3000 重复项测试
+   - 负例测试（畸形 SQL / 未知表 / 类型不匹配 / 事务内 DDL）；§7.2 用例注释去虚报（case2/3 标 N/A）；`exec_crash_recovery_basic` 正名 `exec_clean_shutdown_reopen`
+
+### 设计理由
+
+**1. 为什么硬编码 parser 而非引入 sqlparser crate？**
+子集极小（约 10 种语句形态），零新增依赖，tokenizer→AST 直译。它是 Phase 4a DataFusion 到来前的一次性脚手架——控制依赖面优先于表达能力。
+
+**2. 为什么 TxnHandle consume-self？**
+commit/abort 后句柄不可用由类型系统保证，消灭"use after abort"整类错误；`!Sync` 阻止跨线程共享同一事务上下文。
+
+**3. 为什么索引 undo 用逆操作回放而非 PG 式"留着等 vacuum"？**
+pg_rust 的 DELETE 是物理删索引条目（M2b 无 vacuum 回收死条目），abort 必须能恢复条目；插入侧悬挂条目与 PG 同构（可见性掩码兜底）。逆序回放是必须的：同事务 INSERT(k,t)+DELETE(k,t) 正序回放会留下悬挂项。
+
+**4. 为什么默认 SI 而非 PG 的 RC？**
+Agent 场景长事务多读，SI 避免语句间视图漂移；M2b 实现上 auto-commit 每语句新快照即等价 RC，两种语义同构复用。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage O) | 取舍理由 |
+|---|---|---|---|
+| 默认隔离级别 | RC | **SI**（begin_txn 一次快照） | §8 决策；SSI 留 Phase 7d |
+| cmin/cmax | 双字段 + combo CID | 单 `t_cid`（同语句插删对外判定为不可见，方向保守） | M2b 裁剪；扫描全物化使分歧不可达 |
+| 语句级回滚 | 子事务 | **不做**：语句失败唯一安全操作是 abort() | M2b 无子事务，已文档化 |
+| RETURNING | 支持 | **不支持**（§7.2 case2/3 由 pg-txn 单测覆盖） | 出口裁剪 |
+| 索引删除 | DELETE 不动索引，vacuum 回收死条目 | DML 时物理删条目，abort 逆操作恢复 | M2b 无 vacuum；条目即删即净 |
+| 索引可见性 | index scan 回堆判定 | `index_lookup` 回堆 §7.2 掩码（同构） | 一致；但 SQL SELECT 暂不走索引（无 planner），点查仅程序化 API |
+| 索引 abort | 插入侧悬挂条目留待 vacuum | undo 回放立即清除；undo 失败仅 warn（掩码兜底） | M2b 无索引一致性修复工具 |
+| 事务内 DDL | 事务性 DDL | **显式拒绝** | 目录改动无 undo，M2b 裁剪 |
+| SQL 方言 | 完整 SQL | 硬编码子集 + 不支持清单 | Phase 4a DataFusion 前的脚手架 |
+
+### 已知残留与后续归队
+
+- `index_lookup` fresh-snapshot：显式事务内无 read-your-writes（文档 WARNING 已明示；上层逻辑应走 `exec`）
+- undo 回放失败仅 warn，无索引一致性修复工具 → 后续 stage
+- redo 不恢复 `t_cid`（良性：写入事务不可能活过崩溃；子事务/语句级回滚到来时重审）
+- hint bit 回写仍未接线 → Phase 7；`set_hint_bit` 占位
+- 唯一索引不执行、DROP INDEX、多列索引 → 后续 stage
+- 1000 轮崩溃验收配置需手动执行（默认 25 轮过 CI）；mid-checkpoint kill 仅概率性覆盖，无确定性保证
+- `exec_auto` 的 SELECT / CREATE INDEX 不走 commit barrier（只读路径，已注释说明）
+- 锁管理器、行锁 xmax 协议、B+Tree 并发、HOT update、ARIES Undo/CLR → **M2c（Stage P–T）**
+
+---
+
+## Stage P：LockManager 表锁 + 行锁 xmax 协议 + SELECT FOR UPDATE
+
+**状态**：✅ 完成（M2c 开篇，534 测试全绿；未提交）
+**工期**：预估 5–7 天
+**验收**：`lock_manager` 8/8（4×4 全矩阵）；`row_lock_wait_wake` 8/8；100 线程并发 UPDATE 同一行终值精确无 lost update；无冲突 UPDATE ~11.2K TPS（30K 未达——per-commit fsync 物理上限，与 M2a 无锁基线 11.6K 持平，证明锁路径零额外开销；bench 头部如实声明）
+
+### 交付内容
+
+1. **表级 LockManager（`pg-txn/lock_manager.rs`）**
+   - 4 模式 grant 矩阵（§9.2）；键为 `pg_storage::Oid`（遵守"pg-txn 不依赖 pg-catalog"硬约束）
+   - `LockEntry` = granted 集 + FIFO wait 队列；`can_grant` 三道闸门：已持同级或更强 → 幂等放行 / 队列非空且非队头 → 必等（**反饿死**：兼容模式也不许插队）/ 与其他持有者无冲突
+   - 升级原地 max 强度；冲突升级保留旧授权排队（与 PG 一致，互升死锁归 Stage R）
+   - `release_all(xid)` 清授权 + 清队列项（防死 XID 队头毒化）+ 顺序预授权兼容连续队头；2PL：持锁到事务结束，只升不降
+   - `table_lock_state()` 内省快照 = Stage R 表锁半边 wait-for 图的输入
+
+2. **行锁等待设施（`pg-txn/manager.rs`）**
+   - `row_wait_registry: Mutex<HashMap<Xid, Xid>>`（waiter → waiting_on）+ Condvar
+   - `wait_for(self, blocking)`：谓词直查 active set（不依赖注册边），吸收虚假唤醒，醒来自清边；self-wait 报错；锁序 registry→active（唯一合法嵌套方向，已注释）
+   - `end_txn`：commit/abort 共用尾部，`set_state → active 移除 → notify_all` 严格序（广播必在 CLOG 置位之后，被唤醒者重读 CLOG 必见终态）
+   - `RowWaiter` 窄 trait 供 heap 层注入（比传整个 TxnManager 窄，便于测试）
+
+3. **commit barrier 下沉 TxnManager**（兑现 Stage L/N 的 M2c 计划）
+   - `commit_txn/abort_txn` 内部对整个硬序持 barrier 读守卫；checkpoint "Phase 0" 持写守卫覆盖临界段（begin_lsn 捕获 → ATT/DPT 采样 → CLOG flush → WAL 回收），范围与下沉前逐点相同
+   - pg-storage 侧沿用 AttProvider/ClogFlush 模式：`set_commit_barrier` 共享 `Arc<RwLock<()>>`
+   - pg-engine 删除自有 barrier 字段及全部守卫点；`txn_manager()` 后门的 checkpoint UB 按构造消除（残余：裸调 commit 不释放表锁，已文档化）
+
+4. **行锁 5 步 xmax 协议（`pg-am-heap/heap_am.rs`）**
+   - `row_lock_gate` 在页写 latch 下判定：INVALID/self → Proceed；Committed → `TupleConcurrentlyUpdated`（新错误，与 TupleNotFound 明确区分）；Aborted → Proceed；InProgress → **latch 内注册等待边**后返回 Wait（5a 先于 5b，绝不丢唤醒）
+   - delete/update/lock_tuple 改 restart 循环：Wait 时 drop 全部 latch → `wait_row_lock` → 重回步骤 1（"CAS"由页 latch 天然提供，无需原子指令）
+   - 崩溃豁免：InProgress 且不在活跃集 → 重读一次 CLOG（happens-before 经 active mutex 传递闭合）后才认定崩溃覆盖——修掉了实现期发现的"CLOG 置位与活跃集移除之间的误判窗口"真 bug
+   - 未安装 RowWaiter 时完全保留 M2b 旧行为（heap_abort_visibility 等既有测试原样通过）
+
+5. **HEAP_XMAX_LOCK_ONLY + SELECT FOR UPDATE**
+   - `HEAP_XMAX_LOCK_ONLY = 0x1000`（PG 同构）：xmax 置位但非删除——全部 t_xmax 读者（scan/live gate/vacuum 扫描/redo/engine 掩码）逐一核对正确屏蔽；真删除章清 LOCK_ONLY（live + redo 两侧）
+   - `lock_tuple`：同一 5 步协议盖 lock-only 章，**不写 WAL**（与 PG 一致；带锁章页面落盘后崩溃，恢复出死 XID 锁章，读者屏蔽、写者经崩溃豁免覆盖，无永久阻塞）
+   - parser：`FOR UPDATE` / `FOR SHARE` 子句（LIMIT 后、Eof 前）；exec：filter/ORDER BY/LIMIT 之后、投影之前逐行加锁（与 PG 一致只锁返回行）；FOR SHARE 报 `Unsupported`（multixact 占位）；auto-commit FOR UPDATE 锁随语句结束释放
+
+6. **表锁接线（pg-engine）**
+   - 全路径覆盖：exec 各臂 + 公共 DML/DDL；SELECT→AccessShare、DML+FOR UPDATE→RowExclusive、CREATE INDEX→Exclusive（整个 build 单事务化）、CREATE/DROP TABLE→AccessExclusive
+   - 释放点：auto_commit 成功/失败双路径 + TxnHandle commit/abort/Drop 五处全核对
+   - `lock_table_entry` helper：取锁成功后**重验 registry**（name→OID 一致），配合 drop_table"事务内摘除 registry 先于 commit 放锁"的排序，关闭 TOCTOU
+
+7. **Review 修复清单**（三路对抗审查后）
+   - **create_index 快照在 Exclusive 锁等待前获取 → 索引永久缺行**（高）：闭包内取锁后重取快照，测试补 `index_lookup(id=2)` 断言（修复前必红）
+   - **跨页 UPDATE 双 latch AB/BA 死锁**（中）：两个 latch 一律按 PageId 升序获取，重 pin 后重查空间 + `new_slot` 最终持锁后计算
+   - **table_entry → lock_table TOCTOU**（中）：向已 drop 表的已释放页写入；修复见 6
+   - **自真实删除章被补 LOCK_ONLY 复活行**（中）：gate 加 `for_lock` 细分——自 LOCK_ONLY 重锁幂等放行，自真实删除章上锁报错
+   - 文档类：wait_for 无超时语义、锁序注释、stamp_lock_only 的 t_cid 有损性、FOR UPDATE 值序加锁死锁面、auto_commit panic 策略
+
+### 设计理由
+
+**1. 为什么"CAS"不需要原子指令？**
+页 write latch 使"读 xmax → 判定 → 盖戳"天然原子。§9.1 的 CAS 语义由 latch 串行化提供，等待路径只需保证"注册先于放 latch"。这与跨页 update 既有的"放 latch → 重验"结构同形，改动面最小。
+
+**2. 为什么锁章不写 WAL？**
+锁是纯内存语义：崩溃后事务不存在，锁无需恢复。带锁章页面落盘后崩溃，恢复出的死 XID 锁章对读者被 LOCK_ONLY 屏蔽、对写者经崩溃豁免覆盖——WAL-less 既正确又省去 FOR UPDATE 的写放大。XID 64 位单调无复用，排除"陈旧锁章撞上复用 XID"。
+
+**3. 为什么 barrier 下沉用共享 `Arc<RwLock<()>>` 而非 trait+guard 对象？**
+与 `set_att_provider`/`set_clog_flush` 的 setter 模式一致且最简单；guard 对象方案卡在生命周期上，收益只是类型层面的抽象。
+
+**4. 为什么 FIFO 公平队列？**
+无公平性则 AccessExclusive（DDL）在持续读流下饿死；代价是兼容模式也不许插队（并发 AccessShare 吞吐略降），M2c 规模下正确性优先。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage P) | 取舍理由 |
+|---|---|---|---|
+| 死锁 | wait-for graph + 100ms 检测 + victim abort | **无检测无超时**，锁环 = 挂起 | 归 Stage R；等待边结构（`wait_edges`/`table_lock_state`）已按可消费形状预留 |
+| 行锁等待唤醒 | 锁队列按序授予 | 唤醒后与全新写者**平等竞争**盖戳，可饥饿 | 与 PG 行为一致；公平队列留待需要时 |
+| 并发更新冲突 | EvalPlanQual 重查（RC）/ could-not-serialize 报错（RR+） | 无 EPQ，`TupleConcurrentlyUpdated` 由调用方新快照重试 | 等价 PG RR 语义；EPQ 是执行器工作，后续 stage |
+| FOR SHARE | multixact 共享锁 | **解析后报 Unsupported** | multixact 是独立子系统，占位归后续 |
+| 锁章持久化 | LOCK_ONLY 不写 WAL | 同 PG | 无取舍 |
+| 表锁自省 | pg_locks 视图 | `table_lock_state()` 程序化 API | 系统表形态归 Phase 6 |
+| 升级死锁 | 检测器兜底 | 存在且不处理（同 PG 语义，无检测器） | Stage R |
+| 快照读 | 普通 SELECT 不需要表锁以上的东西 | 同；但 `Engine::scan`/`index_lookup`（无所属 XID 的裸 API）连 AccessShare 都不取 | 无 XID 无法 key 锁；DDL 竞态缺口已文档化 |
+
+### 已知残留与后续归队
+
+- **任何行锁/表锁等待环 = 永久挂起**（无检测无超时）→ **Stage R 死锁检测**（接口已预留：`wait_edges` + `table_lock_state`）
+- 无冲突 UPDATE 30K TPS 未达（~11.2K，fsync 物理上限；group commit 批窗口/ramdisk 可证锁路径非瓶颈）→ 性能归 Phase 7b
+- 唤醒后盖戳无公平性，高竞争下个别事务可饥饿 → 需要时再做
+- `lock_tuple` 覆盖 `t_cid` 有损（同语句自插后自锁使行对本语句不可见；当前 executor 不重扫，不可达）→ 子事务/EPQ 到来时重审
+- 闭包 panic 跳过 `release_all`（锁 + XID 泄漏，进程级故障策略）→ 已文档化，或后续 catch_unwind
+- 裸 `txn_manager()` commit 不释放表锁 → 已文档化；Stage R 落地前考虑守卫包装
+- B+Tree 并发（latch coupling + Blink 读写路径 + loom）→ **Stage Q**
+- 跨页 UPDATE 空间复查重启无上界（实践中对手有进展必终止）→ 观察项
+
+---
+
+## Stage Q：B+Tree 并发（latch coupling + Blink）+ loom
+
+**状态**：✅ 完成（549 测试全绿；未提交）
+**工期**：预估 7–10 天
+**验收**：`btree_concurrent` 8/8（含 100 线程 smoke + 小池驱逐风暴 + watchdog 防死锁）；loom 2 模型 20,393 个交错全绿（`LOOM_MAX_PREEMPTIONS=3` 命令通过，模型 1 自钳 2 档已披露）；soak smoke（60s × 32 写 + 4 扫，release）无 miss；TPS 对照臂证明 latch 非瓶颈（见下）
+
+### 交付内容
+
+1. **Latch 拓扑铁律**（index.rs 模块文档：死锁自由的根基）
+   - 只向 **DOWN**（root→leaf）与 **RIGHT**（左→右兄弟）获取 latch；绝不向上；持有任何 latch 时绝不向左（左跳一律 drop-then-acquire）
+   - Split 按 left→right 持双页；父页绝不在持有子页 latch 时新获取；pessimistic pass 全程持 root 写 latch ⇒ 在线 split 彼此完全串行，读者与乐观叶子插入仍并发
+
+2. **读路径真 crabbing**
+   - `descend_to_leaf_guard`：持父读 latch pin 子页再放父（修掉 Stage M"先放父再拿子"的并发窗口）
+   - 耦合右跳：持当前页 pin 右兄弟再放当前页；空右孪生（Prepare 未 Copy）跳过语义保留；`MAX_CHAIN_HOPS` 保留
+   - 读/扫路径全部消费下降返回的叶 guard（消除 drop-再-pin 窗口）
+
+3. **写路径 optimistic**
+   - 读耦合下降 → `pin_leaf_for_write` 在写 latch 下**重验证叶子归属**（并发 split 挪走 key 区间则耦合右跳重 pin；左边界被抬高则 drop 后左跳）→ 去重 + 插入同一 latch 持有期完成（无重复洞）
+   - 无 upgrade API（parking_lot 未暴露，且 drop-and-re-pin 的重验证本就不可避免）
+
+4. **写路径 pessimistic + 空间预留**
+   - 叶满 → 放全部 latch → `refresh_root_from_meta` → `descend_write_path` 从根耦合写 latch 下行，每层重验证（ROOT 旗校验、SPLIT_INCOMPLETE → Retry、右属 → Retry）
+   - **空间预留**：`reserve_split_page` 在触碰 split 对之前分配右页，失败 → 释放重启（不裸抛 Err）
+   - 三步 WAL 协议逐字节保留（Prepare/Copy/Commit 公有包装 + `*_on_guards` 内部实现）；flush-right-before-release-left 纪律不变；`split_commit_guarded` 沿已持有路径上行 Commit，WAL 记录与 Stage M 同序同内容
+   - 重试预算 `MAX_INSERT_RESTARTS=256`；错误文案区分三种耗尽原因（并发风暴瞬态 / post-crash 不完整 split / stale 内部分隔键间隙）
+
+5. **loom 模型检查**（pg-storage `sync` cfg 别名层）
+   - `not(loom)` = 原样 re-export parking_lot（零成本 no-op）；`loom` = loom 原语薄包装（~40+ 调用点零改动）；**Arc 刻意不别名**（`Arc<dyn Trait>` 协变在 stable 不可行，且引用计数非竞争面）
+   - loom 下 stub：WAL 后台 worker 不启动、flush_to 内联无 fsync、flush_frame 状态迁移（保留 meta→content 嵌套调度点）、setup fsync no-op（macOS F_FULLFSYNC 是探索速度杀手）；**真实 latch 编排全部在模型中运行**
+   - 模型 1（2 写 1 读线性一致）：6,551 交错全绿（自钳 2 档，测试头披露）；模型 2（2 写竞争 split + root 提升）：13,842 交错满 3 档全绿
+
+6. **并发测试与 bench**
+   - `btree_concurrent.rs` 8 个：disjoint inserts 逐 key 点查、split 风暴精确计数、并发 scan no-miss（先快照 committed 集再扫描，竞态安全）、重复键 lookup_all、root 分裂竞赛、分配失败注入重启、**小池驱逐风暴**（16 帧强制 split+CLOCK 驱逐交织）、1h soak（`#[ignore]`，env 可调）
+   - 全部带 watchdog（死锁回归 = 测试失败而非挂起）
+   - `m2c_btree_tps.rs`：auto-commit 100T ≈ 6.6K TPS；**single-txn 对照臂 100T ≈ 13.5K TPS**（摊掉 per-commit fsync，超 m2a 无索引基线）——证明 15K 未达由 fsync/组提交路径主导，**非 B+Tree latch 竞争**
+
+7. **Review 修复清单**（三轮对抗审查后）
+   - **delete 的 WAL 记录写错页面**（高，确定 bug）：`pin_leaf_for_write` hop 后 WAL 仍写下降时的旧 PageId → redo 静默丢删除或误删无辜条目；修复为 `guard.page_id()` 重绑定 + 并发 split 中删除 + 崩溃恢复测试
+   - **内部层左跳跨父边界 → cascade 把 downlink 插进错误父页**（高，潜在）：cascade 用栈中父页前先验证其确实持有指向 left 的 downlink（不满足响亮报错）；写路径内部层左跳改 Retry；场景入 Known limitations
+   - **cascade 中途分配失败 → 子树永久楔死**（中）：`BufferPoolFull` 折叠进重试预算；边界入文档
+   - **split_copy 的 flush(st.right) 驱逐窗口冒泡 PageNotFound**（中）：视为成功（当时注释声称"驱逐器必先完成 WAL-before-data 刷盘才摘页表项"——终审发现该顺序描述与实际相反，见下条终审修复）
+   - **flush() 干净页快路径破坏 split_copy 耐久契约**（高，第三轮）：并发 flusher 清 dirty 但 fsync 在途时第二个 flush 早退 → 掉电可致 left-past/right-missing 不可恢复（checkpoint 变体可静默陈旧）；修复 `FrameMeta.flushing` + Condvar——并发 flush 等待在途 flush 完成耐久决策后才返回
+   - **evict_frame 摘页表项先于刷盘，PageNotFound 容忍失效**（高，终审阻断项）：驱逐顺序原为 ①置 evicting → ②摘映射 → ③flush_frame，窗口 [摘映射, fsync 完成] 内 split_copy 拿到 PageNotFound 提前放行 → 掉电可致 redo Commit downlink 指向空右页（索引静默丢 key）。修复 `evict_frame` 改为**先 flush_frame 后摘映射**（`evicting` 已拒新 pin，映射留着无碍）；flush 失败时清 `evicting` 保留映射传播错误——**顺带修复 Stage N 遗留的"flush 失败帧永久泄漏"**（旧顺序下失败即丢映射、脏内容永久不可达）。与 H1 的 flush_done 握手组合后：split_copy 的 flush 要么找到映射并等待在途驱逐刷盘完成、要么在驱逐者刷盘完成后才见 PageNotFound，两条路径都耐久
+   - **根分裂复用 freelist 回收页无 FPI → 恢复后根页损坏**（高，第三轮）：回收页磁盘上是前任内容（`pd_upper != 0`），redo 的 `init_if_fresh` 失效；修复 `create_new_root` 补 `log_page_init`（与 `create` 同模式）
+   - **分裂点按条数不按字节 + 不感知待插 entry → PageFull 楔死**（高，第三轮）：新增 `choose_split_slot` 按 PG `_bt_findsplitloc` 思路把 pending entry 字节纳入切点约束（含存在性论证）；父页 downlink 路径同理；side-choice 统一 `entry_cmp` 全序
+   - **(key,child) tie 的页号单调假设被 freelist 复用打破**（中，第三轮）：right-ownership 命中时先查父页 downlink 存在性，有则耦合右跳（写楔死降级为多一跳）；insert 叶满一律升级悲观；validate 仅在分隔键相等时容忍乱序
+   - **validate 用 handle 缓存 root → 静态树误报**（中，第三轮）：抽 `root_from_meta` 只读函数，open/refresh/validate 共用
+   - **undo 重插继承 insert 虚假失败面**（中，第三轮）：`insert_with_budget` 参数化预算，undo 走独立大预算（1<<20），失败日志升 error
+   - **split Commit 的周期 FPI 落在 Commit 记录之后 → FPI redo 回滚已提交 split**（P0，Stage T 压测发现）：`split_commit` / `split_commit_guarded` 原先**先 append Commit 记录、后 pin_mut 修改页**；checkpoint 在 Copy→Commit 间开启新 FPI 周期时，pin_mut 触发的周期 FPI 位于 Commit 之后却含提交前镜像（SPLIT_INCOMPLETE 未清）——违反"FPI 内容必须包含所有 LSN < FPI 位的修改"不变式。FPI redo 无条件整页恢复并把 pd_lsn 补过 Commit LSN，Commit redo 的 pd_lsn 守卫跳过清标志/插 downlink → undo H3 页扫描误判已提交 split 为未完成，发伪造 CLR 向父页重复插 downlink。修复：Commit 在固定记录 WAL 位置**之前**用 scoped `pin_mut` 预触其修改的每页（parent→left 降序）打出到期 FPI，append 后改用 `BufferPool::pin_mut_without_fpi` 重取做 apply（被否决的替代方案"持 left latch 跨 append/父页修改直到 apply"会与乐观路径 right-hop/coupling 编排死锁，btree_concurrent 2/2 挂死实证）。复核追加关闭第三方残余：乐观/悲观写路径（`pin_leaf_for_write`/`descend_write_path`）改 `pin_mut_without_fpi` 取锁，且对 SPLIT_INCOMPLETE 页**整段持有期跳过 `ensure_fpi`**——窗口内写按 Stage S 设计放行但绝不发 FPI（无 FPI 即无 stale 镜像；`btree_undo_clr` 两个 in-window 测试为此契约）。初版"flagged 且 FPI 到期才升级"的混合方案因 check-then-emit TOCTOU（判定读 checkpoint_lsn 与 ensure_fpi 重读之间可插入新周期）被复核否决，且 `ensure_fpi` 先补发再升级为时已晚。guarded 根分支对 new_root 的 apply 原先仍是裸 `pin_mut`（fresh 假设在 checkpoint 于 create_new_root→apply 窗口刷过新根时失效，stale FPI 会静默丢弃 slot-1 downlink 且 undo 无法修复），已补 new_root 预触 + `pin_mut_without_fpi` apply。确定性回归 `btree_split_crash.rs::test_btree_split_commit_fpi_precedes_commit_record` / `test_third_party_write_on_committing_leaf_escalates_without_fpi` / `test_btree_split_commit_guarded_root_branch_new_root_fpi_order`（test-hooks 钩子驱动在线根提升交错；均修复前红、修复后绿）
+   - 测试类：注入钩子改 thread-local 防并行消耗、loom 桩补调度点、loom 注释修正、TPS 归因对照臂、**m2c_index_concurrent E2E**（索引表 + 并发 DML + 随机 abort + split + 周期 checkpoint + validate/对拍）、并发 flush 单测、混合大小 key 楔死场景、freelist 乱序写路径、回收页根分裂崩溃恢复
+
+8. **CI 与工程化**（设计终审后）
+   - CI 修复：`--all-features` 会启用 loom 致全部非模型测试 panic（提交必红）——pg-storage/pg-am-btree test 步骤改默认 features；新增 loom job（`LOOM_MAX_PREEMPTIONS=2`）+ parking_lot grep 守卫
+   - `SPLIT_ALLOC_FAILURES` 注入钩子 feature 门控（`test-hooks`，默认关闭，dev-dep 自引用供测试）
+   - MSRV 1.86 + `--all-features` 编译 loom 0.7 本机实证通过
+
+### 设计理由
+
+**1. 为什么读路径必须改成真 crabbing（而不是沿用"先放父再拿子"？**
+单线程下放父拿子无妨；并发下 parent split 可在窗口内插入，下降会走错子树。crabbing 的代价是父子 latch 短暂重叠（DOWN 序，无死锁面），换来每一层决策都在 latch 保护下。
+
+**2. 为什么乐观写不做 latch upgrade？**
+parking_lot 未暴露 upgrade；更根本的是 drop-and-re-pin 之后**无论如何都要重验证**（叶子可能已被 split）——upgrade 省下的只是锁转换，省不掉重验证，引入新 API 得不偿失。
+
+**3. 为什么 pessimistic 全路径写 latch 而不是"安全节点"优化？**
+spec（§13.2）就是从根全路径 X latch；split 是稀有路径（乐观路径承担绝大多数插入），串行化 split 换取协议推演的简单性。root 写 latch 同时天然串行化 root 提升，代际校验得以保持简单。
+
+**4. 为什么 loom 层不别名 Arc？**
+loom 的 `Arc` 在 stable 上无法做 `Arc<dyn Trait>` 协变，强行别名会级联到全部下游 crate；引用计数不是竞争面，排除它让 cfg 层收敛在 pg-storage 一个 crate 内。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL (nbtree) | pg_rust (Stage Q) | 取舍理由 |
+|---|---|---|---|
+| 读并发 | latch coupling（同） | 同（crabbing + Blink 右跳） | 一致 |
+| 写路径 | 乐观叶写 + 悲观重走（同） | 同（悲观为**全路径** X latch；PG 有"安全节点"提前释放优化） | 简单优先；split 稀有，性能归 Phase 7b |
+| 模型检查 | 无 | loom 2 模型 2 万+ 交错 | PG 无此实践；覆盖 loom 能力边界（多级级联 split 未覆盖，由压力测试兜底） |
+| 页合并/压实 | vacuum 触发 merge | **不做**；1-entry 页死空间仅 split 可回收（M2b 既有边界，审查中实测踩到） | 归 M2c+/Stage S |
+| 未完成 split 收尾 | 无 CLR（PG 靠 _bt_finish_split 在线收尾） | **不做**（SPLIT_INCOMPLETE 在线拒二次分裂；cascade 中途失败 = 子树写不可用） | 归 Stage S（CLR） |
+| 并发 TPS | — | 15K 未达（auto-commit 6.6K，fsync 主导；对照臂 13.5K 证明 latch 非瓶颈） | 硬件 fsync 天花板；batch commit 归 Phase 7b |
+| validate | amcheck（可在线，带锁等级） | **静止态检查**（并发写入期 SPLIT_INCOMPLETE 非腐败） | M2c 语义差异已文档化 |
+
+### 已知残留与后续归队
+
+- loom 模型未覆盖多级树的父页递归 split（状态空间限制；由线程压力测试覆盖）→ 需要时专项模型
+- 1h soak 未实际执行（60s smoke 通过；命令已文档化 `BTREE_SOAK_SECS=3600`）
+- **insert 左跳越界修复（Stage T 压测抓出）**：insert 下降/落叶的左跳曾不受限，可把新条目写过分隔键到左侧页——churn 负载下孪生页被抽干成"黑洞空页"，探测在空页终止返回假 EntryNotFound。修复：insert 专用下降（`descend_to_leaf_for_insert` / `position_for_insert`），左跳限制在同键 run 内；定位型操作（lookup/delete）保持全左跳。回归测试 `btree_insert_left_hop.rs`（红→绿）
+- `btpo_prev` 链接陈旧（split 不更新 `old_next.prev`，prev 恒指最旧左页）：右链是 ground truth 所以无正确性影响，但"born-left 重复键 + 空孪生"极端组合下读路径可能漏条目 → 后续 stage 评估
+- 叶页死空间永不回收（`remove_entry_at` 只缩 LP 数组）：churn 负载下叶页因死空间反复分裂（上述左跳 bug 的放大器）→ 压缩回收涉及 slotted-page/WAL 不变式，单独评估
+- stale 内部分隔键间隙（内部最左子被 delete 抬高 + probe 落间隙）→ 预算耗尽响亮 Unsupported，不自愈 → Known limitation，根治归 Stage S（CLR/分隔键维护）
+- validate 的盲区：同父页下相等分隔键的两个子树被对调时不报警（无代码路径能产生；查找经链 hop 自愈）→ 接受
+- commit barrier 写 guard 覆盖整个 checkpoint（commit 停顿随 split 脏页增多拉长；文档已对齐，收窄归 Phase 7b）
+- CLOG 全局单锁（命中也写锁 + 锁内 I/O）；allocation_lock 下等组提交 fsync → 均归 Phase 7b 性能项
+- 1-entry 页死空间压实（page compaction）→ 排入 M2c+ 路线图
+- 死锁检测（表锁 × 行锁 × 页 latch 三层等待）→ **Stage R**
+- CI：已加 loom job（`LOOM_MAX_PREEMPTIONS=2`，模型 1 自钳披露）与 parking_lot grep 守卫；1h soak 不进 CI → 需要时 nightly
+- `SPLIT_ALLOC_FAILURES` 注入钩子已 feature 门控（`test-hooks`，默认关闭，dev-dep 自引用供测试）
+
+---
+
+## Stage R：死锁检测
+
+**状态**：✅ 完成（M2c，工作区测试全绿；未提交）
+**工期**：预估 3–5 天
+**验收**：`deadlock_detection` 11/11（2/3/4 事务环 + 行锁环 + 混合环 + 共享 victim 双环 + churn soak）；检测延迟实测 99–106ms（≤200ms）；tick p99 ≈ 204–229µs（≤5ms）；检测线程 busy/wall ≈ 0.05–0.07%（<1%）
+
+### 交付内容
+
+1. **DeadlockDetector（`pg-txn/deadlock.rs`）**
+   - 后台线程 100ms tick（`EngineConfig.deadlock_detector_interval` 可配）：快照双源 → 迭代式三色 DFS 找环（确定性按 XID 排序）→ 环内 max XID 为最年轻 victim → **撕裂快照复核**（重读双源，环上每边仍在且 victim 仍 active）→ mark + 双 condvar 广播
+   - tick 整体 `catch_unwind` + panic 计数（线程不死）；tick 耗时环形缓冲供性能验收；`stop()` 幂等、Drop 兜底 join、stop flag + notify 即时唤醒（shutdown 不等一个 tick）
+   - **硬边策略**：行边 = `wait_edges()`；表边 = 等待者 → 所有模式冲突的持有者；FIFO 排队顺序不产生边（PG soft-edge 队列重排超出 M2c，模块文档记录了该盲区与"硬边足以发现纯冲突环"的论证）
+
+2. **Victim 中断通道**（兑现 Stage P 的 TODO）
+   - `DeadlockVictims`（`Mutex<HashSet<Xid>>` 共享注册表，**叶锁**：合法嵌套只有 registry→victims 与 entries→victims）
+   - `wait_for`：每轮迭代在 registry 锁内**先查 victim flag**——命中则消费 flag、清自己的等待边、返回 `TxnError::DeadlockVictim`
+   - `LockManager::acquire`：同构——命中则消费、摘出等待队列、`regrant_heads`（不授予与 victim 仍持有锁冲突的请求）+ 广播，返回 `LockError::DeadlockVictim`；已授予锁保留（2PL），由调用方 abort 路径 `release_all`
+   - 标记幂等：`end_txn` 清 stale flag；tick 开头清理已结束 XID 的残留 flag（覆盖 mark-晚于-clear 竞态）
+   - 错误管线：`TxnError::DeadlockVictim` → `HeapError::DeadlockVictim`("deadlock detected")→ EngineError；显式事务语义同 PG——当前语句失败，调用方必须 abort
+
+3. **引擎接线**
+   - `Engine::open`：创建共享 victims 注册表 → TxnManager/LockManager 各装一份 → 最后启动检测器；`shutdown` 先停检测器再停 storage
+   - auto-commit 路径的 deadlock 错误走既有"语句失败 → index undo → abort → release_all"通用通道，零新机制
+
+4. **Review 修复清单**（三轮对抗审查，未发现高危）
+   - `end_txn` 锁序注释补 registry→victims 嵌套（文档与代码矛盾）
+   - victim 消费路径与 `try_acquire` 的 `entry().or_default()` 空 LockEntry 泄漏（改 `get_mut`）
+   - 检测器性能：`table_lock_states` 跳过无等待者的表（克隆成本从总锁数降到竞争锁数）；同一 tick 的 re-verify 复用单次快照
+   - 性能测试抖动修复：CPU 预算断言改按生产 100ms interval 实测 40 tick（原 10ms 加速口径余量太薄）
+   - engine 模块文档补"虚假 DeadlockVictim 可能性"说明
+   - `interval=0` 忙循环（第三轮）：`start` 入口钳制到 1ms 下限 + 测试钉住
+   - Torn-snapshot 文档扩写（第三轮）：复核快照自身亦撕裂（never-coexisted 混合环可通过复核），误标概率非零但语义安全
+   - `start` 的 `Arc::ptr_eq` 防呆断言（设计终审建议）：三处共享同一 victims 注册表从文档承诺变开发期断言
+   - 测试补强（第三轮）：共享 victim 双环（钉住 is_marked 跳过分支）、churn soak-lite（8 线程 3 秒，实测 477 次 victim abort、panic=0、终态全排空）
+
+### 设计理由
+
+**1. 为什么 victim 标记制而非检测器直接 abort？**
+victim 通常正阻塞在 wait 里，第三方线程直接拆它的事务会与 victim 自身执行并发。标记 + 唤醒 + victim 自报错（PG 同款形态）让所有清理（index undo、CLOG、release_all）走已有的调用方 abort 路径，零新机制。
+
+**2. 为什么周期 tick 而非 PG 的惰性触发（deadlock_timeout 后阻塞者自查）？**
+我们的等待图是双源（row_wait_registry + LockManager），让被阻塞事务自己合并快照会污染 hot path；周期 tick 换取 ≤200ms 的检测延迟（agent 场景敏感），成本被验收约束在 CPU <1%（实测 0.07%）。
+
+**3. 为什么复核后仍接受残余误杀？**
+双源快照非原子：复核通过到 mark 落地之间环可能消散且 victim 已合法拿锁继续运行——其下一次 wait 会虚假失败。语义上安全（可重试错误）、概率极低、与 PG 在 deadlock_timeout 竞争下的可观察行为一致；用`end_txn` 清理 + tick 开头清理把残留窗口压到最小。
+
+**4. 为什么 FIFO 排队不产生边？**
+环只能由 hold-and-wait 构成；排在前面的等待者本身不持有锁，等待者→等待者的边不构成死锁。PG 的 soft-edge 队列重排会破坏我们的反饿死公平性承诺，明确不做。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage R) | 取舍理由 |
+|---|---|---|---|
+| 触发 | 惰性（`deadlock_timeout` 默认 1s，阻塞者自查） | **周期 tick（100ms 后台线程）** | 检测延迟 ≤200ms vs 1s 级；成本常开但被验收约束 |
+| 等待图数据源 | 统一锁表（XID 虚拟锁入同一锁表），大锁下一致快照 | 双源（row_wait_registry + LockManager），非原子快照 + 复核 | 行锁等待不进锁管理器是 Stage P 的热路径取舍 |
+| 边类型 | 硬边 + 软边，软环尝试队列重排 | **仅硬边** | 软环罕见；重排破坏 FIFO 反饿死承诺 |
+| Victim 选择 | 触发检测的进程自己 | **环内最年轻（最大 XID)** | 保护老事务；代价是跨线程标记竞态（幂等 + 清理兜底） |
+| 检测成本 | 无死锁时零成本 | 常开（实测 0.07% CPU，p99 204µs） | 快照只克隆受竞争的表 |
+
+### 已知残留与后续归队
+
+- 虚假 DeadlockVictim 残余窗口（复核→mark 间隙）→ 接受，语义安全，已文档化
+- 软边环（纯 FIFO 排队构成）不检测 → 观察项。**核销（Stage T)**：死锁注入压测 1000 环（含无环对照组）全绿，未出现软环形态；维持不检测
+- `lock_timeout` / NOWAIT / SKIP LOCKED 无（wait_for 无超时参数）→ Phase 6 协议层需求出现时评估"XID 虚拟锁统一进 LockManager"的重构
+- pg-txn 无 tracing 依赖，tick panic 只计数不告警 → 可观测性归 Phase 7a
+- SQL 层表达不出纯表锁环（显式事务内 DDL 被拒，AS/RE 互不冲突）→ engine 级表锁环测试用原始 XID 驱动，已注明
+
+---
+
+## Stage S：HOT update + ARIES Undo（B+Tree CLR）+ Multixact 简版
+
+**状态**：✅ 完成（M2c，已提交 ddc1ae6；其后两轮评审修复均已落地：第一轮 C1/C2/H3，第二轮 H1/H2/H4/H5 + B1–B10，工作区测试全绿）
+**工期**：预估 7–10 天
+**验收**：`btree_undo_clr` 13/13（含修复轮的 9 个状态矩阵测试）+ `btree_split_crash` 5/5 + `hot_update` 5/5 + `hot_chain` 4/4 + `m2c_locks` 16/16 + `m2c_index_concurrent`（并发 DML 抓出 HOT 链递归读锁死锁，见设计理由 6）全绿；`m2b_crash_rounds` 25 轮（CI 口径）全绿，每轮携带 B+Tree leaf/root split、HOT/非 HOT update、`FOR SHARE`；`cargo test --workspace` 601 测试 + `cargo clippy --workspace --all-targets -- -D warnings` 全绿
+
+### 交付内容
+
+三条互相独立的轨道 + 一条把三者压进同一个崩溃流的集成验收。
+
+1. **Multixact 简版（`FOR SHARE`）**
+   - `HEAP_XMAX_IS_SHARE = 0x4000`（`t_infomask`），始终与 `HEAP_XMAX_LOCK_ONLY` 同时置位：共享锁与排他锁的区分不引入独立 multixact 段，完整 multixact 推迟 Phase 6
+   - `lock_tuple_shared` 走与 `lock_tuple` 同构的 §9.1 restart 门；LOCK_ONLY 位在可见性判定中屏蔽 `t_xmax`，被共享锁定的行照常可见
+   - **share/share 真正共存（第二轮修复 H5）**：堆 AM 内维护内存持有者注册表 `(page_id, slot) → XID 集合`。行锁本就无 WAL，注册表同为易失状态，崩溃后与锁章语义一同消失（死 XID 章经崩溃豁免视为 aborted），自洽。首位持有者盖 `t_xmax` 章，后续 FOR SHARE 只注册不覆盖章（`ProceedNoStamp`）；写者/FOR UPDATE 请求者逐一等待**全部**存活持有者（每次 restart 重估集合）；同事务 FOR SHARE → FOR UPDATE/写升级等待其余持有者；对已持排他锁的行再 FOR SHARE 不降级。注册表惰性清理（持有者事务结束不主动移除，下次过门时修剪）
+   - SQL 侧 `SELECT ... FOR SHARE`；`m2c_locks::for_share_locks_row_and_stays_visible` 钉住，H5 语义由 `for_share_coexists_with_for_share` / `writer_waits_for_all_share_holders` / `for_share_upgrades_within_same_txn` / `for_share_upgrade_deadlock_detected` 钉住
+
+2. **HOT update**
+   - `HEAP_HOT_UPDATED`（旧版本）/ `HEAP_ONLY_TUPLE`（新版本）+ `t_ctid` 前向链，链不跨页
+   - `hot_eligible` 判据：表上**所有**索引列取值不变（由调用方断言）；旧页是否有空位由 AM 自行判定（第二轮修复 B7 文档澄清）——有空位则同页追加新版本并跳过索引维护，空位不足则回退跨页非 HOT 路径
+   - `HeapHotUpdate` WAL 记录（`page_id, old_slot, new_slot, new_tuple, xmax`）+ pd_lsn 守卫的幂等 redo（10x 重放回归测试，B1）
+   - 可见性侧：`index_lookup` 与 scan 在旧版本不可见时沿 `t_ctid` 跟链**直到链尾**（第二轮修复 H1：原先硬编码 8 跳上限，9+ 次同页 HOT 更新的行会从 scan 和 index_lookup 同时消失——无 vacuum 系统链只增长。三处链跟随统一为 pg-am-heap 的两个共享 helper：前向 `follow_hot_chain`、反向 `hot_chain_root`，均以页内 slot 数为环保护上界，越界报 `Corrupted`；`hot_chain_root` 顺带把每跳全页扫描改为一次 `t_ctid→slot` 映射，B6）
+   - **索引维护缺陷修复**：`HEAP_ONLY_TUPLE` 自身从未获得索引项，因此对它的改键 update / delete 必须退掉**链根**的索引项。原实现按后代 TID 删除，报 `EntryNotFound` 并让索引与堆失去一致；新增 `Engine::hot_chain_root`（页内反向遍历 line pointer 到首个非 `HEAP_ONLY_TUPLE` 版本，HOT 链不跨页所以搜索是页局部的），回归测试 `dml_on_a_hot_descendant_retires_the_chain_root_entry`
+   - **CREATE INDEX bulk load 缺陷修复（第二轮修复 H2）**：bulk load 的 heap scan 产出的是可见版本——HOT 链尾——按链尾建项会让后续改键 update / delete 经 `hot_chain_root` 删除时永远 `EntryNotFound`。修复：建项前把可见版本映射到链根（create_index 持 Exclusive，无并发写者竞态）。回归测试 `create_index_over_hot_chains_then_delete_is_consistent`
+
+3. **ARIES Undo + B+Tree CLR**
+   - `UndoHandler` trait + `UndoContext`（`pg-storage/recovery.rs`）：handler 由 `pg-engine` 注入，因为 `pg-storage` 不能反向依赖 AM crate
+   - `HeapUndoHandler`：堆无需逐条撤销（MVCC 天然屏蔽），唯一动作是把 ATT 每个 XID 在 CLOG 盖 `Aborted`——崩溃可能根本没写出 `TxnAbort`（深审修复 B3 文档化：该盖章无 WAL 记录、无显式 flush，首次 checkpoint 的 `ClogFlush` 钩子落盘前仅存在于内存；此前崩溃无害——下次恢复从 WAL 重推同一 ATT 并重盖，标记幂等，且缺 CLOG 项本就读作 `InProgress`（MVCC 不可见），与 Stage N"无显式堆 undo"决策一致）
+   - `IncompleteSplitTracker`：redo 期间由 Prepare/Copy/Commit/CLR handler 维护（`mark_prepare` / `mark_copy` / `clear`），redo 结束后剩下的就是需要 undo 补齐的 split；`mark_prepare` 记录 Prepare 的 LSN，填入 CLR 的诊断字段 `redo_ref_lsn`（第二轮修复 B8）
+   - `BTreeUndoHandler`：按 level 降序（叶先于父，深审修复 B4：同级 split 再以左页 id 为决胜键，CLR 发出顺序跨恢复字节确定）对每个未完成 split 调 `finish_incomplete_split`；只到 Prepare 的 split 用 `choose_split_slot_readonly` 重算中点。**H3（第一轮修复）**：undo handler 无条件运行并额外**扫描已分配页上的 `SPLIT_INCOMPLETE` 标志**——Prepare 早于 checkpoint 的 split 在重放窗口内不留记录，但标志已持久化在页上
+   - `BTreeSplitCLR` 记录（判别式 50）把 Copy + downlink + 清 `SPLIT_INCOMPLETE` 合成一条幂等记录；字段序为 `left_page / right_page / level / copy_start_slot / redo_ref_lsn（诊断用）/ parent_page / parent_insert_slot / new_root_page / meta_page / separator_key`（深审修复 B5：`separator_key` 移至**末尾**——analysis 阶段只对定长前缀做前缀解码，bincode 标准配置无长度上限，CRC 通过的坏长度前缀会触发无界分配；Stage S 新增判别式、pre-release，布局变更无迁移负担。`BTreeSplitCLRRecord::decode` 另加 `MAX_CLR_SEPARATOR_KEY_BYTES`（≈2698 + trailer）上限作纵深防御）
+   - **C1 收尾计划按当前页内容决定（第一轮修复）**：右页有 entry = Copy 已完成（NoMove，永不重复搬运，分隔键取右页首项）；右页从未写过 = 搬运 `left[copy_start_slot..]`（Move）；右页写过但已空 = Copy→Commit 窗口内右半被删光，**unlink** 放弃分裂（把空右页摘出兄弟链、只清标志，CLR 的 parent/new_root/meta 置 INVALID）
+   - **C2 级联（第一轮修复）**：父页放不下 downlink 时 undo 先分裂父页——递归至根——每级由自己的 CLR 完成；恢复单线程，任意级联前缀在下一次恢复时重新收敛
+   - **`apply_split_clr` 单一实现**：undo 路径与 `BTreeSplitClrRedoHandler` 调同一个函数，逐页 pd_lsn 守卫，收敛性是结构性的而非两份手写代码的巧合
+   - **`finish_incomplete_split` 改为 log-then-apply**：只读收集 → append+flush CLR 拿到 LSN → apply → 按 right→(new_root/parent/meta)→left 的顺序刷盘。任何页字节都不在 CLR 的 LSN 存在之前被改动
+   - **undo 期页修改的撕页防护（第二轮修复 H4）**：undo 阶段在 `checkpoint_lsn` 播种**之前**运行是刻意的——提前播种会让 `pin_mut` 在 undo 期间发 FPI，而 FPI 会把 pd_lsn 顶过已 append 的 CLR 的 LSN，使 apply 的逐页幂等守卫跳过 CLR 欠下的修改（实测 `btree_undo_clr` 两个 H3 测试即如此失败）。正确做法：`emit_and_apply_clr` 在 append CLR **之前**为每个将被修改的页显式 append 前像 `FullPageImage` 记录——FPI 重放无条件恢复前像（正是撕页修复语义）并把 pd_lsn 补到 FPI 自己的 LSN（仍低于 CLR），CLR 再干净地重放其上。为保证逐轮恢复收敛（FPI 重放会把页 pd_lsn 顶到 FPI 的 LSN），CLR 的 NoMove/unlink 分支现在也给右页盖 CLR 的 LSN
+
+4. **集成崩溃验收（`m2b_crash_rounds`）**
+   - `ixt(id INT, name TEXT)` + `name` 上的 B+Tree；索引键宽约 500B → 每叶仅约 15 项，一轮几十次插入即产生多次叶分裂与一次根分裂，kill 落点因此可能正处于 split 协议中途
+   - 同一 op 流混入 HOT update（只改无索引的 `id`）、非 HOT update（改索引列 `name`）、`FOR SHARE`；每个 op 最多新增一行，以维持父进程 mid 模式 `extras <= 1` 的前缀持久性不变式
+   - 每轮恢复后除既有的行内容比对外，追加：`validate()` 通过、每个已提交 `ixt` 行都能经索引查到、`ixt` 行数 > 30 时 `tree_level() >= 1`（否则该轮没有真正跑到 split 恢复，宁可响亮失败）
+
+### 设计理由
+
+**1. 为什么 undo 只补齐 split，不回滚堆元组？**
+§11.3 的简化 undo：堆的可见性判据是 `CLOG[xmin]`，把 ATT 成员盖成 `Aborted` 即让其全部写入不可见，逐条物理回滚是纯浪费。B+Tree 不同——`SPLIT_INCOMPLETE` 的右兄弟已在 `btpo_next` 链上但没有 downlink，这是**结构**破损，不是可见性问题，必须补齐。
+
+**2. 为什么补齐（redo-style）而不是回滚 split？**
+Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可能已把上半 entry 搬走。往回退需要把 entry 搬回并释放右页；往前推只需补 downlink。PG 同样选择"下一个访问者补齐"，我们只是把补齐时机固定在恢复期。
+
+**3. 为什么 undo 也必须 log-then-apply？**
+先改页再写 CLR 会留下"左页已 rebuild、右页已收到 entry、WAL 里没有 CLR"的状态；下一次崩溃恢复的 undo 会把同一批 entry 再搬一次。这正是本 stage 修掉的真实缺陷（右页 452 项而非 226 项，scan 返回 678 行而非 452 行），根因有两处叠加：`apply_split_copy` 是**追加**语义而 CLR redo 无条件传 `move_to_right = true`；`finish_incomplete_split` 从未给右页盖 CLR 的 pd_lsn，于是重放时 Prepare 的右页初始化被跳过、CLR 又追加一遍。
+**幂等不变式**：`move_to_right = right_lsn < clr_lsn`。左页已过 CLR 而右页没有 = 搬走的 entry 无处可寻，报 `Corrupted` 而不是静默丢数据。
+
+**4. 为什么 HOT 的索引维护要找链根，而不是给后代补一个索引项？**
+给后代补索引项就等于不做 HOT。PG 用页内 line pointer 重定向解决同一问题；我们的链不跨页，所以按 `t_ctid` 反向搜一页即可定位链根，且链上所有版本共享同一索引键（HOT 的前提就是索引列不变），链根的索引项携带的正是调用方读回的那个键。
+
+**5. 为什么用宽索引键而不是批量插入来制造 split？**
+父进程的 mid 模式要求每个 op 最多多出一行，批量插入会直接破坏这条不变式。把键 padding 到 500B 让每叶只装约 15 项，于是单行插入也能密集触发分裂。
+
+**6. 为什么 HOT 链遍历必须复用已 pin 的页，而不能再 pin 一次？**
+`parking_lot::RwLock::read()` 不可重入：同一线程持读锁期间再取读锁，只要中间有写者排队就自锁，而它还攥着外层读锁不放，整个 buffer pool 随之雪崩。首版 HOT 链遍历（`HeapAM::scan` 与 `Engine::heap_tuple_visible`）对 `chain_tid.page_id` 重新 `pin`，在 `m2c_index_concurrent` 的 6 写者 + checkpoint 并发下必然死锁（实测卡满 600s 看门狗，同一测试在 Stage R 基线只需 6.1s）。修法是直接读外层已 pin 的页——`HEAP_HOT_UPDATED` 只由同页快路径 `stamp_hot_update` 盖，**HOT 链永不跨页**，因此复用是语义使然而非权宜；`t_ctid` 若指向别页即为损坏，直接终止遍历。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage S) | 取舍理由 |
+|---|---|---|---|
+| 共享行锁 | multixact 段（多持有者共存） | **`t_infomask` 单 bit（`HEAP_XMAX_IS_SHARE`）+ 堆 AM 内存持有者注册表（H5）** | 锁本就无 WAL，注册表同为易失状态、崩溃即消失，语义自洽；完整 multixact（持久段、成员溢出页内）推迟 Phase 6 |
+| HOT 旧版本 | line pointer 转 REDIRECT（由 prune 回收） | **保留旧元组，靠 `t_ctid` 跟链**（LP REDIRECT 在本系统**没有生产者**——spec 偏差，B4 已注明；redirect 跟随分支加 slot 数上界防坏页栈溢出） | 无 vacuum/prune，页内死空间不回收 |
+| HOT 索引项回收 | vacuum 回收，update 期间不删索引项 | **改键 update / delete 即时删链根索引项** | 无 vacuum，只能即时维护；代价是需要 `hot_chain_root` 页内搜索 |
+| 未完成 split | 下一个访问该页的读者/写者补齐 | **恢复期 undo 阶段补齐 + CLR** | 在线路径不必处理"别人的半成品"；代价是恢复多一个阶段 |
+| Undo 范围 | 逐条物理 undo（含 CLR 链） | **仅 CLOG 盖 Aborted + 结构补齐** | MVCC 屏蔽让堆 undo 变成空操作 |
+
+### 已知残留与后续归队
+
+- `BTreeSplitCLRRecord.redo_ref_lsn` 仅诊断用；redo 窗口内见到的 Prepare 其 LSN 已记入 `IncompleteSplit` 并填入 CLR（B8），仅 H3 页扫描发现的 split（Prepare 早于重放起点）保持 `Lsn::INVALID`；CLR 循环保护实际由逐页 pd_lsn 守卫承担 → 若将来出现嵌套 CLR，需要真正记录参考 LSN
+- ~~HOT 链深度上限硬编码为 8；超长链的尾部版本在 `index_lookup` 中判不可见（scan 不受影响）~~ **已修复（H1）**：原说法有误——8 跳上限同时影响 scan 与 `index_lookup`（9+ 次同页 HOT 更新的行从两者一起消失）。现在两处前向跟随统一走 `follow_hot_chain`，跟到链尾、以页内 slot 数为环保护上界；回归测试 `hot_chain_deeper_than_8_hops_visible_via_scan_and_index`（engine 级 scan + index_lookup）与 `test_hot_update_chain_20_followed_to_end`（heap 级）
+- 无 page prune / vacuum：HOT 链把页填满后即退化为跨页非 HOT update → M2c+ 路线图
+- undo 阶段的两处全页扫描（`scan_split_incomplete_pages` O(allocated_pages)、`find_parent_page` O(N × allocated_pages)）：恢复单线程且罕见、只读 pin，阶段内可接受；大库恢复 I/O 可闻时再优化（P2-1/P2-2）
+- share 持有者注册表（H5）条目在真实 delete/update 盖戳时由 gate 的 `note_stamp_overwrite` **即时摘除**（非惰性）；惰性修剪只覆盖崩溃持有者残留（死 XID 章视为 aborted 兜底）——盖章在摘除后失败会在两者间留一个无注册项的锁章，仅延迟等待、无正确性影响（P2-4 实测澄清）
+- `m2b_crash_rounds` 默认 25 轮（CI 口径），plan 的 1000 轮口径需手工跑 → Stage T 的崩溃自动化承接
+- ~~Multixact 简版记不住共享锁持有者集合，因此不支持"多个事务同时持共享锁后其中之一升级"~~ **已修复（H5）**：堆 AM 内存持有者注册表支持 share/share 共存与升级等待；仍归 Phase 6 的是完整 multixact（持久段、成员集合溢出的页外存储、崩溃后仍精确的持有者恢复——当前注册表崩溃即弃，靠"死 XID 章视为 aborted"兜底，与无 WAL 锁章的设计一致）
+
+---
+
+## Stage T：100 并发压测 + Benchmark + M2c 综合验证（M2c 出口）
+
+**状态**：✅ 完成（release 全量 621 测试全绿；M2c 出口）
+**工期**：预估 5–7 天
+**验收**：见下"验收终账"；C 类全过，P 类按 §20 下调并归因落盘（`docs/phase1-m2-benchmarks.md`）
+
+### 定位
+
+验证型 stage：无新机制，交付压测/基准/文档，并用它们把前五个 stage（P/Q/R/S + 存储底座）第一次全部放在一起长时间压。**它抓出 5 个此前全绿测试发现不了的真 bug**——这是本 stage 的核心价值。
+
+### 交付内容
+
+1. **压测设施**（全部带 watchdog，回归=失败而非挂起）
+   - `m2c_stress.rs`：N 连接混合负载（INSERT/HOT UPDATE/DELETE/点查 + 显式事务 + 后台 checkpoint），sleep 配速；终态堆↔簿记逐行比对 + 索引 validate + 泄漏三连查；env 可调（CI 30s/16conn）
+   - `m2c_deadlock_stress.rs`：随机 2–4 事务环（Barrier 保证闭合）+ 无环对照组；断言恰好一个最年轻 victim、有界延迟、零误报、零泄漏
+   - `m2b_crash_rounds.rs` 并发子进程变体：多线程写（含索引表/HOT/持续分裂）+ 后台 checkpoint，随机点 kill -9，逐线程前缀持久性 + 恢复一致性校验
+2. **Benchmark 集合**：验收命令 5 个 bench 全部就位 + 补 `heap_mixed`、`btree_split`；`docs/phase1-m2-benchmarks.md` 落盘（每项 target + 实测 + 未达标归因 + 长跑实际执行记录）
+3. **压测抓出并修复的 5 个 bug**（全部带红→绿确定性回归测试）
+   - **checkpoint/FPI 竞态（P0）**：split Commit 先 append 后 pin_mut，新 FPI 周期在窗口开启 → FPI 落在 Commit 之后但含提交前镜像 → 恢复复活未完成 split。修复：Commit 修改页全部 pre-touch（FPI 先于 Commit 记录落 WAL）+ apply 走 `pin_mut_without_fpi`；第三方写者路径 flagged 页整段跳过 FPI（TOCTOU 安全）
+   - **恢复侧 loser 索引补偿缺失（P0，预存）**：kill 落在索引维护与 commit 之间 → 可见行永久丢索引项（在线 abort 有 undo 日志，恢复路径无对应物）。修复：`compensate_loser_index_entries`（从 WAL 收集 loser 受害 tid，按堆页字节重算 (key, chain_root)，幂等重插 + CRC resync 回卷扫描起点）
+   - **WAL 撕裂尾部误判 corrupted（高）**：预分配段的零填充使撕裂尾"看起来完整"但 CRC 失败 → 重开硬失败。修复：`is_torn_tail` 双重判定（header LSN == 位置 + 记录之后全零）；已知局限（payload_len bit-rot 放大场景）文档化，根治（header 自 CRC）归后续
+   - **insert 左跳越界（高）**：新条目可写过分隔键，churn 把孪生页抽干成"黑洞空页" → 假 EntryNotFound。修复：insert 限同键 run 内左跳
+   - **并发重复 run 跨边界乱序（高，release 50% 复现）**：陈旧 prev 链 + 边界落位乐观检查竞态 → (key,tid) 链序倒置且 validate 的相等-separator 豁免放过了它。修复：`nearest_nonempty_left`（prev 降级为提示、向右走 ground-truth 链找真左邻）+ slot-0 落位在左邻写闩内原子化 + 乐观/悲观两路径同一判定 + validate 新增全链 `last < first` 严格序检查
+
+### 验收终账
+
+| 验收项 | 结果 |
+|---|---|
+| 全量回归 | ✅ debug 618 + release 621 全绿（含 loom) |
+| 1000 轮崩溃（含 split-in-progress） | ✅ 3043s |
+| 并发崩溃 × 激进 checkpoint | ✅ 40 轮连跑全绿（修复后） |
+| 保底压测 50conn×100tps×30min | ✅ 1802.7s，终态一致、零泄漏 |
+| 挑战压测 100conn×60min | ⚠️ 未执行（命令已文档化） |
+| 死锁注入 1000 环 | ✅ 每环恰好 1 victim、对照组 0 误报、延迟 ≤78ms |
+| 性能 P 类 | 按 §20 下调：WAL 18.3MB/s、并发 INSERT 6.6K（均 fsync 封顶，对照臂证明非 latch/锁竞争）；读路径全部超标（点查 1.05M QPS、BP 随机读 2.1M ops/s、CLOG 命中 98.4%/100%） |
+| 回归传承（M1/M2a/M2b） | ✅ 含在全量中，无弱化（抽查确认 Stage S/T 对既有测试只有增强） |
+
+### 已知残留与后续归队
+
+- 挑战档长跑与并发 crash 1000 轮未执行（时间成本；命令在 benchmark 文档）→ 需要时手动
+- torn-tail 的 header 无自 CRC（payload_len 被 bit-rot 放大的残余误截窗口）→ 结构性修复归后续（PG xl_crc 模式）
+- `btpo_prev` 陈旧链（prev 恒指最旧左页）已从"纯文档"升级为被 `nearest_nonempty_left` 实际依赖提示——残余窗口（左侧全空时的 TOCTOU）有 validate 全链检查兜底 → 后续 stage 评估 prev 维护
+- 叶页死空间不回收（churn 分裂放大器）→ 压实/合并归 M2c+/vacuum(M3)
+- 所有性能 P 类未达标项的根治（batch commit、O_DIRECT、io_uring）→ Phase 7b
+
+---
