@@ -49,67 +49,76 @@ Postgres（行存 + pgvector）+ Redis（缓存）+ Qdrant/Milvus（向量）+ E
 
 ## 2. 总体架构
 
+### 图 1：整体分层架构（简化视图）
+
 ```mermaid
-flowchart TB
-    subgraph Agent_Ecosystem["Agent 生态"]
-        A1[psql / SQLAlchemy / Prisma]
-        A2[LangGraph / LlamaIndex / AutoGen]
-        A3[MCP Client]
-        A4[BI Tools DBeaver/DataGrip]
-    end
+flowchart TD
+    Client["Agent 生态<br/>psql / LangChain / MCP Client / BI Tools"]
+    Protocol["协议层<br/>PG Wire / MCP / REST / WebSocket"]
+    AI["AI Native API 层<br/>Parser / Planner / Auto-Embed / LLM Gateway"]
+    Exec["执行层<br/>DataFusion / 混合检索 / 索引回表"]
+    Tx["事务与并发层<br/>Transaction Manager / MVCC / Lock+Latch"]
+    Storage["统一存储内核<br/>WAL + Buffer Pool + Row Store + Multi-Modal Indexes"]
+    IO["物理 I/O<br/>Data Files / CoW Snapshots / Object Storage"]
 
-    subgraph Protocol_Layer["协议层"]
-        P1[PostgreSQL Wire Protocol]
-        P2[MCP Server JSON-RPC 2.0]
-        P3[HTTP/REST/OpenAPI]
-        P4[WebSocket/SSE 实时推送]
-    end
-
-    subgraph AI_API_Layer["AI Native API 层"]
-        Q1[SQL Parser + Planner DataFusion]
-        Q2[Auto-Vectorization embed]
-        Q3[LLM Gateway UDF]
-        Q4[NL2SQL / Query Advisor]
-    end
-
-    subgraph Execution_Layer["执行层"]
-        E1[向量化执行器 Arrow RecordBatch]
-        E2[混合检索执行器 RRF/条件路由]
-        E3[索引回表 TID → Row]
-    end
-
-    subgraph Transaction_Layer["事务与并发层"]
-        T1[Transaction Manager]
-        T2[Snapshot / Visibility]
-        T3[Lock Manager + Latch Manager]
-        T4[Write Set / Undo Log]
-    end
-
-    subgraph Storage_Kernel["统一存储内核"]
-        S1[WAL Append-Only Log]
-        S2[Buffer Pool / Page Directory]
-        S3[Row Store Slotted Pages]
-        S4[Columnar Projections HTAP]
-        S5[HNSW Index]
-        S6[Inverted Index]
-        S7[Graph Index]
-        S8[Time-Series / KV Index]
-        S9[Catalog System Tables]
-    end
-
-    subgraph Physical_IO["物理 I/O"]
-        I1[Data Files DB]
-        I2[CoW Snapshots]
-        I3[Object Storage S3/MinIO]
-    end
-
-    Agent_Ecosystem --> Protocol_Layer
-    Protocol_Layer --> AI_API_Layer
-    AI_API_Layer --> Execution_Layer
-    Execution_Layer --> Transaction_Layer
-    Transaction_Layer --> Storage_Kernel
-    Storage_Kernel --> Physical_IO
+    Client --> Protocol --> AI --> Exec --> Tx --> Storage --> IO
 ```
+
+### 图 2：统一存储内核内部
+
+```mermaid
+flowchart LR
+    subgraph SK["统一存储内核"]
+        direction TB
+        WAL["WAL<br/>Append-Only Log"]
+        BP["Buffer Pool<br/>Page Directory"]
+        RS["Row Store<br/>Slotted Pages"]
+        CP["Columnar Projections<br/>HTAP"]
+    end
+
+    subgraph IDX["Multi-Modal Indexes"]
+        direction TB
+        HNSW["HNSW 向量索引"]
+        INV["倒排索引 全文"]
+        GRA["属性图索引"]
+        TSKV["时序 / KV 索引"]
+        CAT["Catalog 系统表"]
+    end
+
+    WAL <-- redo/undo --> BP
+    BP <-- read/write --> RS
+    BP <-- read/write --> CP
+    RS <-- TID+XID --> HNSW
+    RS <-- TID+XID --> INV
+    RS <-- TID+XID --> GRA
+    RS <-- TID+XID --> TSKV
+    RS <-- TID+XID --> CAT
+```
+
+### 图 3：Agent 写入记忆的数据流
+
+```mermaid
+sequenceDiagram
+    participant Agent as Agent Client
+    participant SQL as SQL / Planner
+    participant Tx as Transaction Manager
+    participant WAL as WAL
+    participant Row as Row Store
+    participant Vec as HNSW Index
+
+    Agent->>SQL: INSERT memory (content + embedding)
+    SQL->>Tx: begin transaction
+    Tx->>WAL: append Insert Row + HnswAddNode
+    WAL-->>Tx: fsync OK
+    Tx->>Row: write tuple version
+    Tx->>Vec: merge graph delta
+    Tx-->>Agent: commit OK
+```
+
+> **读图提示**：
+> - **横向**：Agent 请求从协议层进入，经 AI API、执行、事务，最终落到存储内核；
+> - **纵向**：所有持久化组件（行存、列存、向量、全文、图、时序、KV、catalog）共享同一个 WAL + MVCC + LSN；
+> - **关键**：Agent 的一次写入可能同时更新行存和多个索引，但只对应**一个事务、一次 WAL fsync、一个 LSN**。
 
 ---
 
