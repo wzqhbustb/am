@@ -1,0 +1,38 @@
+{
+  "runId": "wf_d11c62b0-680",
+  "workflowName": "deep-research",
+  "scriptPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/scripts/deep-research-wf_d11c62b0-680.js",
+  "source": "built-in",
+  "args": "数据库内核开发领域，资深专家被称为'老中医'，职业生涯长、经验极有价值。现在AI编码能力很强且不断进化，这个判断是否还成立？请深入研究：1) AI在系统编程和数据库内核开发中的现状与局限；2) 数据库内核专业知识为何难以替代（崩溃恢复、并发控制、查询优化、存储引擎设计）；3) AI如何改变系统程序员的生产力和职业前景；4) 数据库社区领袖（如Andy Pavlo、Michael Stonebraker、PostgreSQL/MySQL/TiDB社区工程师）对AI影响的观点；5) 历史类比——以往技术变革（高级语言、ORM、云数据库）如何影响内核专家；6) 2025-2026年AI在该领域能做好和做不好的具体任务。请用中文撰写报告。",
+  "meta": {
+    "name": "deep-research",
+    "description": "Deep research harness - fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+    "whenToUse": "When the user wants a deep, multi-source, fact-checked research report on any topic. Before invoking, check whether the question is specific enough to research directly; if underspecified, ask 2-3 clarifying questions, then pass the refined question as args.",
+    "phases": [
+      {
+        "title": "Scope",
+        "detail": "Decompose question from args into focused research angles"
+      },
+      {
+        "title": "Search",
+        "detail": "Run parallel WebSearch agents, one per angle"
+      },
+      {
+        "title": "Fetch",
+        "detail": "Deduplicate URLs, fetch top sources, extract falsifiable claims"
+      },
+      {
+        "title": "Verify",
+        "detail": "Use 3-vote adversarial verification per claim"
+      },
+      {
+        "title": "Synthesize",
+        "detail": "Merge findings, rank confidence, cite sources"
+      }
+    ]
+  },
+  "createdAt": "2026-06-30T06:17:33.986Z",
+  "updatedAt": "2026-06-30T06:56:23.096Z",
+  "status": "completed",
+  "outputPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/runs/wf_d11c62b0-680/output.json"
+}

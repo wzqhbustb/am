@@ -1,0 +1,267 @@
+{
+  "runId": "wf_d11c62b0-680",
+  "taskId": "wf-d11c62b0-680",
+  "workflowName": "deep-research",
+  "status": "completed",
+  "result": {
+    "question": "数据库内核开发领域，资深专家被称为'老中医'，职业生涯长、经验极有价值。现在AI编码能力很强且不断进化，这个判断是否还成立？请深入研究：1) AI在系统编程和数据库内核开发中的现状与局限；2) 数据库内核专业知识为何难以替代（崩溃恢复、并发控制、查询优化、存储引擎设计）；3) AI如何改变系统程序员的生产力和职业前景；4) 数据库社区领袖（如Andy Pavlo、Michael Stonebraker、PostgreSQL/MySQL/TiDB社区工程师）对AI影响的观点；5) 历史类比——以往技术变革（高级语言、ORM、云数据库）如何影响内核专家；6) 2025-2026年AI在该领域能做好和做不好的具体任务。请用中文撰写报告。",
+    "summary": "研究结论：在AI编码能力快速进化的2025年，数据库内核专家（\"老中医\"）的价值不仅未被削弱，反而因AI的系统性局限而得到强化。多项实证研究表明：AI在简单/重复性编码任务上有效，但在复杂系统编程、数据库内核开发等需要深度领域知识的场景中表现不佳甚至适得其反。METR随机对照实验显示资深开发者使用AI反而慢19%；LLM在缺陷上下文中准确率仅12%；在企业级text-to-SQL任务中准确率为零。业界领袖（Stonebraker、Pavlo）明确认为深度系统知识不可替代，AI将增强而非取代内核专家。历史类比表明每次技术变革都提升了而非消除了底层专家的价值。",
+    "findings": [
+      {
+        "claim": "AI在复杂代码场景中准确率急剧下降，存在系统性缺陷复制问题",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/html/2503.11082v1"
+        ],
+        "evidence": "GPT-4在含缺陷上下文中代码补全成功率仅12.27%（正常为29.85%）；44.44%的LLM生成bug与历史版本完全一致，表明模型在记忆缺陷模式而非真正推理；在bug-prone位置，生成正确代码的概率与生成错误代码几乎相等(1.01:1.00)。这对数据库内核开发（崩溃恢复、并发控制等对正确性要求极高的场景）构成致命风险。",
+        "vote": "3-0 (三项子发现均全票通过)"
+      },
+      {
+        "claim": "资深系统程序员使用AI工具反而效率降低19%，且存在严重的感知偏差",
+        "confidence": "high",
+        "sources": [
+          "https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/",
+          "https://www.tigerdata.com/blog/we-taught-ai-to-write-real-postgres-code-open-sourced-it"
+        ],
+        "evidence": "METR随机对照实验：16位资深开源开发者完成246个真实任务，使用Cursor Pro(Claude 3.5/3.7 Sonnet)的组比不使用AI的组慢19%。关键发现：开发者实验前预期AI加速24%，实验后仍主观认为加速20%——实际却减速19%。原因：AI生成'几乎正确'的代码需要大量审查和修复时间。研究指出'在质量标准极高、隐含要求(文档、测试)需要人类长期学习的环境中，模型能力相对更低'——这正是数据库内核开发的特征。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "GitHub Copilot未能显著提升代码产出量，在复杂架构问题上完全无效",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/html/2509.20353v2"
+        ],
+        "evidence": "实证研究显示Copilot上线后提交量无统计学显著增长；采用者每周净增仅16行代码；代码复杂度等质量指标未变。工程师明确表示'Copilot没有让难题消失'。对于大型系统构建，AI'缺乏所需的上下文理解能力'，工程师仍须依赖人类协作解决深层架构挑战。这直接说明数据库内核中的锁协议设计、WAL实现、MVCC等架构性难题不在AI能力范围内。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "AI在企业级数据库场景（text-to-SQL）中准确率为零，LLM生成的SQL包含细微但致命的错误",
+        "confidence": "high",
+        "sources": [
+          "https://vonng.com/en/db/db-year-review-2025/",
+          "https://www.tigerdata.com/blog/we-taught-ai-to-write-real-postgres-code-open-sourced-it"
+        ],
+        "evidence": "Stonebraker在MIT数据仓库上测试LLM的text-to-SQL翻译，准确率为零。原因：私有企业数据的schema、术语和业务逻辑LLM从未见过。他建议将AI限制在有限的结构化查询语法中，而非允许不受限的自然语言。TigerData团队发现：无专门指导时，AI生成的SQL会错误使用monetary类型、混淆identity策略等，因为LLM从整个互联网学习，混淆了不同数据库系统的惯例。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "Stonebraker认为深度系统知识不可替代，AI将使数据库事务技术成为AI工作流的基础设施",
+        "confidence": "high",
+        "sources": [
+          "https://vonng.com/en/db/db-year-review-2025/",
+          "https://www.linkedin.com/pulse/what-i-learned-from-listening-mike-stonebraker-andy-pavlo-gattani-mdfvc"
+        ],
+        "evidence": "Stonebraker明确指出：(1)'仅仅被教会编码'的技能将不再有市场价值，暗示深层系统知识才是核心竞争力；(2)AI Agent的持久化计算'基本就是ACID中的D'，传统数据库事务技术将成为AI工作流的基础层；(3)AI Agent需要管理状态并在多步骤流程失败时执行回滚，这需要将应用状态存储在数据库中。这意味着数据库内核专家的知识不仅不会过时，反而成为AI基础设施的核心。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "Andy Pavlo认为AI生成代码将使自动化数据库调优成为必需，因为'没有人在看着数据库'",
+        "confidence": "high",
+        "sources": [
+          "https://www.linkedin.com/pulse/what-i-learned-from-listening-mike-stonebraker-andy-pavlo-gattani-mdfvc"
+        ],
+        "evidence": "Pavlo指出：AI可以生成完整应用代码，但开发者可能因此不再手动优化存储系统。缺乏人类监督使自动化调优变得必不可少。这paradoxically增加了对数据库内核专家的需求——需要构建能自主调优的智能数据库系统，而这正需要深厚的查询优化和存储引擎设计知识。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "当前AI编码基准测试仅评估简单任务，AI在大型代码库中系统性失败",
+        "confidence": "high",
+        "sources": [
+          "https://news.mit.edu/2025/can-ai-really-code-study-maps-roadblocks-to-autonomous-software-engineering-0716"
+        ],
+        "evidence": "MIT研究者指出：标准基准测试评估的是'本科编程练习'级别的任务，仅触及真实项目代码库的微小部分。处理大型代码库时，AI频繁生成看似合理但实际错误的函数、违反内部规则、无法通过自动化验证系统。MIT研究者明确表示'我们的目标不是替代程序员，而是增强他们'。数据库内核（PostgreSQL有130万行代码）正是这类大型代码库的典型代表。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "LLM频繁引入安全漏洞，在高复杂度任务准确率低于30%",
+        "confidence": "high",
+        "sources": [
+          "https://arxiv.org/html/2412.15004v3"
+        ],
+        "evidence": "系统性文献综述确认：LLM经常忽略安全开发实践，频繁引入注入漏洞和内存错误；在高复杂度代码任务上准确率低于30%；模型在跨函数缺陷和复杂真实场景中表现挣扎。对于数据库内核——需要极其精确的内存管理、并发安全性和零容错的崩溃恢复逻辑——这些缺陷是不可接受的。",
+        "vote": "3-0"
+      },
+      {
+        "claim": "专家知识在AI时代价值不减：AI赋予专家'超能力'但不能替代专业判断",
+        "confidence": "high",
+        "sources": [
+          "https://magazine.sebastianraschka.com/p/state-of-llms-2025"
+        ],
+        "evidence": "Sebastian Raschka（ML研究者）在2025年LLM综述中指出：纯LLM生成的代码库不能替代专家精心构建的代码库；AI给专业人士'超能力'使其大幅提高生产力，但专家始终能比使用AI的新手产出更好结果；投资成为专家对于最大化AI效用和交付卓越成果仍然至关重要。这直接适用于数据库内核领域。",
+        "vote": "2-1（一位验证者认为'始终优于'的表述过于绝对）"
+      }
+    ],
+    "caveats": "1. METR研究样本量较小(16人/246任务)，虽然方法论严谨(随机对照、录屏验证)，但结论的外推性有待更大规模验证。2. AI能力进化极快，2025年中的实证数据可能在6-12个月内部分过时；但核心架构理解能力的跨越式突破目前无迹可循。3. Stonebraker的text-to-SQL零准确率可能是早期基线测试结果，后续优化版本达到2-11%但仍远不够实用。4. 多数研究关注通用编程任务，专门针对数据库内核开发的AI评估研究极少，部分结论是合理外推。5. '专家始终优于AI辅助新手'的主张有一位验证者提出反例(哈佛/BCG研究显示AI可能缩小专家-新手差距)，但在数据库内核这类极度专业化领域，该反例的适用性存疑。6. 来源中TigerData博客有推广自身产品的动机，但其技术观察与独立研究一致。",
+    "openQuestions": [
+      "2026年后随着更长上下文窗口(1M+ tokens)和更好的代码推理能力出现，AI能否突破'大型代码库理解'的瓶颈？",
+      "是否存在专门针对数据库内核代码(WAL、MVCC、B-tree实现)训练的领域特化模型？其表现如何？",
+      "AI辅助形式化验证(如TLA+规格自动生成)能否弥补AI在正确性保证方面的不足，从而间接削弱对人类专家的需求？",
+      "PostgreSQL、MySQL等社区是否有关于AI辅助内核开发的正式政策或实证经验报告？",
+      "在中国数据库生态(TiDB、OceanBase、openGauss)中，AI对内核开发流程的实际影响程度如何？",
+      "随着AI在代码审查和bug检测方面的进步，'老中医'的角色会从'编写代码'转向'审查和架构设计'吗？这种转变的时间线是什么？"
+    ],
+    "refuted": [
+      {
+        "claim": "TiDB/PingCAP CTO Ed Huang believes MySQL, not Postgres, will emerge as the primary database for AI agents because SQL acts as the essential link connecting LLMs with information and human supervision.",
+        "source": "https://www.linkedin.com/posts/analytics-india-magazine_tidb-powered-by-pingcap-cto-ed-huang-believes-activity-7340645631494930433-CoUy",
+        "vote": "1-2"
+      },
+      {
+        "claim": "Human domain expertise accumulated over decades is required to instruct AI systems to generate professional-grade database code; the AI cannot produce idiomatic, enterprise-ready code on its own without curated human knowledge translated into machine-readable skills.",
+        "source": "https://www.tigerdata.com/blog/we-taught-ai-to-write-real-postgres-code-open-sourced-it",
+        "vote": "1-2"
+      }
+    ],
+    "sources": [
+      {
+        "url": "https://magazine.sebastianraschka.com/p/state-of-llms-2025",
+        "quality": "blog",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2503.11082v1",
+        "quality": "primary",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2412.15004v3",
+        "quality": "secondary",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.computer.org/csdl/journal/tq/2026/03/11429547/2eODfmZm39C",
+        "quality": "unreliable",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 0
+      },
+      {
+        "url": "https://link.springer.com/article/10.1007/s11432-025-4632-8",
+        "quality": "unreliable",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 0
+      },
+      {
+        "url": "https://www.sciencedirect.com/science/article/pii/S0167739X26002529",
+        "quality": "unreliable",
+        "angle": "AI系统编程能力现状与局限",
+        "claimCount": 0
+      },
+      {
+        "url": "https://vonng.com/en/db/db-year-review-2025/",
+        "quality": "secondary",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.dbos.dev/webcast-2025-in-review-with-mike-stonebraker-and-andy-pavlo",
+        "quality": "unreliable",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 0
+      },
+      {
+        "url": "https://www.linkedin.com/pulse/what-i-learned-from-listening-mike-stonebraker-andy-pavlo-gattani-mdfvc",
+        "quality": "secondary",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 5
+      },
+      {
+        "url": "https://www.youtube.com/watch?v=1B-MdlHat9c",
+        "quality": "unreliable",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 0
+      },
+      {
+        "url": "https://www.linkedin.com/posts/analytics-india-magazine_tidb-powered-by-pingcap-cto-ed-huang-believes-activity-7340645631494930433-CoUy",
+        "quality": "secondary",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 4
+      },
+      {
+        "url": "https://www.tigerdata.com/blog/we-taught-ai-to-write-real-postgres-code-open-sourced-it",
+        "quality": "blog",
+        "angle": "数据库社区领袖对AI的观点",
+        "claimCount": 5
+      },
+      {
+        "url": "https://metr.org/blog/2025-07-10-early-2025-ai-experienced-os-dev-study/",
+        "quality": "primary",
+        "angle": "AI辅助编程生产力实证研究",
+        "claimCount": 5
+      },
+      {
+        "url": "https://arxiv.org/html/2509.20353v2",
+        "quality": "primary",
+        "angle": "AI辅助编程生产力实证研究",
+        "claimCount": 5
+      },
+      {
+        "url": "https://news.mit.edu/2025/can-ai-really-code-study-maps-roadblocks-to-autonomous-software-engineering-0716",
+        "quality": "secondary",
+        "angle": "AI辅助编程生产力实证研究",
+        "claimCount": 5
+      }
+    ],
+    "stats": {
+      "angles": 6,
+      "sourcesFetched": 15,
+      "claimsExtracted": 25,
+      "claimsVerified": 25,
+      "confirmed": 23,
+      "refuted": 2,
+      "agentCalls": 98
+    }
+  },
+  "logs": [
+    "Question: 数据库内核开发领域，资深专家被称为'老中医'，职业生涯长、经验极有价值。现在AI编码能力很强且不断进化，这个判断是否还成立？请深入研究：1) AI在系统编程和数据库内核开发中的现状与局限；2) 数据库",
+    "Angles: AI系统编程能力现状与局限, 数据库社区领袖对AI的观点, AI辅助编程生产力实证研究, 数据库内核开发AI自动化尝试, 技术变革对数据库专家影响的历史类比, AI不能做的系统工程任务（怀疑论视角）",
+    "数据库内核开发AI自动化尝试: 6 search results",
+    "AI不能做的系统工程任务（怀疑论视角）: 6 search results",
+    "AI系统编程能力现状与局限: 6 search results",
+    "AI辅助编程生产力实证研究: 6 search results",
+    "技术变革对数据库专家影响的历史类比: 6 search results",
+    "数据库社区领袖对AI的观点: 6 search results",
+    "Fetching 15 unique sources",
+    "Extracted 25 claims from 15 sources",
+    "kept: Mike Stonebraker argues that LLMs perform poorly at translating natura",
+    "kept: 44.44% of the bugs LLMs produce are completely identical to historical",
+    "kept: Stonebraker argues that durable computing for AI agents is equivalent ",
+    "refuted: TiDB/PingCAP CTO Ed Huang believes MySQL, not Postgres, will emerge as",
+    "kept: Experienced open-source developers using AI tools (Cursor Pro with Cla",
+    "kept: LLMs are useful for generating mundane/boilerplate code but experts st",
+    "kept: GitHub Copilot did not produce a statistically significant increase in",
+    "kept: A METR study found that nearly correct AI-generated code causes vetera",
+    "kept: Without specialized guidance, AI-generated SQL contains subtle errors ",
+    "kept: Andy Pavlo states that AI-generated application code means developers ",
+    "kept: LLMs frequently introduce security vulnerabilities in generated code, ",
+    "refuted: Human domain expertise accumulated over decades is required to instruc",
+    "kept: Before the experiment, participating developers expected AI to speed t",
+    "kept: MIT researchers state the goal of AI coding tools is to enhance human ",
+    "kept: AI gives professionals 'superpowers' making them substantially more pr",
+    "kept: LLM accuracy drops below 30% on highly complex code tasks, and models ",
+    "kept: When generating code continuations in bug-prone contexts, LLMs are nea",
+    "kept: LLMs have significantly lower code completion accuracy when the surrou",
+    "kept: AI coding assistants excel at boilerplate, documentation, and repetiti",
+    "kept: Current AI coding benchmarks primarily evaluate minor tasks equivalent",
+    "kept: Stonebraker believes that people who are just taught to code will find",
+    "kept: For complex systems programming, Copilot lacks the contextual understa",
+    "kept: When handling massive repositories, AI frequently fails by generating ",
+    "kept: Mike Stonebraker tested LLMs on MIT data warehouse for text-to-SQL tra",
+    "kept: AI model capabilities may be comparatively lower in settings with very",
+    "Verified 25 claims; confirmed 23, refuted 2"
+  ],
+  "failures": [],
+  "agentCount": 98,
+  "totalToolCalls": 573,
+  "durationMs": 2329104,
+  "usage": {
+    "agents": 98,
+    "toolCalls": 573,
+    "durationMs": 2329104
+  },
+  "transcriptDir": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/runs/wf_d11c62b0-680",
+  "scriptPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/scripts/deep-research-wf_d11c62b0-680.js"
+}

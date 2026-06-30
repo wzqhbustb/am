@@ -1,0 +1,40 @@
+{
+  "runId": "wf_833feab3-f87",
+  "workflowName": "deep-research",
+  "scriptPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/scripts/deep-research-wf_833feab3-f87.js",
+  "source": "built-in",
+  "args": {
+    "question": "In the database kernel/internals development field, experienced experts are often called '老中医' (old Chinese medicine doctors) because their careers are very long and experience is extremely valuable. Now with AI coding capabilities becoming very strong and continuously evolving, is this judgment still valid? Please research: 1) The current state and limitations of AI in systems programming and database kernel development specifically; 2) What makes database kernel expertise hard to replace (crash recovery, concurrency control, query optimization, storage engine design); 3) How AI is changing the productivity and career landscape for systems programmers; 4) Expert opinions from database community leaders (e.g., Andy Pavlo, Michael Stonebraker, or engineers from PostgreSQL, MySQL, Oracle, CockroachDB, TiDB communities) on AI's impact; 5) Historical parallels - how previous technology shifts (high-level languages, ORMs, cloud databases) affected database kernel experts; 6) What specific tasks AI can and cannot do well in this domain as of 2025-2026."
+  },
+  "meta": {
+    "name": "deep-research",
+    "description": "Deep research harness - fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.",
+    "whenToUse": "When the user wants a deep, multi-source, fact-checked research report on any topic. Before invoking, check whether the question is specific enough to research directly; if underspecified, ask 2-3 clarifying questions, then pass the refined question as args.",
+    "phases": [
+      {
+        "title": "Scope",
+        "detail": "Decompose question from args into focused research angles"
+      },
+      {
+        "title": "Search",
+        "detail": "Run parallel WebSearch agents, one per angle"
+      },
+      {
+        "title": "Fetch",
+        "detail": "Deduplicate URLs, fetch top sources, extract falsifiable claims"
+      },
+      {
+        "title": "Verify",
+        "detail": "Use 3-vote adversarial verification per claim"
+      },
+      {
+        "title": "Synthesize",
+        "detail": "Merge findings, rank confidence, cite sources"
+      }
+    ]
+  },
+  "createdAt": "2026-06-30T06:17:16.035Z",
+  "updatedAt": "2026-06-30T06:17:16.052Z",
+  "status": "completed",
+  "outputPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/runs/wf_833feab3-f87/output.json"
+}

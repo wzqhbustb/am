@@ -1,0 +1,21 @@
+{
+  "runId": "wf_833feab3-f87",
+  "taskId": "wf-833feab3-f87",
+  "workflowName": "deep-research",
+  "status": "completed",
+  "result": {
+    "error": "No research question provided. Pass it as args: Workflow({ name: \"deep-research\", args: \"<question>\" })."
+  },
+  "logs": [],
+  "failures": [],
+  "agentCount": 0,
+  "totalToolCalls": 0,
+  "durationMs": 2,
+  "usage": {
+    "agents": 0,
+    "toolCalls": 0,
+    "durationMs": 2
+  },
+  "transcriptDir": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/runs/wf_833feab3-f87",
+  "scriptPath": "/Users/wangyang/pg_rust/.qoder/sessions/4eb3c689-4f44-4f6d-aef1-c9876dad0fbb/workflows/scripts/deep-research-wf_833feab3-f87.js"
+}
