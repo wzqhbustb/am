@@ -1,0 +1,10 @@
+[workspace]
+members = ["crates/pg-storage"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+authors = ["pg_rust contributors"]
+license = "Apache-2.0"

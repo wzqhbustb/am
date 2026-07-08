@@ -1,3 +1,25 @@
-postgres/
-neon/
-supabase/
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test data
+/pg_rust_data/
+/tmp/
+
+# Reference repositories (not part of pg_rust source tree)
+/supabase/
+/neon/
+/postgres/
+
+# We commit Cargo.lock for the binary workspace, so do not ignore it.
