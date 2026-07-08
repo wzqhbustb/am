@@ -402,7 +402,7 @@ impl Lsn {
 │   ├── wal-00000002.log
 │   └── ...
 ├── meta/
-│   ├── freelist.meta      # Freelist 持久化（checkpoint 时写入）
+│   ├── freelist.meta      # Freelist 持久化（checkpoint 时写入；M1 无 CRC，因 freelist 恒空；M2 起加）
 │   ├── tables.meta        # 表元数据（表名、列定义、索引信息）
 │   └── checkpoint.meta    # 最近 checkpoint 的 ATT + DPT
 └── tmp/                   # 临时文件（排序溢出等）
@@ -417,6 +417,7 @@ superblock {
     magic: u32,               // 0x50475253 ("PGRS")
     version: u32,             // 格式版本号
     page_size: u32,           // 页大小
+    padding: u32,             // 保留对齐用，使后续 64-bit 字段 8 字节对齐
     checkpoint_lsn: u64,      // 最近有效 checkpoint 的 LSN
     next_page_id: u64,        // 下一个可分配的 page_id（仅 checkpoint 时持久化）
     next_txn_id: u64,         // 下一个可分配的事务 ID（仅 checkpoint 时持久化）

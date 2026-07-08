@@ -37,9 +37,9 @@ pub enum StorageError {
     #[error("checkpoint failed: {0}")]
     CheckpointFailed(String),
 
-    /// The superblock is corrupted or unreadable.
-    #[error("superblock corrupted: {0}")]
-    SuperblockCorrupted(String),
+    /// Metadata file (superblock, freelist.meta, etc.) is corrupted or unreadable.
+    #[error("metadata corrupted: {0}")]
+    MetadataCorrupted(String),
 
     /// A requested LSN has not been written yet.
     #[error("LSN {0} not available")]

@@ -16,11 +16,12 @@
 
 pub mod config;
 pub mod error;
+pub mod freelist_meta;
+pub mod io;
+pub mod superblock;
 pub mod types;
 
-// Modules introduced in later stages (M1 C–K):
-// pub mod io;
-// pub mod superblock;
+// Modules introduced in later stages (M1 D–K):
 // pub mod wal;
 // pub mod buffer_pool;
 // pub mod page_allocator;
