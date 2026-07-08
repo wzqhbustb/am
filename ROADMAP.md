@@ -74,7 +74,7 @@ Phase 7：生产化
 
 | Phase | Layer 1（物理） | Layer 2（事务/可见性） | Layer 3（Access Methods） | 跨层能力 |
 |---|---|---|---|---|
-| Phase 1 M1 | ✓ Page/WAL/BufferPool/LSN/Checkpoint | — | — | File Manager |
+| Phase 1 M1 | ✓ Page/WAL/BufferPool/LSN/Checkpoint | — | — | （文件管理分散在各组件中，不独立暴露） |
 | Phase 1 M2 | (扩展) Full Page Image | ✓ MVCC / Lock / Snapshot / Visibility | ✓ B+Tree（含 AccessMethod trait） | ARIES 崩溃恢复 |
 | Phase 1 M3 | — | (扩展) Vacuum | — | PG Wire 极简版 + 可观测 |
 | Phase 2 | (Tier 1 异步 IO) | (扩展) Per-tx delta | ✓ HNSW（Epoch + 节点锁） | HNSW Vacuum |
@@ -127,11 +127,11 @@ Phase 4b + Phase 5 + Phase 6 → Phase 7
 
 | 模块 | 说明 |
 |------|------|
-| Page Allocator | 固定大小页分配/释放（8KB/16KB/64KB 可配置），freelist 管理，不假设页内容 |
+| Page Allocator | 固定大小页分配/释放（8KB/16KB 可配置），freelist 管理，不假设页内容 |
 | WAL Writer | append-only 日志，接受 (record_type, payload)，fsync 语义，CRC32 校验；物理 WAL 完整实现（before/after image）；逻辑 WAL 接口预留（Phase 2 HNSW 接入时实现） |
 | Buffer Pool | page_id → in-memory frame 映射，LRU/CLOCK 替换，pin/unpin 协议，WAL 先行规则（刷页前确保相关 WAL 已持久化） |
 | LSN Clock | 全局单调递增，所有组件共享 |
-| File Manager | 数据文件、WAL 文件、元数据文件的统一管理，支持 O_DIRECT 可选 |
+| 文件管理 | 数据文件/WAL/元数据文件操作分散在 PageAllocator/WalWriter/Superblock 中，不独立暴露；O_DIRECT 为 Phase 7b 优化项 |
 
 **验证标准：**
 - **正确性优先（不设硬性性能指标）**：
