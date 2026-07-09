@@ -40,9 +40,6 @@ impl LsnClock {
     /// Only the WAL Writer thread should call this method. The `AtomicU64` is
     /// used so that [`LsnClock::current`] can be read lock-free from other
     /// threads.
-    //
-    // Allowed dead code until Stage E (WAL Writer) starts calling it.
-    #[allow(dead_code)]
     pub(crate) fn next(&self, record_size: u64) -> Lsn {
         assert!(record_size > 0, "record_size must be > 0");
         assert!(

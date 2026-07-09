@@ -48,6 +48,10 @@ pub enum StorageError {
     /// The configuration is invalid.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// A serialization or deserialization error (e.g. bincode payload).
+    #[error("serialization error: {0}")]
+    Serialize(String),
 }
 
 /// A convenient type alias for storage-layer results.

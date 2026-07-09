@@ -1,5 +1,6 @@
 //! Core storage identifiers and newtypes used across the storage engine.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::Hash;
 
@@ -41,7 +42,7 @@ pub const LSN_ALIGNMENT: u64 = 8;
 /// A physical page identifier.
 ///
 /// `PageId(0)` is reserved and never allocated. Page IDs start at 1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PageId(pub u64);
 
 impl PageId {
@@ -62,7 +63,7 @@ impl fmt::Display for PageId {
 ///
 /// LSNs are global byte offsets into the WAL stream. They are always a
 /// multiple of [`LSN_ALIGNMENT`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
@@ -108,7 +109,7 @@ impl fmt::Display for Lsn {
 ///
 /// 64-bit transaction IDs avoid the XID wraparound problem that PostgreSQL
 /// faces with 32-bit XIDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TxnId(pub u64);
 
 impl TxnId {
