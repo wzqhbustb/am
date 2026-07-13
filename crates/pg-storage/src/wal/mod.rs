@@ -1,9 +1,11 @@
 //! Write-ahead log (WAL) subsystem.
 
+pub mod reader;
 pub mod record;
 pub mod segment;
 pub mod writer;
 
+pub use reader::{WalReader, WalRecordIter};
 pub use record::{
     CheckpointEndRecord, FullPageImageRecord, PageAllocRecord, WalRecord, WalRecordType,
 };

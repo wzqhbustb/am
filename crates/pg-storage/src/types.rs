@@ -150,6 +150,14 @@ impl fmt::Display for Tid {
     }
 }
 
+/// Align `n` up to the next multiple of `align`.
+///
+/// `align` must be a power of two.
+pub(crate) fn align_up(n: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two());
+    (n + align - 1) & !(align - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

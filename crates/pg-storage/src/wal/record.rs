@@ -8,7 +8,7 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
-use crate::types::{Lsn, PageId, TxnId};
+use crate::types::{align_up, Lsn, PageId, TxnId};
 
 /// Size of the fixed record header in bytes.
 pub const WAL_RECORD_HEADER_SIZE: usize = 32;
@@ -288,11 +288,6 @@ impl WalRecord {
 
 fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
-}
-
-fn align_up(n: usize, align: usize) -> usize {
-    assert!(align.is_power_of_two());
-    (n + align - 1) & !(align - 1)
 }
 
 #[cfg(test)]
