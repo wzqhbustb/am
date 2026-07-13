@@ -286,7 +286,8 @@ impl WalRecord {
     }
 }
 
-fn bincode_config() -> bincode::config::Configuration {
+/// Return the shared bincode configuration used across the storage crate.
+pub(crate) fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
 }
 

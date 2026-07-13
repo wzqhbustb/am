@@ -19,13 +19,13 @@ pub mod error;
 pub mod freelist_meta;
 pub mod io;
 pub mod lsn_clock;
+pub mod page_allocator;
 pub mod superblock;
 pub mod types;
 pub mod wal;
 
-// Modules introduced in later stages (M1 E–K):
+// Modules introduced in later stages (M1 H–K):
 // pub mod buffer_pool;
-// pub mod page_allocator;
 // pub mod checkpoint;
 
 /// Initialize a global `tracing` subscriber for tests.

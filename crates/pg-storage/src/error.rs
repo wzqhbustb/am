@@ -52,6 +52,10 @@ pub enum StorageError {
     /// A serialization or deserialization error (e.g. bincode payload).
     #[error("serialization error: {0}")]
     Serialize(String),
+
+    /// Recovery must be completed before the requested operation.
+    #[error("recovery required: {0}")]
+    RecoveryRequired(String),
 }
 
 /// A convenient type alias for storage-layer results.

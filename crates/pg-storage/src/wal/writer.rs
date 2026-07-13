@@ -15,6 +15,7 @@ use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::lsn_clock::LsnClock;
 use crate::types::{Lsn, LSN_ALIGNMENT};
+use crate::wal::reader::WalReader;
 use crate::wal::record::WalRecord;
 use crate::wal::segment::WalSegmentManager;
 
@@ -42,10 +43,35 @@ impl WalWriter {
     /// Open or create the WAL writer in `{data_dir}/wal`, starting at
     /// [`Lsn::FIRST`].
     ///
-    /// This is appropriate for a fresh database. For recovery, use
-    /// [`Self::open_at`] to restart at the checkpoint LSN.
+    /// If WAL segment files already exist (for example after a crash or a
+    /// previous run), the writer scans the durable log and resumes appending
+    /// from the byte position immediately after the last complete record. This
+    /// prevents recovery code from accidentally overwriting existing WAL.
+    ///
+    /// # Preconditions
+    ///
+    /// This method assumes the complete WAL is still present in `{data_dir}/wal`
+    /// (i.e. no segments have been recycled by a checkpoint). If older segments
+    /// are missing, use [`Self::open_at`] with the checkpoint redo LSN instead.
     pub fn open(data_dir: impl AsRef<Path>, config: &StorageConfig) -> Result<Self> {
-        Self::open_at(data_dir, config, Lsn::FIRST)
+        let wal_dir = data_dir.as_ref().join("wal");
+        let mut segment_manager = WalSegmentManager::open(&wal_dir, config.wal_segment_size)?;
+
+        let has_existing_records = segment_manager.current_segment_id() > 0
+            || segment_manager
+                .current_file()
+                .metadata()
+                .map_err(StorageError::Io)?
+                .len()
+                > 0;
+
+        let start_lsn = if has_existing_records {
+            Self::discover_resume_lsn(&wal_dir, config.wal_segment_size)?
+        } else {
+            Lsn::FIRST
+        };
+
+        Self::open_with_segment_manager(segment_manager, config, start_lsn)
     }
 
     /// Open or create the WAL writer in `{data_dir}/wal`, starting at
@@ -56,6 +82,9 @@ impl WalWriter {
     /// existing segment must be the one that contains `start_lsn`. If a later
     /// segment exists, this method returns an error so that recovery can trim
     /// or recycle it first.
+    ///
+    /// For normal restart, prefer [`Self::open`] which resumes from the end of
+    /// the existing WAL automatically.
     pub fn open_at(
         data_dir: impl AsRef<Path>,
         config: &StorageConfig,
@@ -78,6 +107,14 @@ impl WalWriter {
             )));
         }
 
+        Self::open_with_segment_manager(segment_manager, config, start_lsn)
+    }
+
+    fn open_with_segment_manager(
+        segment_manager: WalSegmentManager,
+        config: &StorageConfig,
+        start_lsn: Lsn,
+    ) -> Result<Self> {
         let lsn_clock = LsnClock::new(start_lsn);
 
         let inner = Arc::new(Mutex::new(WriterState {
@@ -104,6 +141,16 @@ impl WalWriter {
             config: config.clone(),
             handle: Some(handle),
         })
+    }
+
+    /// Scan the existing WAL and return the LSN immediately after the last
+    /// complete record. Torn or partial records at the tail are discarded: the
+    /// returned LSN points to the start of the torn record, allowing the next
+    /// append to overwrite it.
+    fn discover_resume_lsn(wal_dir: &Path, segment_size: u64) -> Result<Lsn> {
+        let mut reader = WalReader::open_at(wal_dir, segment_size, Lsn::FIRST)?;
+        while reader.next_record()?.is_some() {}
+        Ok(reader.current_lsn())
     }
 
     /// Append a record to the WAL.
