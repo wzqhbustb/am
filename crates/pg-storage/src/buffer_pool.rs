@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -114,6 +114,10 @@ pub struct BufferPool {
     clock_hand: AtomicUsize,
     /// Serializes frame allocation / eviction.
     allocation_lock: Mutex<()>,
+    /// LSN of the most recent checkpoint begin. Used to decide whether a page
+    /// needs a Full Page Image before its first modification in the current
+    /// checkpoint cycle.
+    checkpoint_lsn: AtomicU64,
 }
 
 impl BufferPool {
@@ -156,12 +160,26 @@ impl BufferPool {
             frames,
             clock_hand: AtomicUsize::new(0),
             allocation_lock: Mutex::new(()),
+            checkpoint_lsn: AtomicU64::new(Lsn::INVALID.0),
         })
     }
 
     /// Return the path to the data file.
     pub fn data_file_path(&self) -> &Path {
         &self.data_file_path
+    }
+
+    /// Update the checkpoint LSN used to decide FPI requirements.
+    ///
+    /// Called by `CheckpointCoordinator` immediately after writing a
+    /// `CheckpointBegin` record.
+    pub fn set_checkpoint_lsn(&self, lsn: Lsn) {
+        self.checkpoint_lsn.store(lsn.0, Ordering::Release);
+    }
+
+    /// Return the current checkpoint LSN.
+    pub fn checkpoint_lsn(&self) -> Lsn {
+        Lsn(self.checkpoint_lsn.load(Ordering::Acquire))
     }
 
     /// Pin a page for read access.
@@ -207,21 +225,22 @@ impl BufferPool {
         // the exact state just before this modification.
         let content_guard = self.frames[frame_id.0].content.write();
 
-        // Write FPI if this is the first modification since the page was loaded.
-        // Do not clear `needs_fpi` until the append succeeds, so a failed FPI
-        // write can be retried on the next pin_mut.
+        // Write FPI if this page has not been modified since the current
+        // checkpoint begin. The `needs_fpi` flag tracks whether this residency
+        // has already written an FPI; the checkpoint LSN tells us whether the
+        // page was last modified in the current checkpoint cycle.
         //
-        // TODO(Stage I): once checkpoint is implemented, the FPI decision should
-        // be based on whether `page_lsn < checkpoint_lsn` (i.e. the page has not
-        // been modified in the current checkpoint cycle), rather than on every
-        // residency. M1 accepts the current simpler behavior because there is no
-        // checkpoint yet.
-        let needs_fpi = {
+        // If no checkpoint has ever run (`checkpoint_lsn` is invalid), we skip
+        // the FPI. This is correct for M1 because pages allocated before the
+        // first checkpoint have no prior on-disk version that needs protecting.
+        let (needs_fpi, page_lsn) = {
             let meta = self.frames[frame_id.0].meta.lock();
-            meta.needs_fpi
+            (meta.needs_fpi, meta.page_lsn)
         };
+        let checkpoint_lsn = self.checkpoint_lsn();
+        let should_write_fpi = needs_fpi && checkpoint_lsn.is_valid() && page_lsn < checkpoint_lsn;
 
-        if needs_fpi {
+        if should_write_fpi {
             let image = content_guard.to_vec();
             let fpi_record = match WalRecord::full_page_image(page_id, image) {
                 Ok(rec) => rec,
@@ -715,6 +734,10 @@ mod tests {
             guard.page_mut()[0] = 0xCD;
             id
         };
+
+        // Simulate a checkpoint so that the page is considered "before the
+        // checkpoint" when it is reloaded. This triggers the FPI path.
+        pool.set_checkpoint_lsn(Lsn(1_000));
 
         // First pin_mut after the page has been evicted should write an FPI.
         // Force eviction by allocating many new pages.

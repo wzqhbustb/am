@@ -236,6 +236,14 @@ impl WalWriter {
         self.inner.lock().synced_lsn
     }
 
+    /// Recycle WAL segment files whose contents are all before `lsn`.
+    ///
+    /// The segment that contains `lsn` itself is preserved.
+    pub fn recycle_before(&self, lsn: Lsn) -> Result<()> {
+        self.inner.lock().segment_manager.recycle_before(lsn)?;
+        Ok(())
+    }
+
     fn check_error(state: &WriterState) -> Result<()> {
         if let Some(ref msg) = state.last_error {
             return Err(StorageError::WalWriteFailed(msg.clone()));

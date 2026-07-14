@@ -86,6 +86,20 @@ impl PageAllocator {
         config: &StorageConfig,
         wal_writer: Arc<WalWriter>,
     ) -> Result<Self> {
+        Self::open_at(data_dir, config, wal_writer, PageId(1))
+    }
+
+    /// Open or create the page allocator with a specific initial `next_page_id`.
+    ///
+    /// This is used during recovery to restore the allocator to the state
+    /// captured in the most recent checkpoint. The caller must still replay WAL
+    /// records from the checkpoint redo point before calling `alloc_page`.
+    pub fn open_at(
+        data_dir: impl AsRef<Path>,
+        config: &StorageConfig,
+        wal_writer: Arc<WalWriter>,
+        next_page_id: PageId,
+    ) -> Result<Self> {
         // `ensure_data_dir` is idempotent. It is also called by other M1
         // components (e.g. Superblock::create), so this is a harmless
         // redundancy that keeps `PageAllocator::open` self-contained.
@@ -108,8 +122,6 @@ impl PageAllocator {
                 "data file size {current_file_len} is not a multiple of page size {page_size}"
             )));
         }
-
-        let next_page_id = PageId(1);
 
         Ok(Self {
             wal_writer,
@@ -177,11 +189,11 @@ impl PageAllocator {
         Ok(())
     }
 
-    /// Mark recovery as complete without replaying WAL records.
+    /// Mark recovery as complete.
     ///
-    /// This is intended for tests that deliberately exercise the
-    /// "no-replay-yet" path. Production callers must replay WAL instead.
-    #[cfg(test)]
+    /// This must be called after all existing WAL records have been replayed
+    /// (or after the caller has otherwise restored allocator state). It lifts
+    /// the guard in `alloc_page()` that prevents allocations before recovery.
     pub fn mark_recovery_complete(&mut self) {
         self.recovery_applied = true;
     }
@@ -189,6 +201,15 @@ impl PageAllocator {
     /// Return the next page ID that would be allocated if the freelist is empty.
     pub fn next_page_id(&self) -> PageId {
         self.next_page_id
+    }
+
+    /// Replace the WAL writer used for future allocations.
+    ///
+    /// This is used during recovery: a temporary WAL writer is supplied while
+    /// replaying old records, and then replaced by the real writer once the
+    /// storage engine is fully opened.
+    pub fn set_wal_writer(&mut self, wal_writer: Arc<WalWriter>) {
+        self.wal_writer = wal_writer;
     }
 
     /// Return the path to the data file.

@@ -18,6 +18,12 @@ pub const DEFAULT_WAL_GROUP_COMMIT_TIMEOUT_MS: u64 = 2;
 /// Default WAL group-commit batch size.
 pub const DEFAULT_WAL_GROUP_COMMIT_BATCH_SIZE: usize = 64;
 
+/// Default interval between automatic checkpoints in milliseconds.
+///
+/// A value of 0 disables automatic checkpoints; the caller must trigger them
+/// manually via `CheckpointCoordinator::trigger_checkpoint`.
+pub const DEFAULT_CHECKPOINT_INTERVAL_MS: u64 = 30_000;
+
 /// Configuration for the storage engine.
 #[derive(Debug, Clone)]
 pub struct StorageConfig {
@@ -39,6 +45,11 @@ pub struct StorageConfig {
     /// Maximum milliseconds to wait before fsync (group commit).
     pub wal_group_commit_timeout_ms: u64,
 
+    /// Interval between automatic checkpoints in milliseconds.
+    ///
+    /// Set to 0 to disable automatic checkpoints.
+    pub checkpoint_interval_ms: u64,
+
     /// Page size in bytes.
     ///
     /// This is derived from the compile-time [`PAGE_SIZE`] constant and is
@@ -58,6 +69,7 @@ impl StorageConfig {
             buffer_pool_shards: 256,
             wal_group_commit_batch_size: DEFAULT_WAL_GROUP_COMMIT_BATCH_SIZE,
             wal_group_commit_timeout_ms: DEFAULT_WAL_GROUP_COMMIT_TIMEOUT_MS,
+            checkpoint_interval_ms: DEFAULT_CHECKPOINT_INTERVAL_MS,
         }
     }
 
@@ -121,6 +133,7 @@ impl StorageConfig {
     /// - `PG_RUST_BP_SHARDS`
     /// - `PG_RUST_WAL_TIMEOUT_MS`
     /// - `PG_RUST_WAL_BATCH_SIZE`
+    /// - `PG_RUST_CHECKPOINT_INTERVAL_MS` (0 disables automatic checkpoints)
     pub fn from_env() -> Self {
         let data_dir = std::env::var("PG_RUST_DATA_DIR")
             .map(PathBuf::from)
@@ -172,6 +185,17 @@ impl StorageConfig {
             }
         }
 
+        if let Ok(interval) = std::env::var("PG_RUST_CHECKPOINT_INTERVAL_MS") {
+            match interval.parse::<u64>() {
+                Ok(interval) => cfg.checkpoint_interval_ms = interval,
+                Err(e) => tracing::warn!(
+                    value = %interval,
+                    error = %e,
+                    "PG_RUST_CHECKPOINT_INTERVAL_MS is not a valid u64; using default"
+                ),
+            }
+        }
+
         cfg
     }
 }
@@ -193,6 +217,7 @@ mod tests {
         assert_eq!(cfg.wal_segment_size, WAL_SEGMENT_SIZE);
         assert_eq!(cfg.buffer_pool_size, DEFAULT_BUFFER_POOL_SIZE);
         assert_eq!(cfg.buffer_pool_shards, 256);
+        assert_eq!(cfg.checkpoint_interval_ms, DEFAULT_CHECKPOINT_INTERVAL_MS);
     }
 
     #[test]

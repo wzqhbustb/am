@@ -95,6 +95,32 @@ impl FreelistMeta {
         file.read_to_end(&mut bytes).map_err(StorageError::Io)?;
         Self::decode(&bytes)
     }
+
+    /// Read the snapshot from disk, returning an empty snapshot if the file
+    /// does not exist or is corrupted.
+    ///
+    /// This is used during crash recovery: a missing or corrupted freelist
+    /// snapshot is harmless because the allocator state is rebuilt from WAL.
+    /// Only `NotFound` IO errors are swallowed; permission errors and other
+    /// disk failures are propagated so that the caller can surface them.
+    pub fn read_or_default(data_dir: impl AsRef<Path>) -> Result<Self> {
+        let path = Self::path(data_dir.as_ref());
+        match Self::read(&path) {
+            Ok(meta) => Ok(meta),
+            Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                checkpoint_lsn: Lsn::INVALID,
+                page_ids: Vec::new(),
+            }),
+            Err(StorageError::Io(e)) => Err(StorageError::Io(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, "freelist.meta corrupted; using empty snapshot");
+                Ok(Self {
+                    checkpoint_lsn: Lsn::INVALID,
+                    page_ids: Vec::new(),
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
