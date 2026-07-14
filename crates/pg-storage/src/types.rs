@@ -128,11 +128,11 @@ impl fmt::Display for TxnId {
 
 /// A frame identifier inside the buffer pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FrameId(pub u32);
+pub struct FrameId(pub usize);
 
 impl FrameId {
     /// The invalid frame ID.
-    pub const INVALID: FrameId = FrameId(u32::MAX);
+    pub const INVALID: FrameId = FrameId(usize::MAX);
 }
 
 /// A tuple identifier: (page_id, slot_id).

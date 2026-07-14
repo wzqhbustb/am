@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod buffer_pool;
 pub mod config;
 pub mod error;
 pub mod freelist_meta;
@@ -24,8 +25,7 @@ pub mod superblock;
 pub mod types;
 pub mod wal;
 
-// Modules introduced in later stages (M1 H–K):
-// pub mod buffer_pool;
+// Modules introduced in later stages (M1 I–K):
 // pub mod checkpoint;
 
 /// Initialize a global `tracing` subscriber for tests.
