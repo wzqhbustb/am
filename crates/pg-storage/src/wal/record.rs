@@ -294,6 +294,8 @@ pub(crate) fn bincode_config() -> bincode::config::Configuration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PAGE_SIZE;
+    use proptest::prelude::*;
 
     #[test]
     fn page_alloc_roundtrip() {
@@ -370,5 +372,59 @@ mod tests {
             WalRecordType::from_u8(40).unwrap(),
             WalRecordType::PageAlloc
         );
+    }
+
+    proptest! {
+        // Coding plan target is 10,000 cases. 1024 keeps normal CI fast while
+        // still exercising the encoding paths thoroughly; set PROPTEST_CASES
+        // environment variable to override.
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1024)
+        ))]
+
+        #[test]
+        fn wal_record_roundtrip(
+            lsn in 8u64..10_000u64,
+            record_type in prop_oneof![
+                Just(WalRecordType::PageAlloc),
+                Just(WalRecordType::CheckpointBegin),
+                Just(WalRecordType::CheckpointEnd),
+                Just(WalRecordType::FullPageImage),
+            ],
+            page_id in 1u64..1000u64,
+            checkpoint_lsn in 8u64..10_000u64,
+            next_page_id in 1u64..1000u64,
+            next_txn_id in 1u64..1000u64,
+            image_seed in 0u8..=255u8,
+        ) {
+            let lsn = Lsn(lsn);
+            let mut record = match record_type {
+                WalRecordType::PageAlloc => WalRecord::page_alloc(PageId(page_id)).unwrap(),
+                WalRecordType::CheckpointBegin => WalRecord::checkpoint_begin(),
+                WalRecordType::CheckpointEnd => WalRecord::checkpoint_end(
+                    Lsn(checkpoint_lsn),
+                    PageId(next_page_id),
+                    TxnId(next_txn_id),
+                ).unwrap(),
+                WalRecordType::FullPageImage => {
+                    let image = vec![image_seed; PAGE_SIZE];
+                    WalRecord::full_page_image(PageId(page_id), image).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            record.lsn = lsn;
+
+            let buf = record.encode().unwrap();
+            prop_assert_eq!(buf.len() % 8, 0);
+
+            let (decoded, consumed) = WalRecord::decode(&buf).unwrap();
+            prop_assert_eq!(consumed, buf.len());
+            prop_assert_eq!(decoded.lsn, lsn);
+            prop_assert_eq!(decoded.record_type, record_type);
+            prop_assert_eq!(decoded.payload, record.payload);
+        }
     }
 }

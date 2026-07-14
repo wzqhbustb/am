@@ -494,7 +494,11 @@ mod tests {
             //    checkpoint; the recovery replay will apply the FPI directly.
             engine.wal_writer().flush().unwrap();
 
-            // Simulate kill -9: do not run Drop / graceful shutdown.
+            // Simulate kill -9: do not run Drop / graceful shutdown. This leaks
+            // the WalWriter background thread, but the process exits shortly and
+            // the OS reaps it. A more realistic crash is exercised by the
+            // fork+kill integration tests in tests/crash_recovery.rs; this unit
+            // test keeps the torn-page repair path fast and self-contained.
             mem::forget(engine);
             id
         };
@@ -519,5 +523,132 @@ mod tests {
             guard.page().iter().all(|&b| b == 0xCD),
             "FPI did not repair the torn page"
         );
+    }
+
+    #[test]
+    fn background_checkpoint_flushes_dirty_pages() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = StorageConfig::new(tmp.path());
+        // Short interval so the test does not have to wait long.
+        config.checkpoint_interval_ms = 200;
+        config.wal_group_commit_timeout_ms = 1;
+        config.wal_group_commit_batch_size = 1;
+
+        let page_id = {
+            let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+            engine.start_background_checkpointing().unwrap();
+
+            let mut guard = engine.buffer_pool().new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[0..8].copy_from_slice(b"bgckpt01");
+            drop(guard);
+
+            // Wait for at least one background checkpoint to run.
+            std::thread::sleep(Duration::from_millis(600));
+
+            id
+        };
+
+        // Reopen without an explicit manual checkpoint: the background thread
+        // should have persisted the page.
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        let guard = engine.buffer_pool().pin(page_id).unwrap();
+        assert_eq!(&guard.page()[0..8], b"bgckpt01");
+    }
+
+    #[test]
+    fn concurrent_new_page_and_pin_are_safe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = StorageConfig::new(tmp.path());
+        // Small buffer pool to force eviction pressure.
+        config.buffer_pool_size = 256 * 1024; // 32 frames
+        config.wal_group_commit_timeout_ms = 1;
+        config.wal_group_commit_batch_size = 8;
+
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        let engine = Arc::new(engine);
+
+        let successes = Arc::new(AtomicUsize::new(0));
+        let all_ids: Arc<Mutex<Vec<PageId>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..64 {
+            let e = Arc::clone(&engine);
+            let s = Arc::clone(&successes);
+            let ids = Arc::clone(&all_ids);
+            handles.push(thread::spawn(move || {
+                for _ in 0..25 {
+                    if let Ok(mut g) = e.buffer_pool().new_page() {
+                        g.page_mut()[0] = 0xAB;
+                        ids.lock().push(g.page_id());
+                        s.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let ids = all_ids.lock();
+        assert_eq!(ids.len(), 64 * 25);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate page IDs detected");
+
+        // All successfully allocated pages must be durable after checkpoint.
+        let checkpoint_lsn = engine.trigger_checkpoint().unwrap();
+        assert!(checkpoint_lsn.is_valid());
+    }
+
+    #[test]
+    fn multiple_checkpoints_keep_data_consistent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = StorageConfig::new(tmp.path());
+        config.wal_segment_size = 4096;
+        config.wal_group_commit_timeout_ms = 1;
+        config.wal_group_commit_batch_size = 1;
+
+        let ids = {
+            let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+            let mut ids = Vec::new();
+            for i in 0..16u8 {
+                let mut guard = engine.buffer_pool().new_page().unwrap();
+                guard.page_mut()[0] = i;
+                ids.push(guard.page_id());
+            }
+
+            // First checkpoint.
+            engine.trigger_checkpoint().unwrap();
+
+            // Modify a subset after the first checkpoint.
+            for (idx, id) in ids.iter().enumerate() {
+                if idx % 2 == 0 {
+                    let mut guard = engine.buffer_pool().pin_mut(*id).unwrap();
+                    guard.page_mut()[1] = 0xCC;
+                }
+            }
+
+            // Second checkpoint; WAL recycling is verified by the dedicated
+            // `checkpoint_recycles_old_wal_segments` test above.
+            engine.trigger_checkpoint().unwrap();
+            ids
+        };
+
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        for (idx, id) in ids.iter().enumerate() {
+            let guard = engine.buffer_pool().pin(*id).unwrap();
+            assert_eq!(guard.page()[0], idx as u8);
+            if idx % 2 == 0 {
+                assert_eq!(guard.page()[1], 0xCC);
+            }
+        }
     }
 }

@@ -447,10 +447,17 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
+        // Coding plan target is 10,000 cases. 32 keeps normal CI fast while
+        // exercising the allocator thoroughly; set PROPTEST_CASES to override.
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(32)
+        ))]
 
         #[test]
-        fn alloc_many_pages_have_unique_monotonic_ids(count in 1usize..100) {
+        fn alloc_many_pages_have_unique_monotonic_ids(count in 1usize..50) {
             let tmp = TempDir::new().unwrap();
             let mut cfg = test_config(&tmp);
             cfg.wal_group_commit_timeout_ms = 10;

@@ -667,6 +667,7 @@ impl Drop for PageGuardMut<'_> {
 mod tests {
     use super::*;
     use crate::config::StorageConfig;
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> StorageConfig {
@@ -1001,6 +1002,147 @@ mod tests {
         let frame_count = pool.frame_count();
         for _ in 0..frame_count + 16 {
             drop(pool.new_page().unwrap());
+        }
+    }
+
+    #[test]
+    fn concurrent_pin_unpin_stress() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+        let pool = Arc::new(pool);
+
+        // Pre-allocate a set of shared pages for concurrent pin/unpin/new_page
+        // traffic, plus one exclusive page per thread so we can verify that
+        // written data is readable after the stress burst.
+        let mut shared_ids = Vec::new();
+        for _ in 0..8 {
+            let guard = pool.new_page().unwrap();
+            shared_ids.push(guard.page_id());
+        }
+        let mut owned_ids = Vec::new();
+        for _ in 0..100 {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[0] = 0; // initial baseline
+            owned_ids.push(guard.page_id());
+        }
+
+        let ops = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for thread_id in 0..100usize {
+            let p = Arc::clone(&pool);
+            let shared = shared_ids.clone();
+            let owned = owned_ids.clone();
+            let o = Arc::clone(&ops);
+            handles.push(thread::spawn(move || {
+                for i in 0..20usize {
+                    let action = (thread_id + i) % 5;
+                    match action {
+                        0 => {
+                            if let Ok(g) = p.pin(shared[i % shared.len()]) {
+                                assert_eq!(g.page().len(), PAGE_SIZE);
+                                o.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        1 => {
+                            if let Ok(mut g) = p.pin_mut(shared[i % shared.len()]) {
+                                g.page_mut()[0] = thread_id as u8;
+                                o.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        2 => {
+                            if let Ok(g) = p.new_page() {
+                                o.fetch_add(1, Ordering::Relaxed);
+                                drop(g);
+                            }
+                        }
+                        3 => {
+                            if let Ok(g) = p.pin(shared[i % shared.len()]) {
+                                o.fetch_add(1, Ordering::Relaxed);
+                                drop(g);
+                            }
+                        }
+                        _ => {
+                            // Write to the thread's exclusive page. The final
+                            // value should be the last successful write.
+                            if let Ok(mut g) = p.pin_mut(owned[thread_id]) {
+                                g.page_mut()[0] = (thread_id + 1) as u8;
+                                g.page_mut()[1..9].copy_from_slice(&i.to_be_bytes());
+                                o.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The exact count is not important; the test passes if there are no
+        // deadlocks, panics, or data races detected by Miri/TSan/loom in later
+        // stages.
+        assert!(ops.load(Ordering::Relaxed) > 0);
+
+        // Verify that every thread's exclusive page can be read back and
+        // contains one of the values the owning thread wrote.
+        for (thread_id, &owned_id) in owned_ids.iter().enumerate() {
+            let guard = pool.pin(owned_id).unwrap();
+            assert_eq!(guard.page()[0], (thread_id + 1) as u8);
+            let last_iteration = u64::from_be_bytes(guard.page()[1..9].try_into().unwrap());
+            assert!(last_iteration < 20, "owned page {thread_id} corrupted");
+        }
+
+        // Buffer pool must still be usable after the stress burst.
+        let guard = pool.new_page().unwrap();
+        assert_eq!(guard.page().len(), PAGE_SIZE);
+
+        // And frames must still be evictable (no pin_count leak).
+        let frame_count = pool.frame_count();
+        for _ in 0..frame_count + 16 {
+            drop(pool.new_page().unwrap());
+        }
+    }
+
+    proptest! {
+        // Coding plan target is 10,000 cases. 64 keeps normal CI fast while
+        // exercising allocate-write-read invariants; set PROPTEST_CASES to
+        // override.
+        #![proptest_config(ProptestConfig::with_cases(
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64)
+        ))]
+
+        #[test]
+        fn allocated_pages_are_unique_and_readable(count in 1usize..50) {
+            let tmp = TempDir::new().unwrap();
+            let (_, _, pool) = setup(&tmp);
+
+            let mut ids = Vec::with_capacity(count);
+            for i in 0..count {
+                let mut guard = pool.new_page().unwrap();
+                guard.page_mut()[0] = (i % 256) as u8;
+                guard.page_mut()[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                ids.push(guard.page_id());
+            }
+
+            prop_assert_eq!(ids.len(), count);
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            prop_assert_eq!(sorted.len(), ids.len(), "duplicate page IDs");
+
+            for (i, id) in ids.iter().enumerate() {
+                let guard = pool.pin(*id).unwrap();
+                prop_assert_eq!(guard.page()[0], (i % 256) as u8);
+                prop_assert_eq!(&guard.page()[1..9], &(i as u64).to_be_bytes());
+            }
         }
     }
 }
