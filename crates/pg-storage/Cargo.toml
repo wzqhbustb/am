@@ -45,7 +45,19 @@ proptest = "~1.4"
 tempfile = "3"
 
 # benchmarks (added in Stage K)
-# criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = "0.5"
 
 # tracing subscriber for tests / examples
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "wal_throughput"
+harness = false
+
+[[bench]]
+name = "buffer_pool_random_read"
+harness = false
+
+[[bench]]
+name = "page_allocator"
+harness = false
