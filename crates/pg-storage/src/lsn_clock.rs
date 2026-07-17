@@ -53,6 +53,29 @@ impl LsnClock {
         Lsn(lsn)
     }
 
+    /// Reserve a contiguous chunk of `record_size` bytes in the WAL stream
+    /// without writing any record.
+    ///
+    /// The caller is responsible for emitting a record that exactly covers
+    /// the reserved range afterwards (see `WalWriter::append_at`). Other
+    /// threads may keep allocating from the clock in the meantime: `fetch_add`
+    /// hands out non-overlapping ranges, so the reserved range remains
+    /// exclusively owned by the caller.
+    /// This is used by the checkpoint coordinator to pre-allocate the
+    /// `CheckpointBegin` LSN so that `set_checkpoint_lsn` can be called
+    /// before the record is actually written, eliminating the FPI race window.
+    ///
+    /// `record_size` must be a positive multiple of [`LSN_ALIGNMENT`].
+    pub fn reserve(&self, record_size: u64) -> Lsn {
+        assert!(record_size > 0, "record_size must be > 0");
+        assert!(
+            record_size % LSN_ALIGNMENT == 0,
+            "record_size must be a multiple of {LSN_ALIGNMENT}"
+        );
+        let lsn = self.next.fetch_add(record_size, Ordering::Relaxed);
+        Lsn(lsn)
+    }
+
     /// Return the next LSN that would be handed out without advancing the
     /// clock.
     pub fn current(&self) -> Lsn {
@@ -134,5 +157,43 @@ mod tests {
         for (i, lsn) in all.iter().enumerate() {
             assert_eq!(*lsn, 8 + i as u64 * 8);
         }
+    }
+
+    #[test]
+    fn reserve_allocates_without_writing() {
+        let clock = LsnClock::default();
+        let r1 = clock.reserve(8);
+        let r2 = clock.reserve(16);
+        assert_eq!(r1, Lsn(8));
+        assert_eq!(r2, Lsn(16));
+        assert_eq!(clock.current(), Lsn(32));
+
+        // next() continues from where reserve() left off.
+        let n1 = clock.next(8);
+        assert_eq!(n1, Lsn(32));
+        assert_eq!(clock.current(), Lsn(40));
+    }
+
+    #[test]
+    fn reserve_and_next_are_interchangeable_for_allocation() {
+        let clock = LsnClock::default();
+        let _ = clock.reserve(8);
+        let _ = clock.next(8);
+        let _ = clock.reserve(8);
+        assert_eq!(clock.current(), Lsn(32));
+    }
+
+    #[test]
+    #[should_panic]
+    fn reserve_rejects_unaligned_size() {
+        let clock = LsnClock::default();
+        let _ = clock.reserve(5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn reserve_rejects_zero_size() {
+        let clock = LsnClock::default();
+        let _ = clock.reserve(0);
     }
 }

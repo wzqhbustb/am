@@ -155,33 +155,101 @@ impl WalWriter {
 
     /// Append a record to the WAL.
     ///
-    /// The record is assigned an LSN, written to the current segment file, and
-    /// the method returns only after the record has been fsynced to disk.
-    /// Concurrent callers are batched into a single fsync by the background
-    /// worker.
+    /// The record is assigned an LSN and written to the current segment file.
+    /// **This method does not fsync**: the record is only guaranteed to be
+    /// durable after the caller explicitly invokes [`Self::flush_to`] or
+    /// [`Self::flush`]. Concurrent callers are batched into a single fsync by
+    /// the background worker.
+    ///
+    /// Callers that need WAL-before-data ordering (e.g. before flushing a dirty
+    /// page) must call `flush_to(lsn)` explicitly.
     pub fn append(&self, mut record: WalRecord) -> Result<Lsn> {
-        let lsn = {
-            let mut state = self.inner.lock();
-            Self::check_error(&state)?;
+        let mut state = self.inner.lock();
+        Self::check_error(&state)?;
 
-            let record_size = record.record_size() as u64;
-            let lsn = state.lsn_clock.next(record_size);
-            record.lsn = lsn;
+        let record_size = record.record_size() as u64;
+        let lsn = state.lsn_clock.next(record_size);
+        record.lsn = lsn;
 
-            let buf = record.encode()?;
-            write_record_to_segment(&mut state.segment_manager, &buf, lsn)?;
+        let buf = record.encode()?;
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn)?;
 
-            state.pending += 1;
-            let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
-            let should_wake = state.pending >= self.config.wal_group_commit_batch_size
-                || state.last_flush.elapsed() >= timeout;
-            if should_wake {
-                self.cond.notify_one();
-            }
-            lsn
-        };
+        state.pending += 1;
+        let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
+        let should_wake = state.pending >= self.config.wal_group_commit_batch_size
+            || state.last_flush.elapsed() >= timeout;
+        if should_wake {
+            self.cond.notify_one();
+        }
+        Ok(lsn)
+    }
 
-        self.flush_to(lsn)?;
+    /// Append a record at a specific pre-reserved LSN.
+    ///
+    /// The caller must have already reserved the LSN range via
+    /// [`Self::reserve_lsn`]. This method writes the record at exactly `lsn`
+    /// without allocating a new one. It is used by the checkpoint coordinator
+    /// to emit `CheckpointBegin` after `set_checkpoint_lsn` has already been
+    /// called, eliminating the FPI race window.
+    ///
+    /// Like [`Self::append`], this method does not fsync; the caller must
+    /// invoke [`Self::flush_to`] when durability is required.
+    ///
+    /// # Concurrency
+    ///
+    /// Other threads may keep appending or reserving LSNs between
+    /// [`Self::reserve_lsn`] and this call — this is expected while a fuzzy
+    /// checkpoint is in progress (e.g. FPI records from `pin_mut`). That is
+    /// safe: `LsnClock` hands out non-overlapping ranges via `fetch_add`, so
+    /// the reserved range stays exclusively owned by this caller no matter how
+    /// far the clock advances past it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `lsn` is invalid or unaligned;
+    /// - the reserved range `[lsn, lsn + reserved_size)` extends beyond the
+    ///   current clock (i.e. it was never reserved);
+    /// - the record's encoded size does not match `reserved_size`.
+    pub fn append_at(&self, mut record: WalRecord, lsn: Lsn, reserved_size: u64) -> Result<Lsn> {
+        if !lsn.is_valid() || lsn.0 % LSN_ALIGNMENT != 0 {
+            return Err(StorageError::InvalidConfig(format!(
+                "append_at LSN {lsn} is invalid or unaligned"
+            )));
+        }
+
+        let mut state = self.inner.lock();
+        Self::check_error(&state)?;
+
+        // The reserved range [lsn, lsn + reserved_size) must lie entirely
+        // within the allocated LSN space. The clock hands out non-overlapping
+        // ranges via fetch_add, so any range inside the allocated space cannot
+        // overlap a record written by another thread. Concurrent appends may
+        // have advanced the clock beyond this range since reserve_lsn; that is
+        // expected during a fuzzy checkpoint and must not fail the append.
+        if lsn.0 + reserved_size > state.lsn_clock.current().0 {
+            return Err(StorageError::LsnNotAvailable(lsn));
+        }
+
+        record.lsn = lsn;
+        let buf = record.encode()?;
+        if buf.len() as u64 != reserved_size {
+            return Err(StorageError::WalWriteFailed(format!(
+                "append_at record size {} does not match reserved size {}",
+                buf.len(),
+                reserved_size
+            )));
+        }
+
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn)?;
+
+        state.pending += 1;
+        let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
+        let should_wake = state.pending >= self.config.wal_group_commit_batch_size
+            || state.last_flush.elapsed() >= timeout;
+        if should_wake {
+            self.cond.notify_one();
+        }
         Ok(lsn)
     }
 
@@ -234,6 +302,31 @@ impl WalWriter {
     /// Return the latest LSN that has been fsynced to disk.
     pub fn synced_lsn(&self) -> Lsn {
         self.inner.lock().synced_lsn
+    }
+
+    /// Reserve a contiguous chunk of LSN space without writing any record.
+    ///
+    /// This is a convenience wrapper around [`LsnClock::reserve`] that locks
+    /// the writer state. The caller must later emit a record at the reserved
+    /// LSN via [`Self::append_at`].
+    ///
+    /// Used by the checkpoint coordinator to pre-allocate the `CheckpointBegin`
+    /// LSN so that `set_checkpoint_lsn` can be called before the record is
+    /// written, eliminating the FPI race window.
+    ///
+    /// # Crash-safety note
+    ///
+    /// If the process crashes between `reserve_lsn` and `append_at`, the
+    /// reserved range appears as zeros to recovery, which treats it as
+    /// end-of-WAL. Any records written by other threads at higher LSNs after
+    /// the reservation are therefore lost. This is acceptable for the
+    /// checkpoint use case (in-flight records during checkpoint are not
+    /// guaranteed durable) but callers should minimize the reserve→emit
+    /// window.
+    pub fn reserve_lsn(&self, record_size: u64) -> Result<Lsn> {
+        let state = self.inner.lock();
+        Self::check_error(&state)?;
+        Ok(state.lsn_clock.reserve(record_size))
     }
 
     /// Recycle WAL segment files whose contents are all before `lsn`.
@@ -388,6 +481,8 @@ mod tests {
             .append(WalRecord::page_alloc(PageId(42)).unwrap())
             .unwrap();
         assert!(lsn.is_valid());
+        // append() no longer fsyncs; explicit flush_to is required.
+        writer.flush_to(lsn).unwrap();
         assert!(writer.synced_lsn() >= lsn);
 
         // Read the record back from the WAL segment.
@@ -420,6 +515,8 @@ mod tests {
         for window in lsns.windows(2) {
             assert!(window[1] > window[0]);
         }
+        // Explicit flush required after batch of appends.
+        writer.flush().unwrap();
         assert!(writer.synced_lsn() >= lsns[lsns.len() - 1]);
     }
 
@@ -453,6 +550,8 @@ mod tests {
         for window in all.windows(2) {
             assert!(window[1] > window[0]);
         }
+        // Flush all pending records after concurrent appends.
+        writer.flush().unwrap();
     }
 
     #[test]
@@ -516,11 +615,14 @@ mod tests {
         let writer = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
 
         let w = Arc::clone(&writer);
-        let handle =
-            thread::spawn(move || w.append(WalRecord::page_alloc(PageId(1)).unwrap()).unwrap());
+        let handle = thread::spawn(move || {
+            let lsn = w.append(WalRecord::page_alloc(PageId(1)).unwrap()).unwrap();
+            w.flush_to(lsn).unwrap();
+            lsn
+        });
 
-        // append internally calls flush_to, which should wake the worker and
-        // return once the background fsync completes.
+        // flush_to should wake the worker and return once the background fsync
+        // completes.
         let lsn = handle.join().unwrap();
         assert!(writer.synced_lsn() >= lsn);
     }
@@ -534,6 +636,7 @@ mod tests {
         let lsn = writer
             .append(WalRecord::page_alloc(PageId(1)).unwrap())
             .unwrap();
+        writer.flush_to(lsn).unwrap();
         // Calling flush_to directly on an already-synced LSN must return
         // immediately without error.
         writer.flush_to(lsn).unwrap();
@@ -580,6 +683,147 @@ mod tests {
         let lsn = writer
             .append(WalRecord::page_alloc(PageId(1)).unwrap())
             .unwrap();
+        writer.flush_to(lsn).unwrap();
         assert!(lsn >= Lsn(64));
+    }
+
+    #[test]
+    fn append_at_writes_to_reserved_lsn() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Reserve an LSN range for a PageAlloc record. PageAlloc encodes to
+        // 40 bytes (32B header + 8B payload), not 32.
+        let record = WalRecord::page_alloc(PageId(42)).unwrap();
+        let record_size = record.record_size() as u64;
+        let reserved = writer.reserve_lsn(record_size).unwrap();
+        assert_eq!(reserved, Lsn(8));
+
+        // Emit the record at the reserved LSN.
+        let lsn = writer.append_at(record, reserved, record_size).unwrap();
+        assert_eq!(lsn, reserved);
+
+        // Explicit flush required.
+        writer.flush_to(lsn).unwrap();
+        assert!(writer.synced_lsn() >= lsn);
+
+        // The next append should continue from after the reserved range.
+        let next = writer
+            .append(WalRecord::page_alloc(PageId(43)).unwrap())
+            .unwrap();
+        assert_eq!(next, Lsn(48));
+    }
+
+    #[test]
+    fn append_at_rejects_unaligned_lsn() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        let record = WalRecord::page_alloc(PageId(1)).unwrap();
+        assert!(writer.append_at(record, Lsn(12), 32).is_err());
+    }
+
+    #[test]
+    fn append_at_rejects_unreserved_future_lsn() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Lsn(64) is beyond the current clock (Lsn(8)), so it cannot have been
+        // reserved.
+        let record = WalRecord::page_alloc(PageId(1)).unwrap();
+        assert!(writer.append_at(record, Lsn(64), 32).is_err());
+    }
+
+    #[test]
+    fn append_at_rejects_wrong_size_record() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Reserve the size of a PageAlloc record but try to write a larger FPI.
+        let page_alloc_size = WalRecord::page_alloc(PageId(1)).unwrap().record_size() as u64;
+        let reserved = writer.reserve_lsn(page_alloc_size).unwrap();
+        let fpi = WalRecord::full_page_image(PageId(1), vec![0xAB; 64]).unwrap();
+        assert!(writer.append_at(fpi, reserved, page_alloc_size).is_err());
+    }
+
+    #[test]
+    fn append_at_succeeds_after_clock_advances() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Reserve a range, then let the clock advance via further reservations
+        // and concurrent-style appends. This mirrors a fuzzy checkpoint:
+        // reserve_lsn(CheckpointBegin), FPI/PageAlloc appends from other
+        // threads, then append_at on the reserved LSN.
+        let record_size = WalRecord::page_alloc(PageId(1)).unwrap().record_size() as u64;
+        let reserved = writer.reserve_lsn(record_size).unwrap();
+        let _r2 = writer.reserve_lsn(record_size).unwrap();
+        let _r3 = writer
+            .append(WalRecord::page_alloc(PageId(2)).unwrap())
+            .unwrap();
+
+        // Emitting at the originally reserved LSN must still succeed: the
+        // range was handed out exclusively and cannot have been overwritten.
+        let record = WalRecord::page_alloc(PageId(1)).unwrap();
+        let lsn = writer.append_at(record, reserved, record_size).unwrap();
+        assert_eq!(lsn, reserved);
+
+        // The record must be readable back at exactly the reserved LSN.
+        writer.flush_to(lsn).unwrap();
+        let mut reader =
+            WalReader::open_at(tmp.path().join("wal"), cfg.wal_segment_size, reserved).unwrap();
+        let first = reader
+            .next_record()
+            .unwrap()
+            .expect("record at reserved LSN");
+        assert_eq!(first.lsn, reserved);
+    }
+
+    #[test]
+    fn append_at_cross_segment_write() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = writer_config(&tmp);
+        // 96-byte segments: after one 40B PageAlloc (offset 48), a 64B FPI
+        // starting at 48 extends to 111, crossing into segment 1.
+        cfg.wal_segment_size = 96;
+        cfg.wal_group_commit_batch_size = 1;
+        cfg.wal_group_commit_timeout_ms = 1;
+
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+
+        // Write a small record to advance the clock close to the segment
+        // boundary.
+        let small = WalRecord::page_alloc(PageId(1)).unwrap();
+        let last_lsn = writer.append(small.clone()).unwrap();
+        writer.flush_to(last_lsn).unwrap();
+
+        // Reserve a range that will cross the segment boundary.
+        let fpi = WalRecord::full_page_image(PageId(99), vec![0xCD; 32]).unwrap();
+        let fpi_size = fpi.record_size() as u64;
+        assert!(fpi_size <= cfg.wal_segment_size);
+        let reserved = writer.reserve_lsn(fpi_size).unwrap();
+        // The reserved range starts in the current segment but extends into the
+        // next one.
+        assert_eq!(
+            reserved.segment_id(cfg.wal_segment_size),
+            last_lsn.segment_id(cfg.wal_segment_size)
+        );
+        let reserved_end = Lsn(reserved.0 + fpi_size - 1);
+        assert!(
+            reserved_end.segment_id(cfg.wal_segment_size)
+                > reserved.segment_id(cfg.wal_segment_size)
+        );
+
+        // append_at must handle the cross-segment write correctly.
+        let lsn = writer.append_at(fpi, reserved, fpi_size).unwrap();
+        writer.flush_to(lsn).unwrap();
+        assert_eq!(lsn, reserved);
+        assert!(tmp.path().join("wal").join("wal-00000001.log").exists());
+        assert!(tmp.path().join("wal").join("wal-00000002.log").exists());
     }
 }

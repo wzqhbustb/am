@@ -225,6 +225,36 @@ fn run_child_scenario(data_dir: &str, scenario: &str, iterations: usize) {
             engine.wal_writer().flush().unwrap();
         }
 
+        "reserve_without_emit" => {
+            // Simulate a crash between reserve_lsn and append_at during a
+            // checkpoint. This leaves a gap of zeros in the WAL; recovery treats
+            // it as end-of-WAL. The baseline checkpoint data must survive.
+            //
+            // Step 1: Establish a baseline with a completed checkpoint.
+            for i in 1..=iterations {
+                let mut guard = engine.buffer_pool().new_page().unwrap();
+                write_test_pattern(guard.page_mut(), i);
+            }
+            engine.trigger_checkpoint().unwrap();
+
+            // Step 2: Reserve a slot (as trigger_checkpoint would) but do NOT
+            // call append_at. This creates a 32-byte gap of zeros.
+            let _reserved_lsn = engine
+                .wal_writer()
+                .reserve_lsn(pg_storage::wal::record::WAL_RECORD_HEADER_SIZE as u64)
+                .unwrap();
+
+            // Step 3: Write additional records AFTER the gap via new allocations.
+            // These records live at LSNs beyond the gap.
+            for _ in 0..4 {
+                let _ = engine.buffer_pool().new_page().unwrap();
+            }
+
+            // Step 4: Flush the WAL so post-gap records are physically on disk.
+            // Recovery will still stop at the gap (zeros → end-of-WAL).
+            engine.wal_writer().flush().unwrap();
+        }
+
         other => panic!("unknown crash scenario: {other}"),
     }
 }
@@ -500,6 +530,42 @@ fn crash_with_large_wal_recovers_across_segments() {
     let engine = StorageEngine::open(tmp.path(), &config).unwrap();
     let next_page_id = engine.page_allocator().lock().next_page_id().0;
     assert!(next_page_id > 1, "no pages were allocated before crash");
+}
+
+#[test]
+fn crash_reserve_without_emit_recovers_baseline() {
+    // Simulates a crash between reserve_lsn and append_at during a checkpoint.
+    // The reserved range is zeros in the WAL; recovery treats zeros as end-of-WAL.
+    // The baseline (pre-gap) checkpoint data must be fully intact. Post-gap
+    // allocations are lost — this is the expected/acceptable behavior documented
+    // in WalWriter::reserve_lsn's crash-safety note.
+    let iterations = 8;
+    let tmp = run_manual_crash_test("reserve_without_emit", iterations, 50, None);
+    let data_dir = tmp.path();
+
+    // Recovery must succeed without panic.
+    let config = StorageConfig::new(data_dir);
+    let engine = StorageEngine::open(data_dir, &config).unwrap();
+
+    // The baseline pages (written and checkpointed before the gap) must survive.
+    for i in 1..=iterations {
+        let page_id = PageId(i as u64);
+        let guard = engine.buffer_pool().pin(page_id).unwrap();
+        assert!(
+            verify_test_pattern(guard.page(), i),
+            "baseline page {page_id} lost after reserve-without-emit crash"
+        );
+    }
+
+    // The 4 post-gap allocations are NOT guaranteed to survive (their WAL
+    // records are beyond the gap). The allocator may or may not know about them
+    // depending on whether recovery stopped before or after their PageAlloc
+    // records (it stops at the gap, so they are lost).
+    let next_page_id = engine.page_allocator().lock().next_page_id().0;
+    assert!(
+        next_page_id >= (iterations as u64 + 1),
+        "allocator should have at least the checkpointed pages"
+    );
 }
 
 #[test]

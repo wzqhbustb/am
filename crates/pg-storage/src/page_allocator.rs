@@ -162,9 +162,18 @@ impl PageAllocator {
         //    reopen.
         self.ensure_data_file_capacity(page_id)?;
 
-        // 2. Write the allocation to the WAL and wait for it to be fsynced.
+        // 2. Write the allocation to the WAL and explicitly fsync it before
+        //    updating in-memory state. (append() no longer fsyncs implicitly;
+        //    this flush_to preserves the WAL-before-data invariant for page
+        //    allocation.)
+        //
+        // TODO(M2): batch page_alloc flushes at transaction commit time. When
+        // the transaction manager batches multiple operations, the per-page
+        // flush_to can be deferred to commit, amortizing fsync latency across
+        // bulk allocations (e.g. CREATE TABLE with many pages).
         let record = WalRecord::page_alloc(page_id)?;
-        self.wal_writer.append(record)?;
+        let alloc_lsn = self.wal_writer.append(record)?;
+        self.wal_writer.flush_to(alloc_lsn)?;
 
         // 3. Update allocator state.
         if page_id == self.next_page_id {

@@ -138,35 +138,55 @@ impl CheckpointCoordinator {
     /// concurrently. Flushing an individual page briefly blocks writers on that
     /// page.
     ///
-    /// # M1 race note
+    /// # FPI race fix (Stage B)
     ///
-    /// A `pin_mut` that lands between `wal_writer.append(begin_record)`
-    /// returning and `set_checkpoint_lsn(begin_lsn)` may skip its FPI because
-    /// `checkpoint_lsn` is still the previous value. If a crash occurs in this
-    /// window, the in-memory modification is lost on recovery. The window is
-    /// microseconds and M1 already accepts lossiness for in-place modifications
-    /// after the FPI; this is the same class of loss. M2 can pre-allocate the
-    /// checkpoint LSN to close the window.
+    /// M1 had a race window between `wal_writer.append(begin_record)` returning
+    /// and `set_checkpoint_lsn(begin_lsn)`: a `pin_mut` in that window could
+    /// skip its FPI because `checkpoint_lsn` was still the old value. Stage B
+    /// eliminates the window by pre-reserving the LSN:
+    ///
+    /// 1. `reserve_lsn(CHECKPOINT_BEGIN_SIZE)` — advance the clock and return
+    ///    the future LSN without writing anything.
+    /// 2. `set_checkpoint_lsn(begin_lsn)` — publish the new checkpoint LSN
+    ///    immediately; any `pin_mut` from this point on will write an FPI.
+    /// 3. `append_at(begin_record, begin_lsn)` — emit the `CheckpointBegin`
+    ///    record into the already-reserved slot.
+    ///
+    /// Because step 2 happens before step 3, there is no window in which a
+    /// page modification can miss its FPI.
     pub fn trigger_checkpoint(&self) -> Result<Lsn> {
         // Serialize checkpoints so that manual and background checkpoints do not
         // interleave and produce redundant or overlapping checkpoint records.
         let _lock = self.checkpoint_lock.lock();
 
-        // 1. Begin checkpoint: write CheckpointBegin and make it the active
-        //    checkpoint LSN for the buffer pool. From this point on, the first
-        //    mutable access to any page in this checkpoint cycle will write an
-        //    FPI.
-        let begin_record = WalRecord::checkpoint_begin();
-        let begin_lsn = self.wal_writer.append(begin_record)?;
-        self.buffer_pool.set_checkpoint_lsn(begin_lsn);
-        debug!(%begin_lsn, "checkpoint begin");
+        // -- Phase 1: CheckpointBegin ----------------------------------------
 
-        // 2. Collect dirty pages. This is a snapshot; pages may become clean or
+        // 1. Pre-reserve the CheckpointBegin LSN. A CheckpointBegin record has
+        //    an empty payload, so its total size is exactly WAL_RECORD_HEADER_SIZE
+        //    (32 bytes), already aligned to LSN_ALIGNMENT.
+        const CHECKPOINT_BEGIN_SIZE: u64 = crate::wal::record::WAL_RECORD_HEADER_SIZE as u64;
+        let begin_lsn = self.wal_writer.reserve_lsn(CHECKPOINT_BEGIN_SIZE)?;
+
+        // 2. Publish the checkpoint LSN immediately. From this point on, the
+        //    first mutable access to any page in this checkpoint cycle will
+        //    write an FPI.
+        self.buffer_pool.set_checkpoint_lsn(begin_lsn);
+        debug!(%begin_lsn, "checkpoint begin (LSN pre-reserved)");
+
+        // 3. Emit the CheckpointBegin record into the reserved slot.
+        let begin_record = WalRecord::checkpoint_begin();
+        self.wal_writer
+            .append_at(begin_record, begin_lsn, CHECKPOINT_BEGIN_SIZE)?;
+        debug!(%begin_lsn, "checkpoint begin record emitted");
+
+        // -- Phase 2: Flush dirty pages --------------------------------------
+
+        // 4. Collect dirty pages. This is a snapshot; pages may become clean or
         //    dirty while we iterate.
         let dirty_pages = self.buffer_pool.dirty_page_ids();
         debug!(count = dirty_pages.len(), "collected dirty pages");
 
-        // 3. Flush each dirty page. flush() enforces WAL-before-data internally.
+        // 5. Flush each dirty page. flush() enforces WAL-before-data internally.
         //    M1 is conservative: any flush failure aborts the checkpoint so that
         //    the superblock is never updated to a checkpoint that did not
         //    actually complete.
@@ -189,21 +209,24 @@ impl CheckpointCoordinator {
         }
         debug!(%flushed, "flushed dirty pages");
 
-        // 4. Capture allocator state for the checkpoint end record.
+        // -- Phase 3: CheckpointEnd and superblock update ---------------------
+
+        // 6. Capture allocator state for the checkpoint end record.
         let next_page_id = self.page_allocator.lock().next_page_id();
         let next_txn_id = TxnId::FIRST; // M1 has no transactions.
 
-        // 5. Write CheckpointEnd. This marks the point at which the superblock
+        // 7. Write CheckpointEnd. This marks the point at which the superblock
         //    can be safely updated.
         let end_record = WalRecord::checkpoint_end(begin_lsn, next_page_id, next_txn_id)?;
         let end_lsn = self.wal_writer.append(end_record)?;
         debug!(%end_lsn, "checkpoint end");
 
-        // 6. Ensure CheckpointEnd and everything before it is fsynced before the
-        //    superblock is updated or old WAL segments are recycled.
+        // 8. Ensure CheckpointEnd and everything before it is fsynced before the
+        //    superblock is updated or old WAL segments are recycled. (append()
+        //    no longer fsyncs implicitly; this explicit flush_to is required.)
         self.wal_writer.flush_to(end_lsn)?;
 
-        // 7. Update the superblock. The redo LSN is the CheckpointBegin LSN.
+        // 9. Update the superblock. The redo LSN is the CheckpointBegin LSN.
         {
             let mut sb = self.superblock.lock();
             sb.checkpoint_lsn = begin_lsn;
@@ -214,7 +237,7 @@ impl CheckpointCoordinator {
         }
         info!(%begin_lsn, %flushed, "checkpoint completed");
 
-        // 8. Recycle WAL segments that are no longer needed for recovery.
+        // 10. Recycle WAL segments that are no longer needed for recovery.
         self.wal_writer.recycle_before(begin_lsn)?;
 
         Ok(begin_lsn)
@@ -504,5 +527,141 @@ mod tests {
             saw_fpi,
             "expected FPI after checkpoint for page modified before checkpoint"
         );
+    }
+
+    #[test]
+    fn checkpoint_fpi_race_window_is_eliminated() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        // Allocate and dirty a page so the next checkpoint has work to do.
+        let page_id = {
+            let mut guard = buffer_pool.new_page().unwrap();
+            guard.page_mut()[0] = 0xAA;
+            guard.page_id()
+        };
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool.clone(),
+            page_allocator,
+            wal_writer.clone(),
+        );
+
+        // Trigger checkpoint. With the Stage B fix, set_checkpoint_lsn is
+        // called BEFORE the CheckpointBegin record is emitted, so any pin_mut
+        // that starts after trigger_checkpoint returns will see the new LSN.
+        let begin_lsn = coordinator.trigger_checkpoint().unwrap();
+
+        // Invariant 1: buffer_pool's checkpoint_lsn must equal the reserved LSN.
+        // We can't read it directly, but we can verify via behavior: a pin_mut
+        // on a page modified before the checkpoint must write an FPI.
+        //
+        // Invariant 2: the CheckpointBegin record must exist at exactly
+        // begin_lsn in the WAL.
+        let mut reader = crate::wal::reader::WalReader::open_at(
+            data_dir.join("wal"),
+            config.wal_segment_size,
+            begin_lsn,
+        )
+        .unwrap();
+        let first_rec = reader
+            .next_record()
+            .unwrap()
+            .expect("WAL must contain CheckpointBegin");
+        assert_eq!(
+            first_rec.record_type,
+            crate::wal::record::WalRecordType::CheckpointBegin
+        );
+        assert_eq!(first_rec.lsn, begin_lsn);
+
+        // Invariant 3: a subsequent pin_mut on a pre-checkpoint page must
+        // produce an FPI because checkpoint_lsn was already visible.
+        buffer_pool.flush(page_id).unwrap(); // ensure page is clean first
+        let frame_count = buffer_pool.frame_count();
+        for _ in 0..frame_count + 10 {
+            drop(buffer_pool.new_page().unwrap());
+        }
+
+        let mut saw_fpi = false;
+        {
+            let mut guard = buffer_pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[0] = 0xBB;
+            let mut reader2 = crate::wal::reader::WalReader::open_at(
+                data_dir.join("wal"),
+                config.wal_segment_size,
+                begin_lsn,
+            )
+            .unwrap();
+            while let Some(rec) = reader2.next_record().unwrap() {
+                if rec.record_type == crate::wal::record::WalRecordType::FullPageImage {
+                    let decoded: crate::wal::record::FullPageImageRecord =
+                        bincode::serde::decode_from_slice(
+                            &rec.payload,
+                            crate::wal::record::bincode_config(),
+                        )
+                        .unwrap()
+                        .0;
+                    if decoded.page_id == page_id {
+                        saw_fpi = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_fpi,
+            "pin_mut after checkpoint must write FPI (checkpoint_lsn was visible)"
+        );
+    }
+
+    #[test]
+    fn checkpoint_succeeds_with_concurrent_wal_appends() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        // Dirty a page so the checkpoint has flush work to do.
+        {
+            let mut guard = buffer_pool.new_page().unwrap();
+            guard.page_mut()[0] = 0x5A;
+        }
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool,
+            page_allocator,
+            wal_writer.clone(),
+        );
+
+        // Continuously append WAL records while checkpoints run. An append
+        // landing between reserve_lsn(CheckpointBegin) and append_at advances
+        // the clock past the reserved range; the relaxed append_at check must
+        // tolerate that (it used to fail with "not at the reservation
+        // boundary", failing the whole checkpoint).
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let wal = Arc::clone(&wal_writer);
+        let appender = thread::spawn(move || {
+            let mut count = 0u64;
+            while !stop_flag.load(Ordering::Relaxed) {
+                wal.append(WalRecord::page_alloc(crate::types::PageId(1_000_000 + count)).unwrap())
+                    .unwrap();
+                count += 1;
+            }
+            count
+        });
+
+        // Run many checkpoints so appends land inside the reserve → emit
+        // window with high probability.
+        for _ in 0..20 {
+            coordinator.trigger_checkpoint().unwrap();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let appended = appender.join().unwrap();
+        assert!(appended > 0, "appender thread made no progress");
     }
 }

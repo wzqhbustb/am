@@ -135,8 +135,45 @@ impl FrameId {
     pub const INVALID: FrameId = FrameId(usize::MAX);
 }
 
+/// A database object identifier (table, type, index, etc.).
+///
+/// `Oid(0)` is reserved and never allocated. User OIDs start at 16384
+/// (matching PostgreSQL's user OID range). System OIDs are in the range
+/// `[1, 9999]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Oid(pub u64);
+
+impl Oid {
+    /// The reserved OID 0 (never allocated).
+    pub const INVALID: Oid = Oid(0);
+
+    /// The first user OID. System OIDs occupy `[1, 9999]`.
+    pub const FIRST_USER: Oid = Oid(16384);
+
+    /// Return true if this OID is in the system range `[1, 9999]`.
+    pub fn is_system(&self) -> bool {
+        self.0 > 0 && self.0 < Self::FIRST_USER.0
+    }
+}
+
+impl fmt::Display for Oid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Oid({})", self.0)
+    }
+}
+
 /// A tuple identifier: (page_id, slot_id).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `repr(C)` guarantees field order (`page_id` first, then `slot_id`) for
+/// predictable encoding. Rust's default alignment rules pad the in-memory
+/// struct to 16 bytes (8-byte PageId + 2-byte slot + 6-byte padding to the
+/// 8-byte alignment boundary). The useful payload is 10 bytes.
+///
+/// On-disk layout inside tuple headers: 12 bytes (8-byte PageId + 2-byte slot +
+/// 2-byte padding for 8-byte alignment), matching the M2 tuple header `t_ctid`
+/// field layout. Encoding is done manually, not via `repr(C)` memcpy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(C)]
 pub struct Tid {
     /// The page containing the tuple.
     pub page_id: PageId,
@@ -181,5 +218,45 @@ mod tests {
     fn lsn_advance_panics_on_unaligned_size() {
         let lsn = Lsn::FIRST;
         let _ = lsn.advance(5);
+    }
+
+    #[test]
+    fn oid_system_range() {
+        assert!(Oid(1259).is_system());
+        assert!(Oid(9999).is_system());
+        assert!(!Oid(16384).is_system());
+        assert!(!Oid::INVALID.is_system());
+        assert!(Oid(10000).is_system());
+    }
+
+    #[test]
+    fn oid_ordering() {
+        assert!(Oid::INVALID < Oid::FIRST_USER);
+        assert!(Oid(1259) < Oid(16384));
+    }
+
+    #[test]
+    fn oid_display() {
+        assert_eq!(format!("{}", Oid(1259)), "Oid(1259)");
+    }
+
+    #[test]
+    fn oid_serde_round_trip() {
+        let oid = Oid(16384);
+        let encoded = bincode::serde::encode_to_vec(oid, bincode::config::standard()).unwrap();
+        let (decoded, _): (Oid, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(oid, decoded);
+    }
+
+    #[test]
+    fn tid_layout() {
+        // repr(C) guarantees field order: page_id (8B) then slot_id (2B).
+        // Rust rounds struct size up to the alignment of the largest field (8B),
+        // so the actual in-memory size is 16 bytes. The useful payload is 10
+        // bytes; the on-disk tuple-header layout manually encodes as 12 bytes
+        // (8B PageId + 2B slot + 2B padding).
+        assert_eq!(std::mem::size_of::<Tid>(), 16);
+        assert_eq!(std::mem::align_of::<Tid>(), 8);
     }
 }

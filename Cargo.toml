@@ -1,5 +1,12 @@
 [workspace]
-members = ["crates/pg-storage"]
+members = [
+    "crates/pg-storage",
+    "crates/pg-txn",
+    "crates/pg-catalog",
+    "crates/pg-am-heap",
+    "crates/pg-am-btree",
+    "crates/pg-engine",
+]
 resolver = "2"
 
 [workspace.package]

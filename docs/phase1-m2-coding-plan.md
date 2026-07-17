@@ -61,7 +61,7 @@ M2 主线开工前请通读 tech-selection §0 / §7 / §11 / §14 / §21，以�
 | 追加 `Oid` 类型 | `pg-storage::types` 新增 `pub struct Oid(pub u64);`，与 `PageId / TxnId / FrameId` 平级 |
 | `TableOid` / `TypeOid` 别名 | 在 `pg-catalog` 定义 newtype，M2 起用（`pg_class` / `pg_type` 已需要） |
 | AM trait 定义 | `pg-catalog` 定义 `AccessMethod` + `UpdatableAM` trait 骨架（§14）；`pg-catalog` 定义 `Vacuumable` trait（§15，M2 只留接口 + heap `scan_dead_tuples`，Stage I 实现） |
-| 移动 `Tid` 到 `pg-storage` | 若 M1 未在 `pg-storage`，一次性上移；`repr(C)` 内存 10B、磁盘 12B（padding 声明） |
+| 移动 `Tid` 到 `pg-storage` | 若 M1 未在 `pg-storage`，一次性上移；`repr(C)` 保证字段顺序；payload 10B、repr(C) 对齐后 16B、磁盘 12B（padding 声明） |
 | CI 更新 | GitHub Actions 矩阵按 crate 拆开 fmt / clippy / test / doc |
 
 **关键 v2.3 约束**：
@@ -105,7 +105,7 @@ M2 主线开工前请通读 tech-selection §0 / §7 / §11 / §14 / §21，以�
 - **性能**：group commit 攒批吞吐较 M1 提升 ≥ 20%（测量方法：100 线程并发 commit，batch
   size ≥ 8 时 criterion 对比基线）
 
-**验收命令**：`cargo test -p pg-storage --test wal_before_data_on_evict && cargo bench -p pg-storage --bench wal_group_commit`
+**验收命令**：`cargo test -p pg-storage wal_before_data_on_evict && cargo bench -p pg-storage --bench wal_group_commit`
 
 ---
 

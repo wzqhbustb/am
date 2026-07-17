@@ -337,6 +337,18 @@ impl BufferPool {
         self.page_table.len()
     }
 
+    /// Test-only accessor for the `page_lsn` of a resident frame.
+    ///
+    /// Returns `None` if the page is not currently in the pool. Used by tests
+    /// to assert WAL-before-data ordering against the real FPI LSN.
+    #[cfg(test)]
+    fn frame_page_lsn(&self, page_id: PageId) -> Option<Lsn> {
+        let shard_idx = self.shard_index(page_id);
+        let frame_id = *self.page_table[shard_idx].lock().get(&page_id)?;
+        let meta = self.frames[frame_id.0].meta.lock();
+        Some(meta.page_lsn)
+    }
+
     /// Return the page IDs of all currently dirty frames.
     ///
     /// Intended for Stage I's checkpoint coordinator. The returned list is a
@@ -786,6 +798,97 @@ mod tests {
         let (_, _, pool2) = setup(&tmp);
         let guard = pool2.pin(page_id).unwrap();
         assert_eq!(&guard.page()[0..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn wal_before_data_on_evict() {
+        // Single-frame pool: every page load evicts the resident page, so
+        // eviction is fully deterministic. The group-commit worker is
+        // configured to flush ONLY on its 1s timeout (the batch size is never
+        // reached), so within this test's millisecond-scale critical section
+        // the worker cannot fsync the FPI spontaneously: the only way
+        // synced_lsn can advance past the FPI LSN is flush_frame's
+        // flush_to(page_lsn). That makes the assertion in step 5 a genuine
+        // WAL-before-data guard — delete the flush_to in flush_frame and it
+        // fails. Each explicit flush_to stalls at most ~1s waiting for the
+        // worker's timeout, which bounds the runtime.
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = StorageConfig::new(tmp.path());
+        cfg.buffer_pool_size = cfg.page_size(); // 1 frame
+        cfg.buffer_pool_shards = 1;
+        cfg.wal_group_commit_timeout_ms = 1_000;
+        cfg.wal_group_commit_batch_size = 1_000_000;
+        let wal = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
+        let allocator = Arc::new(Mutex::new(
+            PageAllocator::open(tmp.path(), &cfg, Arc::clone(&wal)).unwrap(),
+        ));
+        let pool =
+            BufferPool::open(tmp.path(), &cfg, Arc::clone(&allocator), Arc::clone(&wal)).unwrap();
+
+        // 1. Create the victim with on-disk content, then a second page whose
+        //    allocation evicts the victim from the single frame (the dirty
+        //    eviction writes the victim to the data file).
+        let victim_id = {
+            let mut guard = pool.new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[0] = 0xAA;
+            id
+        };
+        let other_id = {
+            let mut guard = pool.new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[0] = 0x11;
+            id
+        };
+        assert!(
+            pool.frame_page_lsn(victim_id).is_none(),
+            "victim should have been evicted by the second allocation"
+        );
+
+        // 2. Set checkpoint_lsn above everything written so far so that the
+        //    next pin_mut on the victim appends an FPI.
+        pool.set_checkpoint_lsn(wal.synced_lsn());
+
+        // 3. pin_mut reloads the victim (evicting `other`, whose flush brings
+        //    synced_lsn up to date) and appends its FPI without flushing.
+        //    Capture the real FPI LSN from the frame metadata. The worker's
+        //    next spontaneous flush is ~1s away, so the FPI cannot become
+        //    durable on its own within this critical section.
+        let fpi_lsn = {
+            let mut guard = pool.pin_mut(victim_id).unwrap();
+            guard.page_mut()[0] = 0xBB;
+            drop(guard);
+            pool.frame_page_lsn(victim_id)
+                .expect("victim frame must be resident after pin_mut")
+        };
+        assert!(
+            wal.synced_lsn() < fpi_lsn,
+            "setup: the FPI must not be durable yet: synced={}, fpi_lsn={}",
+            wal.synced_lsn(),
+            fpi_lsn
+        );
+
+        // 4. Reload `other`, evicting the dirty victim. flush_frame must call
+        //    flush_to(fpi_lsn) before writing the page.
+        {
+            let _guard = pool.pin(other_id).unwrap();
+        }
+        assert!(
+            pool.frame_page_lsn(victim_id).is_none(),
+            "victim should have been evicted"
+        );
+
+        // 5. WAL-before-data: synced_lsn now covers the real FPI LSN.
+        let post_evict_synced = wal.synced_lsn();
+        assert!(
+            post_evict_synced >= fpi_lsn,
+            "eviction must have called flush_to(fpi_lsn) for WAL-before-data: \
+             fpi_lsn={fpi_lsn}, post_evict_synced={post_evict_synced}"
+        );
+
+        // 6. The victim page is durable on disk with the updated content.
+        let guard = pool.pin(victim_id).unwrap();
+        assert_eq!(guard.page()[0], 0xBB);
     }
 
     #[test]

@@ -459,6 +459,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "pg-am-btree"
+version = "0.1.0"
+dependencies = [
+ "pg-catalog",
+ "pg-storage",
+ "pg-txn",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "pg-am-heap"
+version = "0.1.0"
+dependencies = [
+ "pg-catalog",
+ "pg-storage",
+ "pg-txn",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "pg-catalog"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "pg-storage",
+ "pg-txn",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "pg-engine"
+version = "0.1.0"
+dependencies = [
+ "pg-am-btree",
+ "pg-am-heap",
+ "pg-catalog",
+ "pg-storage",
+ "pg-txn",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "pg-storage"
 version = "0.1.0"
 dependencies = [
@@ -474,6 +520,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pg-txn"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "pg-storage",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,0 +1,22 @@
+[package]
+name = "pg-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust catalog layer — system tables, bootstrap, AccessMethod traits"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+pg-txn = { path = "../pg-txn" }
+
+# error types
+thiserror = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# For serde round-trip tests
+bincode = { version = "2.0.1", features = ["serde"] }

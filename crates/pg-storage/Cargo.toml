@@ -51,7 +51,7 @@ criterion = "0.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
-name = "wal_throughput"
+name = "wal_group_commit"
 harness = false
 
 [[bench]]

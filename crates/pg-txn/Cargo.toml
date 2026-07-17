@@ -1,0 +1,23 @@
+[package]
+name = "pg-txn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pg_rust transaction layer — XID, CLOG, Snapshot, Visibility Oracle, Lock Manager"
+
+[dependencies]
+pg-storage = { path = "../pg-storage" }
+
+# concurrency primitives
+parking_lot = "0.12"
+
+# TODO(Stage P): evaluate tokio::sync::Notify for lock manager wait/wake
+# (currently parking_lot::Condvar is the leading candidate)
+
+# error types
+thiserror = "2"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
