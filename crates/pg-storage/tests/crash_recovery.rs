@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
+use pg_storage::page::PAGE_HEADER_SIZE;
 use pg_storage::types::PageId;
 
 const CHILD_ENV_VAR: &str = "CRASH_RECOVERY_CHILD";
@@ -260,22 +261,24 @@ fn run_child_scenario(data_dir: &str, scenario: &str, iterations: usize) {
 }
 
 fn write_test_pattern(page: &mut [u8], seed: usize) {
-    page[0] = (seed % 256) as u8;
-    page[1..9].copy_from_slice(&seed.to_be_bytes());
+    // User content starts past the 32-byte page header so the pattern never
+    // collides with pd_lsn (page[0..8]).
+    page[PAGE_HEADER_SIZE] = (seed % 256) as u8;
+    page[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9].copy_from_slice(&seed.to_be_bytes());
     // Fill the rest with a deterministic but non-trivial pattern.
-    for (i, byte) in page.iter_mut().enumerate().skip(9) {
+    for (i, byte) in page.iter_mut().enumerate().skip(PAGE_HEADER_SIZE + 9) {
         *byte = ((seed + i) % 256) as u8;
     }
 }
 
 fn verify_test_pattern(page: &[u8], seed: usize) -> bool {
-    if page[0] != (seed % 256) as u8 {
+    if page[PAGE_HEADER_SIZE] != (seed % 256) as u8 {
         return false;
     }
-    if page[1..9] != seed.to_be_bytes() {
+    if page[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9] != seed.to_be_bytes() {
         return false;
     }
-    for (i, &byte) in page.iter().enumerate().skip(9) {
+    for (i, &byte) in page.iter().enumerate().skip(PAGE_HEADER_SIZE + 9) {
         if byte != ((seed + i) % 256) as u8 {
             return false;
         }

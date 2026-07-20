@@ -56,6 +56,16 @@ pub enum StorageError {
     /// Recovery must be completed before the requested operation.
     #[error("recovery required: {0}")]
     RecoveryRequired(String),
+
+    /// A WAL record type has no registered redo handler (recovery hard
+    /// failure; tech-selection v2.3-24).
+    #[error("no redo handler registered for WAL record type {record_type} at {lsn}")]
+    UnknownRecord {
+        /// The unhandled record type discriminant.
+        record_type: u8,
+        /// LSN of the offending record.
+        lsn: Lsn,
+    },
 }
 
 /// A convenient type alias for storage-layer results.

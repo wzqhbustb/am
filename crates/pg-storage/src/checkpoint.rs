@@ -292,6 +292,7 @@ mod tests {
     use super::*;
     use crate::buffer_pool::BufferPool;
     use crate::config::StorageConfig;
+    use crate::page::PAGE_HEADER_SIZE;
     use crate::page_allocator::PageAllocator;
     use crate::superblock::Superblock;
     use crate::wal::writer::WalWriter;
@@ -353,7 +354,7 @@ mod tests {
         // Allocate and modify a page so there is dirty work to checkpoint.
         {
             let mut guard = buffer_pool.new_page().unwrap();
-            guard.page_mut()[0] = 42;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 42;
         }
 
         let coordinator = CheckpointCoordinator::new(
@@ -440,7 +441,7 @@ mod tests {
         // flush and advances the superblock state.
         for _ in 0..3 {
             let mut guard = buffer_pool.new_page().unwrap();
-            guard.page_mut()[0] = 0xCD;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xCD;
         }
 
         let initial_lsn = superblock.lock().checkpoint_lsn;
@@ -478,7 +479,7 @@ mod tests {
         // Allocate and modify page 1.
         let page_id = {
             let mut guard = buffer_pool.new_page().unwrap();
-            guard.page_mut()[0] = 1;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 1;
             guard.page_id()
         };
         wal_writer.flush().unwrap();
@@ -505,7 +506,7 @@ mod tests {
         let mut saw_fpi = false;
         {
             let mut guard = buffer_pool.pin_mut(page_id).unwrap();
-            guard.page_mut()[0] = 2;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 2;
 
             // Read the WAL from the first checkpoint begin to find the FPI.
             let mut reader = crate::wal::reader::WalReader::open_at(
@@ -543,7 +544,7 @@ mod tests {
         // Allocate and dirty a page so the next checkpoint has work to do.
         let page_id = {
             let mut guard = buffer_pool.new_page().unwrap();
-            guard.page_mut()[0] = 0xAA;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xAA;
             guard.page_id()
         };
 
@@ -594,7 +595,7 @@ mod tests {
         let mut saw_fpi = false;
         {
             let mut guard = buffer_pool.pin_mut(page_id).unwrap();
-            guard.page_mut()[0] = 0xBB;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xBB;
             let mut reader2 = crate::wal::reader::WalReader::open_at(
                 data_dir.join("wal"),
                 config.wal_segment_size,
@@ -630,7 +631,7 @@ mod tests {
         // Dirty a page so the checkpoint has flush work to do.
         {
             let mut guard = buffer_pool.new_page().unwrap();
-            guard.page_mut()[0] = 0x5A;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0x5A;
         }
 
         let coordinator = CheckpointCoordinator::new(

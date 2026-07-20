@@ -28,6 +28,12 @@
 //!
 //! The use of `try_lock` on `Frame::meta` from both directions prevents the
 //! classic page-table / frame-meta lock-order reversal deadlock.
+//!
+//! `alloc_frame` is the one place that reads `Frame::content` before taking
+//! `Frame::meta` (to initialize the `pd_lsn` cache). This is safe because
+//! the frame has just been evicted and is not yet inserted into the page
+//! table: no other thread can locate or contend for it. Everywhere else the
+//! two locks are either held in one of the orders above or never nested.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -40,6 +46,7 @@ use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
+use crate::page::{page_pd_lsn, set_page_pd_lsn};
 use crate::page_allocator::PageAllocator;
 use crate::types::{FrameId, Lsn, PageId, PAGE_SIZE};
 use crate::wal::record::WalRecord;
@@ -59,8 +66,11 @@ struct FrameMeta {
     dirty: bool,
     /// CLOCK reference bit.
     reference: bool,
-    /// LSN of the last WAL record that modified this page.
-    page_lsn: Lsn,
+    /// Read-only cache of the page's `pd_lsn` (`page[0..8]`), kept in sync by
+    /// the FPI path in `pin_mut` and refreshed from page content on load. The
+    /// authoritative value lives in the page itself; readers that need
+    /// correctness (e.g. `flush_frame`) must read `page[0..8]` directly.
+    cached_lsn: Lsn,
     /// True if the page still needs a `FullPageImage` WAL record before the
     /// first modification in this residency.
     needs_fpi: bool,
@@ -76,7 +86,7 @@ impl Default for FrameMeta {
             pin_count: 0,
             dirty: false,
             reference: false,
-            page_lsn: Lsn::INVALID,
+            cached_lsn: Lsn::INVALID,
             needs_fpi: false,
             evicting: false,
         }
@@ -223,21 +233,31 @@ impl BufferPool {
 
         // Acquire the write lock before writing the FPI so the image reflects
         // the exact state just before this modification.
-        let content_guard = self.frames[frame_id.0].content.write();
+        let mut content_guard = self.frames[frame_id.0].content.write();
 
         // Write FPI if this page has not been modified since the current
         // checkpoint begin. The `needs_fpi` flag tracks whether this residency
-        // has already written an FPI; the checkpoint LSN tells us whether the
-        // page was last modified in the current checkpoint cycle.
+        // has already written an FPI; the page's own `pd_lsn` (authoritative,
+        // `page[0..8]`) tells us whether the page was last modified in the
+        // current checkpoint cycle.
         //
         // If no checkpoint has ever run (`checkpoint_lsn` is invalid), we skip
         // the FPI. This is correct for M1 because pages allocated before the
         // first checkpoint have no prior on-disk version that needs protecting.
-        let (needs_fpi, page_lsn) = {
+        //
+        // Conservative deviation from PG: `needs_fpi` is only reset on
+        // eviction/reload, not on checkpoint. A page already FPI'd in this
+        // residency gets no new FPI after a later checkpoint begins, even when
+        // its pd_lsn falls behind the new checkpoint_lsn — PG would write one.
+        // This is M1's accepted loss window (post-checkpoint in-place
+        // modifications are not redo-protected); it closes when Stage I adds
+        // heap redo records.
+        let needs_fpi = {
             let meta = self.frames[frame_id.0].meta.lock();
-            (meta.needs_fpi, meta.page_lsn)
+            meta.needs_fpi
         };
         let checkpoint_lsn = self.checkpoint_lsn();
+        let page_lsn = page_pd_lsn(&content_guard[..]);
         let should_write_fpi = needs_fpi && checkpoint_lsn.is_valid() && page_lsn < checkpoint_lsn;
 
         if should_write_fpi {
@@ -261,9 +281,13 @@ impl BufferPool {
                 }
             };
 
+            // Publish the FPI LSN into the page itself (authoritative) and
+            // mirror it into the frame cache. The FPI image keeps the *old*
+            // pd_lsn; recovery patches it to the record's own LSN.
+            set_page_pd_lsn(&mut content_guard[..], fpi_lsn);
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.needs_fpi = false;
-            meta.page_lsn = fpi_lsn;
+            meta.cached_lsn = fpi_lsn;
             meta.dirty = true;
         }
 
@@ -337,16 +361,17 @@ impl BufferPool {
         self.page_table.len()
     }
 
-    /// Test-only accessor for the `page_lsn` of a resident frame.
+    /// Test-only accessor for the cached `pd_lsn` of a resident frame.
     ///
-    /// Returns `None` if the page is not currently in the pool. Used by tests
-    /// to assert WAL-before-data ordering against the real FPI LSN.
+    /// Returns `None` if the page is not currently in the pool. The cached
+    /// value is a read-only mirror of `page[0..8]`; tests use it to check
+    /// cache/page consistency and frame residency.
     #[cfg(test)]
-    fn frame_page_lsn(&self, page_id: PageId) -> Option<Lsn> {
+    fn frame_cached_lsn(&self, page_id: PageId) -> Option<Lsn> {
         let shard_idx = self.shard_index(page_id);
         let frame_id = *self.page_table[shard_idx].lock().get(&page_id)?;
         let meta = self.frames[frame_id.0].meta.lock();
-        Some(meta.page_lsn)
+        Some(meta.cached_lsn)
     }
 
     /// Return the page IDs of all currently dirty frames.
@@ -432,6 +457,16 @@ impl BufferPool {
             self.read_page_from_disk(page_id, frame_id)?;
         }
 
+        // Read the page's pd_lsn before touching frame metadata: the two
+        // locks are taken sequentially, never nested (pin_mut is the one
+        // place that legitimately nests them, in content → meta order). The
+        // frame is not yet visible in the page table, so no other thread can
+        // contend for it.
+        let cached_lsn = {
+            let content = self.frames[frame_id.0].content.read();
+            page_pd_lsn(&content[..])
+        };
+
         {
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.page_id = page_id;
@@ -440,7 +475,9 @@ impl BufferPool {
             meta.pin_count = 1;
             meta.reference = true;
             meta.dirty = false;
-            meta.page_lsn = Lsn::INVALID;
+            // The page's pd_lsn is authoritative; cache a copy in the frame.
+            // A fresh (zeroed) page yields Lsn::INVALID, matching M1 semantics.
+            meta.cached_lsn = cached_lsn;
             meta.needs_fpi = true;
         }
 
@@ -527,35 +564,52 @@ impl BufferPool {
     }
 
     /// Flush a single frame to disk if it is dirty.
+    ///
+    /// **WAL-before-data invariant**: the content read lock must be held
+    /// continuously from the moment we sample `pd_lsn` through `flush_to`,
+    /// `write_all`, and `sync_all`. Otherwise a concurrent `pin_mut` on the
+    /// same frame can append a new WAL record and advance `pd_lsn` between
+    /// the LSN sample and the disk write, causing the data file to contain
+    /// a `pd_lsn` whose WAL record is not yet fsynced.
+    ///
+    /// **Lock order** (local to this function): `content.read → data_file →
+    /// meta`. This reverses the global `data_file → content.write` order
+    /// used by `read_page_from_disk`, but is deadlock-free because:
+    /// * `read_page_from_disk` acquires `content.write` on a *freshly
+    ///   allocated* frame `F_new` that is not yet published in
+    ///   `page_table`, so no other thread can target it.
+    /// * `flush_frame` targets an *already published* frame `F_a`. Eviction
+    ///   uses the `evicting` flag to prevent `F_a` from being reused as
+    ///   `F_new` while a flush is in progress.
+    /// * `F_new ≠ F_a` therefore holds; the two lock orders never share a
+    ///   frame and no cycle can form.
     fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
-        let (page_id, page_lsn, dirty) = {
+        let (page_id, dirty) = {
             let meta = self.frames[frame_id.0].meta.lock();
-            (meta.page_id, meta.page_lsn, meta.dirty)
+            (meta.page_id, meta.dirty)
         };
 
         if !dirty || page_id == PageId::INVALID {
             return Ok(());
         }
 
-        // WAL-before-data: ensure the WAL is fsynced up to page_lsn.
+        let content = self.frames[frame_id.0].content.read();
+        let page_lsn = page_pd_lsn(&content[..]);
         if page_lsn.is_valid() && self.wal_writer.synced_lsn() < page_lsn {
             self.wal_writer.flush_to(page_lsn)?;
         }
 
         let offset = (page_id.0 - 1) * self.config.page_size() as u64;
-
-        // Lock ordering: data_file before content. The seek only touches the
-        // file, so we acquire the file lock first and then the content lock.
         let mut file = self.data_file.lock();
         file.seek(SeekFrom::Start(offset))
             .map_err(StorageError::Io)?;
-
-        let content = self.frames[frame_id.0].content.read();
         file.write_all(&*content).map_err(StorageError::Io)?;
         // TODO(Stage I): checkpoint can batch multiple frame flushes and call
         // sync_all() once at the end. For M1 per-page flush is correct but
         // performs more fsyncs than necessary.
         file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        drop(content);
 
         {
             let mut meta = self.frames[frame_id.0].meta.lock();
@@ -679,6 +733,7 @@ impl Drop for PageGuardMut<'_> {
 mod tests {
     use super::*;
     use crate::config::StorageConfig;
+    use crate::page::{page_pd_lsn, PAGE_HEADER_SIZE};
     use proptest::prelude::*;
     use tempfile::TempDir;
 
@@ -728,11 +783,11 @@ mod tests {
 
         let mut guard = pool.new_page().unwrap();
         let page_id = guard.page_id();
-        guard.page_mut()[0] = 0xAB;
+        guard.page_mut()[PAGE_HEADER_SIZE] = 0xAB;
         drop(guard);
 
         let read_guard = pool.pin(page_id).unwrap();
-        assert_eq!(read_guard.page()[0], 0xAB);
+        assert_eq!(read_guard.page()[PAGE_HEADER_SIZE], 0xAB);
     }
 
     #[test]
@@ -744,7 +799,7 @@ mod tests {
         let page_id = {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0] = 0xCD;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xCD;
             id
         };
 
@@ -759,7 +814,7 @@ mod tests {
         }
 
         let mut guard = pool.pin_mut(page_id).unwrap();
-        guard.page_mut()[1] = 0xEF;
+        guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0xEF;
         drop(guard);
 
         // WAL should contain at least one FullPageImage record.
@@ -788,7 +843,7 @@ mod tests {
         let page_id = {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
+            guard.page_mut()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(&[1, 2, 3, 4]);
             id
         };
 
@@ -797,7 +852,10 @@ mod tests {
         // Drop the pool and reopen it; the page should still be readable.
         let (_, _, pool2) = setup(&tmp);
         let guard = pool2.pin(page_id).unwrap();
-        assert_eq!(&guard.page()[0..4], &[1, 2, 3, 4]);
+        assert_eq!(
+            &guard.page()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4],
+            &[1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -827,21 +885,22 @@ mod tests {
 
         // 1. Create the victim with on-disk content, then a second page whose
         //    allocation evicts the victim from the single frame (the dirty
-        //    eviction writes the victim to the data file).
+        //    eviction writes the victim to the data file). User content lives
+        //    past the 32-byte page header so it never collides with pd_lsn.
         let victim_id = {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0] = 0xAA;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xAA;
             id
         };
         let other_id = {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0] = 0x11;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0x11;
             id
         };
         assert!(
-            pool.frame_page_lsn(victim_id).is_none(),
+            pool.frame_cached_lsn(victim_id).is_none(),
             "victim should have been evicted by the second allocation"
         );
 
@@ -850,16 +909,20 @@ mod tests {
         pool.set_checkpoint_lsn(wal.synced_lsn());
 
         // 3. pin_mut reloads the victim (evicting `other`, whose flush brings
-        //    synced_lsn up to date) and appends its FPI without flushing.
-        //    Capture the real FPI LSN from the frame metadata. The worker's
-        //    next spontaneous flush is ~1s away, so the FPI cannot become
-        //    durable on its own within this critical section.
+        //    synced_lsn up to date) and appends its FPI without flushing. The
+        //    authoritative FPI LSN is read from the page's pd_lsn field. The
+        //    worker's next spontaneous flush is ~1s away, so the FPI cannot
+        //    become durable on its own within this critical section.
         let fpi_lsn = {
             let mut guard = pool.pin_mut(victim_id).unwrap();
-            guard.page_mut()[0] = 0xBB;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xBB;
+            let fpi_lsn = page_pd_lsn(guard.page());
             drop(guard);
-            pool.frame_page_lsn(victim_id)
-                .expect("victim frame must be resident after pin_mut")
+            assert!(
+                pool.frame_cached_lsn(victim_id) == Some(fpi_lsn),
+                "frame cache must mirror the page's pd_lsn"
+            );
+            fpi_lsn
         };
         assert!(
             wal.synced_lsn() < fpi_lsn,
@@ -874,7 +937,7 @@ mod tests {
             let _guard = pool.pin(other_id).unwrap();
         }
         assert!(
-            pool.frame_page_lsn(victim_id).is_none(),
+            pool.frame_cached_lsn(victim_id).is_none(),
             "victim should have been evicted"
         );
 
@@ -888,7 +951,56 @@ mod tests {
 
         // 6. The victim page is durable on disk with the updated content.
         let guard = pool.pin(victim_id).unwrap();
-        assert_eq!(guard.page()[0], 0xBB);
+        assert_eq!(guard.page()[PAGE_HEADER_SIZE], 0xBB);
+    }
+
+    #[test]
+    fn pd_lsn_authoritative() {
+        // After any WAL-covered mutation, the frame's cached LSN must equal
+        // the page's own pd_lsn (page[0..8]); after an eviction/reload cycle
+        // the cache is rebuilt from page[0..8] itself.
+        let tmp = TempDir::new().unwrap();
+        let (_, wal, pool) = setup(&tmp);
+
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0x42;
+            guard.page_id()
+        };
+        pool.flush(page_id).unwrap();
+
+        // Evict the page so the next pin_mut starts a new residency (FPI
+        // eligible), then simulate a checkpoint.
+        let frame_count = pool.frame_count();
+        for _ in 0..frame_count + 2 {
+            let _ = pool.new_page().unwrap();
+        }
+        pool.set_checkpoint_lsn(wal.synced_lsn());
+
+        // First mutation in the new residency: the FPI publishes its LSN into
+        // the page header, and the frame cache mirrors it.
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0x43;
+            let pd_lsn = page_pd_lsn(guard.page());
+            assert!(
+                pd_lsn.is_valid(),
+                "pin_mut must publish the FPI LSN into page[0..8]"
+            );
+            assert_eq!(pool.frame_cached_lsn(page_id), Some(pd_lsn));
+        }
+
+        // Evict and reload: the cache must be rebuilt from page[0..8] (the
+        // flush on eviction wrote pd_lsn to disk).
+        for _ in 0..frame_count + 2 {
+            let _ = pool.new_page().unwrap();
+        }
+        let pd_after_reload = {
+            let guard = pool.pin(page_id).unwrap();
+            page_pd_lsn(guard.page())
+        };
+        assert!(pd_after_reload.is_valid());
+        assert_eq!(pool.frame_cached_lsn(page_id), Some(pd_after_reload));
     }
 
     #[test]
@@ -922,7 +1034,7 @@ mod tests {
         for i in 0..frame_count {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0] = i as u8;
+            guard.page_mut()[PAGE_HEADER_SIZE] = i as u8;
             ids.push(id);
         }
         drop(ids);
@@ -931,7 +1043,7 @@ mod tests {
         let referenced: Vec<_> = (0..frame_count / 2)
             .map(|i| {
                 let guard = pool.pin(PageId(i as u64 + 1)).unwrap();
-                assert_eq!(guard.page()[0], i as u8);
+                assert_eq!(guard.page()[PAGE_HEADER_SIZE], i as u8);
                 guard.page_id()
             })
             .collect();
@@ -947,7 +1059,7 @@ mod tests {
         // original content.
         for i in 0..frame_count / 2 {
             let guard = pool.pin(PageId(i as u64 + 1)).unwrap();
-            assert_eq!(guard.page()[0], i as u8);
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], i as u8);
         }
     }
 
@@ -962,7 +1074,7 @@ mod tests {
         for i in 0..frame_count {
             let mut guard = pool.new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0] = i as u8;
+            guard.page_mut()[PAGE_HEADER_SIZE] = i as u8;
             ids.push(id);
         }
         drop(ids);
@@ -970,7 +1082,7 @@ mod tests {
         // Simulate a full table scan: pin every page once, then release.
         for i in 0..frame_count {
             let guard = pool.pin(PageId(i as u64 + 1)).unwrap();
-            assert_eq!(guard.page()[0], i as u8);
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], i as u8);
         }
 
         // After one full scan, all pages have reference=true. CLOCK should give
@@ -1128,7 +1240,7 @@ mod tests {
         let mut owned_ids = Vec::new();
         for _ in 0..100 {
             let mut guard = pool.new_page().unwrap();
-            guard.page_mut()[0] = 0; // initial baseline
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0; // initial baseline
             owned_ids.push(guard.page_id());
         }
 
@@ -1152,7 +1264,7 @@ mod tests {
                         }
                         1 => {
                             if let Ok(mut g) = p.pin_mut(shared[i % shared.len()]) {
-                                g.page_mut()[0] = thread_id as u8;
+                                g.page_mut()[PAGE_HEADER_SIZE] = thread_id as u8;
                                 o.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -1172,8 +1284,9 @@ mod tests {
                             // Write to the thread's exclusive page. The final
                             // value should be the last successful write.
                             if let Ok(mut g) = p.pin_mut(owned[thread_id]) {
-                                g.page_mut()[0] = (thread_id + 1) as u8;
-                                g.page_mut()[1..9].copy_from_slice(&i.to_be_bytes());
+                                g.page_mut()[PAGE_HEADER_SIZE] = (thread_id + 1) as u8;
+                                g.page_mut()[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9]
+                                    .copy_from_slice(&i.to_be_bytes());
                                 o.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -1195,8 +1308,12 @@ mod tests {
         // contains one of the values the owning thread wrote.
         for (thread_id, &owned_id) in owned_ids.iter().enumerate() {
             let guard = pool.pin(owned_id).unwrap();
-            assert_eq!(guard.page()[0], (thread_id + 1) as u8);
-            let last_iteration = u64::from_be_bytes(guard.page()[1..9].try_into().unwrap());
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], (thread_id + 1) as u8);
+            let last_iteration = u64::from_be_bytes(
+                guard.page()[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9]
+                    .try_into()
+                    .unwrap(),
+            );
             assert!(last_iteration < 20, "owned page {thread_id} corrupted");
         }
 
@@ -1230,8 +1347,8 @@ mod tests {
             let mut ids = Vec::with_capacity(count);
             for i in 0..count {
                 let mut guard = pool.new_page().unwrap();
-                guard.page_mut()[0] = (i % 256) as u8;
-                guard.page_mut()[1..9].copy_from_slice(&(i as u64).to_be_bytes());
+                guard.page_mut()[PAGE_HEADER_SIZE] = (i % 256) as u8;
+                guard.page_mut()[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9].copy_from_slice(&(i as u64).to_be_bytes());
                 ids.push(guard.page_id());
             }
 
@@ -1243,8 +1360,8 @@ mod tests {
 
             for (i, id) in ids.iter().enumerate() {
                 let guard = pool.pin(*id).unwrap();
-                prop_assert_eq!(guard.page()[0], (i % 256) as u8);
-                prop_assert_eq!(&guard.page()[1..9], &(i as u64).to_be_bytes());
+                prop_assert_eq!(guard.page()[PAGE_HEADER_SIZE], (i % 256) as u8);
+                prop_assert_eq!(&guard.page()[PAGE_HEADER_SIZE + 1..PAGE_HEADER_SIZE + 9], &(i as u64).to_be_bytes());
             }
         }
     }

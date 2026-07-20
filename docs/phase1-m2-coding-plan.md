@@ -164,15 +164,21 @@ Heap AM 编译期就依赖它。
 - v2.3-12：PageHeader 32B（26 字节字段 + 6 padding）；28B 无法满足 tuple 8 字节对齐
 
 > **tech-selection §0 偏差说明**：§0 原文说 "Stage 0a 只落 trait 定义 + doc comment，
-> NoOpClogAccessor 在 Stage 0b 交付"。本计划将 `NoOpClogAccessor` 骨架提前到 Stage D，
-> 因为 Stage D 的回归测试（M1 `crash_recovery` 用新 `RedoRegistry` 分发）需要实例化
-> `RedoContext`，而 `RedoContext.clog: &dyn ClogAccessor` 要求至少有一个具体实现才能编译
-> 通过。Stage F 仍负责将其正式装配到 `Engine::open`。这是对 tech-selection 的实践细化，
-> 不改变 trait 定义位置和后续实现计划。
+> NoOpClogAccessor + Engine::open 装配 RedoRegistry 在 Stage 0b (F) 交付"。本计划将两者
+> 一并前移到 Stage D，因为 Stage D 的回归测试（M1 `crash_recovery` 用新 `RedoRegistry`
+> 分发 `FullPageImage` / `PageAlloc` handler）需要**实际的** `Engine::open` 走过装配路径，
+> 而不仅是编译期占位。Stage F 因此收窄为 Debt #5 (`read_at/write_at`) 单一职责；这是对
+> tech-selection 的实践细化，不改变 trait 定义位置和后续 M2 实现计划。
+
+> ⚠️ **M1 数据文件兼容性声明（Stage D 起生效）**：superblock v1→v2 迁移只覆盖元数据；
+> M1 数据文件的页面没有 `pd_lsn`（`page[0..8]` 是用户数据），自本 stage 引入 pd_lsn
+> 权威契约后**不再支持打开**（垃圾 LSN 会导致 checkpoint/flush 报 `LsnNotAvailable`，
+> 或错误抑制 FPI）。M1 数据库从未对外发布，测试产物直接重建，不做页面级迁移。
 
 **验收标准**：
-- **功能**：trait 定义完整可编译；`NoOpClogAccessor` 骨架（M1 无事务，`get_state` 返回
-  `COMMITTED`，`set_state` no-op）用于本 stage 编译期占位（真正装配在 Stage F）
+- **功能**：trait 定义完整可编译；`NoOpClogAccessor`（M1 无事务，`get_state` 返回
+  `COMMITTED`，`set_state` no-op）+ `Engine::open` 已装配 `RedoRegistry`（FPI + PageAlloc
+  + Checkpoint no-op handler 三条已注册；heap / txn handler 后续 stage 追加）
 - **正确性**：`test_redo_registry_duplicate_panics`；`test_pd_lsn_authoritative` 通过
 - **回归**：M1 `crash_recovery` 用新 `RedoRegistry` 分发 `FullPageImage` 与 `PageAlloc`
   handler，1000 轮继续绿灯
@@ -209,28 +215,35 @@ Heap AM 编译期就依赖它。
 
 ---
 
-## 阶段 F：NoOpClogAccessor 装配 + RedoRegistry engine wiring + read_at/write_at（3–4 天）
+## 阶段 F：数据文件 I/O 无锁化（read_at / write_at）（3–4 天）
 
 **归属**：Stage 0b（可与 M2a 前 60% 并行）
 **前置**：D（F 与 E 平级，无相互依赖，可并行推进）
-**目标**：Stage 0b 收尾 —— 完成债务 #4b、#5，让 M2a 集成测试可以起跑。
+**目标**：完成 M1 债务 #5 —— 把 `Mutex<File>` 的锁化 I/O 换成无锁 positional read/write，
+让 BufferPool 并发路径不再串行到单锁上。
+
+> **Stage 0a 吸收说明**：本 stage 原计划的两项工作（`NoOpClogAccessor` 骨架 + `Engine::open`
+> 装配 `RedoRegistry`）已在 Stage D 一并完成（详见 Stage D 的"tech-selection §0 偏差说明"）。
+> Stage F 因此只保留 Debt #5，工期减半。此变更也解锁了 Stage 0b 与 M2a 的完全并行（见
+> 依赖图 / 并行边界）。
 
 | 任务 | 交付物 |
 |------|--------|
-| `NoOpClogAccessor` 实现 | `pg-storage::clog::NoOpClogAccessor`：`get_state → COMMITTED`、`set_state → no-op`；M1 空事务场景默认装配 |
-| `Engine::open` 装配 `RedoRegistry` | 收集所有 crate 的 `redo_handlers()` 一次性注册；未注册 record 类型 → 硬失败 |
-| 数据文件 I/O 改造 | `data_file: Arc<File>`，`read_at` / `write_at` 无锁并发；Windows fallback `seek_read/seek_write` |
-| BufferPool 并发压测 | 100 线程随机 read/write，QPS ≥ M1 + 50% |
+| 数据文件 I/O 改造 | `data_file: Arc<File>`（不再 `Mutex<File>`）；BufferPool `read_page_from_disk` / `write_page_to_disk` 走 positional read/write，无锁并发 |
+| 跨平台 wrapper | `pg-storage::io` 内新增薄 trait 或 `#[cfg]` 包装：Unix 用 `std::os::unix::fs::FileExt::{read_at, write_at}`，Windows 用 `std::os::windows::fs::FileExt::{seek_read, seek_write}`（Windows 上不共享 file position，语义一致）；一个 `pub fn read_page_at(file: &File, page_id: PageId, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>` API |
+| Checkpointer / recovery I/O | `FullPageImageRedoHandler` 内的 `Mutex<File>::seek+write_all` 一并换成 `write_at`；handler 内部锁移除 |
+| BufferPool 并发压测 | 100 线程随机 read/write，QPS ≥ M1 + 50%（M1 单锁下 baseline 约 20K ops/s） |
+| 回归 | 现有 100+ 单元 / 集成测试全绿；`crash_recovery` 1000 轮全绿 |
 
-**关键 v2.3 约束**：v2.3-Q1（NoOpClogAccessor 位置）
+**关键 v2.3 约束**：无（属债务清理）
 
 **验收标准**：
-- **功能**：`Engine::open` 装配后 `crash_recovery` 走新分发路径
-- **并发**：100 线程 × 10K 随机 page read/write，无锁竞争 hot path
+- **功能**：数据文件所有 I/O 走 positional API；`data_file` 字段类型从 `Arc<Mutex<File>>` 变 `Arc<File>`
+- **并发**：100 线程 × 10K 随机 page read/write，无锁竞争 hot path；`perf` 采样确认 `pthread_mutex_lock` 不在 top 10
 - **回归**：M1 集成测试 + `crash_recovery` 1000 轮全绿
 
 **Stage 0b 出口 tag**：`phase1-m1-debt-clean`（与 Stage 0a 的 `-0a` 对称；后者是中间态 tag，前者是合并后 tag，对应 tech-selection §0）
-**并行边界**：Stage 0b 交付前，M2a Stage G→H（G/H 内部顺序，见 Stage H 前置）与 Stage 0b 完全并行；Stage I 后半段（Heap redo 并发压测）与 J 集成测试必须等 F 就位
+**并行边界**：Stage 0b 与整个 M2a Stage G / H / I / J 完全并行（Stage D 吸收 F 原有 clog/registry wiring 后，M2a 主线不再依赖 F）；F 的 pread/pwrite 提升只影响 Stage K 100 线程压测的**性能数字**，不影响功能正确性，因此 K 的功能验收不强制等 F
 **验收命令**：`cargo test --workspace && cargo bench -p pg-storage --bench buffer_pool_concurrent`
 
 ---
@@ -279,7 +292,9 @@ Heap AM 编译期就依赖它。
 | builtin_types 硬编码 | `int4 / int8 / text / bytea / timestamptz / uuid`；`pg-catalog::builtin_types.rs` |
 | Bootstrap 顺序 | init 时先按硬编码 schema 直接写第一个 heap page（pg_class 自身定义），再用读到的 schema 校验后续系统表 |
 | OID 分配器 | `AtomicU64` 从 superblock `next_oid` 加载；系统 OID [1, 9999]，用户 OID ≥ 16384 |
+| Checkpointer 接线 OID allocator | Stage C 已在 superblock v2 保留 `next_oid` 字段但写入值恒为 `FIRST_USER`（无 allocator）；本 stage 让 `Checkpointer::trigger_checkpoint` 从 `OidAllocator::current()` 读实际值写回 superblock，关掉 Stage C 遗留的占位路径 |
 | 集成测试 | `test_bootstrap_from_empty_dir`：空目录 open → 5 表齐全 → schema 与 builtin_types 一致 |
+| next_oid 持久化测试 | `test_next_oid_persists_across_checkpoint`：分配 N 个 OID → checkpoint → 重开 → allocator 起点 ≥ N（配合下方 next_oid 回滚窗口用例） |
 
 **关键 v2.3 约束**：无（属 §5）
 - §16 依赖：引入 `arc-swap = "1"`（Catalog 快照原子换代，DDL 生效）
@@ -307,17 +322,20 @@ Heap AM 编译期就依赖它。
 ## 阶段 I：Heap AM + Redo Handlers（6–8 天）
 
 **归属**：M2a
-**前置**：D（trait）/ G（Tuple 编解码）/ H（Catalog）；**并发验收部分额外依赖 F**（read_at/write_at 无锁 I/O）
+**前置**：D（trait + `RedoRegistry` 装配）/ G（Tuple 编解码）/ H（Catalog）；F 只影响 100 线程并发压测的 QPS 数字，不阻塞任何**功能**验收（Stage D 装配已完备）
 **目标**：实现 M2a 单线程 heap CRUD 路径 + 崩溃恢复能重放 heap WAL。
 
 | 任务 | 交付物 |
 |------|--------|
+| Engine::open recovery 顺序调整 | **Stage D 遗留**：M1 recovery 在 `BufferPool::open` 之前跑（FPI 直写 data file，`RedoContext.buffer_pool: None`）。Heap redo handler 必须能 pin/dirty 页 → 本 stage 重排为"先建 BufferPool → 再跑 Analysis → Redo 通过 pool 写页"；FPI handler 同步改走 pool 而不是 `Mutex<File>`。补 `test_redo_context_pool_is_some`（recovery 期间 handler 断言 `ctx.buffer_pool.is_some()`） |
 | Heap AM 实现 | `impl AccessMethod + UpdatableAM for HeapAM`；`InsertContext.out_tid: Option<&mut Tid>` 回填 |
 | Vacuumable 接口 | `impl Vacuumable for HeapAM`：`scan_dead_tuples` 实现（xmax committed 且早于 oldest snapshot）；`reclaim` / `notify_indexes` 留 `unimplemented!()`（§15，M3 实现） |
 | Heap redo handlers | `HeapInsertHandler / HeapUpdateHandler / HeapDeleteHandler` 三个；`redo_handlers()` 返回 `Vec<Box<dyn RedoHandler>>` |
 | mutation 写 pd_lsn | 每次修改 heap page 后同 latch 内 `set_page_pd_lsn(page, record.lsn.max(old))`，然后 `buffer_pool.mark_dirty(page_id, record.lsn)` |
 | redo 幂等 | handler apply 内部 `if page_pd_lsn(page) >= record.lsn { return Ok(()); }` |
 | `RedoRegistry` 注册 | Heap AM 在 `Engine::open` 时把 3 个 handler 注册；duplicate 触发 panic 单测 |
+| 跨 record 幂等 crash test | `test_fpi_then_heap_record_idempotent`：FPI(page,lsn=100) → HeapInsert(page,lsn=200) → 崩溃 → 重放两条 → 再崩溃 → 重放两条，断言 `page_pd_lsn == 200` 且 tuple 内容一致（验证 FPI handler 的 `set_page_pd_lsn(&mut image, record.lsn)` patching 与后续 record 的比较逻辑一致，不会因 image 内旧 pd_lsn 引发死锁式重放） |
+| 关闭 Stage D 遗留 FPI 窗口 | Stage D 保守偏差：同一驻留内跨 checkpoint 边界的第二次修改**不补 FPI**（`needs_fpi` 只在 evict/reload 重置）。本 stage 让 heap 写路径在每次 checkpoint 后重新检查"page.pd_lsn < checkpoint_lsn"，跨边界即强制写 FPI；补 `test_fpi_across_checkpoint_boundary`（驻留期间连续两次 checkpoint 后修改，crash-restart 数据完整） |
 | 集成测试 | INSERT 100 万条 + kill -9 + restart → 数据完全一致；abort 事务 tuple 在下轮 SELECT 中不可见（xmin ABORTED via CLOG） |
 
 **关键 v2.3 约束**：
@@ -329,7 +347,7 @@ Heap AM 编译期就依赖它。
 - **功能**：`insert / scan / update / delete` 单线程 API 全通
 - **正确性**：`test_heap_crash_recovery`；`test_heap_redo_idempotent`（同一 record 重放
   10 次页面不变）
-- **并发**：Stage F 就位后 100 线程 INSERT 无 slot 冲突
+- **并发**：100 线程 INSERT 无 slot 冲突（Stage F pread/pwrite 就位后 QPS 数字更高，功能不变）
 - **性能**：单线程 INSERT ≥ 30K ops/s（criterion，纯 heap AM 路径，尚未叠加 TxnManager / CLOG；
   该数字是后续 Stage K/T 的性能上限，加层后会逐步下降）
 
@@ -337,7 +355,7 @@ Heap AM 编译期就依赖它。
 ```bash
 # 单线程验收（G/H 完成后即可）
 cargo test -p pg-am-heap --test heap_am_integration && cargo test -p pg-am-heap --test heap_redo_idempotent
-# 并发验收（需 Stage F 就位）
+# 并发验收（G/H 完成即可跑，Stage F 提升 QPS 数字）
 cargo test -p pg-am-heap --test heap_concurrent_insert
 ```
 
@@ -346,7 +364,7 @@ cargo test -p pg-am-heap --test heap_concurrent_insert
 ## 阶段 J：最小 TxnManager + In-Memory ClogAccessor（4–6 天）
 
 **归属**：M2a
-**前置**：D / I；**集成测试路径额外依赖 F**（TxnManager 装配到 Engine::open 走 F 的 wiring）
+**前置**：D（trait + `RedoRegistry` 装配）/ I；F 只影响 QPS，不阻塞集成测试
 **目标**：让 M2a 每条 SQL 走一次真实的 XID 分配 + WAL commit / abort，为 M2b 换成磁盘
 CLOG 铺路。
 
@@ -378,7 +396,7 @@ CLOG 铺路。
 ## 阶段 K：Engine API + M2a 综合验证（4–5 天）
 
 **归属**：M2a
-**前置**：F（Stage 0b 装配）/ H / I / J
+**前置**：**E**（`PageFree` handler 必须先注册，否则 `drop_table` emit `PageFree` 触发 v2.3-24 硬失败）/ H / I / J；F 只影响并发压测数字，不阻塞功能验收
 **目标**：M2a 出口 —— 程序化 API 可用 + 100 线程并发压测通过 + crash-restart 数据一致。
 
 | 任务 | 交付物 |
@@ -707,9 +725,11 @@ cargo bench -p pg-engine --bench m2c_100_conn
 | **M2c 小计** | | **27–39 天（5.5–8 周）** |
 | **总计** | | **约 16–22 周（4–5.5 个月）** |
 
-> Stage 0a + 0b 顺序执行约 3–3.5 周；Stage 0b 与 M2a 前 60%（Stage G+H）并行推进，
-> 关键路径上 0b 被 G+H 吸收（G+H 8–11 天 ≥ 0b 6–8 天），实际节省约 1–1.5 周。
-> M2 主线落地约 18–25 周；总表 16–22 周为乐观区间（假设无返工、0b 恰好不阻塞 M2a 后段）。
+> Stage 0a + 0b 顺序执行约 3–3.5 周；Stage 0b 与 M2a 完全并行（Stage D 吸收 F 的
+> wiring 工作后，F 的 `read_at/write_at` 只影响 Stage K 压测数字，不阻塞任何 M2a
+> 功能验收）。关键路径上 0b 被 M2a Stage G+H+I（14–19 天）完全吸收，实际节省约
+> 1.5–2 周。
+> M2 主线落地约 18–25 周；总表 16–22 周为乐观区间（假设无返工）。
 
 ---
 
@@ -729,31 +749,32 @@ cargo bench -p pg-engine --bench m2c_100_conn
                                      ▼
                         ┌─────────────────────────────────────┐
                         │ D (RedoHandler/ClogAccessor +       │
-                        │   pd_lsn + PageHeader 32B)          │
+                        │   pd_lsn + PageHeader 32B +         │
+                        │   Engine::open 装配 RedoRegistry)   │
                         └─────────┬───────────────────────────┘
                                   │  Stage 0a 出口
               ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼   (G/H 与 0b 完全并行)
-         ┌────────┐          ┌────────┐          ┌────────┐
-         │ E(FLM) │          │ F(装配)│          │ G      │
-         └────┬───┘          └────┬───┘          └────┬───┘
-              │                   │                   ▼
-              │      Stage 0b 出口│              ┌────────┐
-              │                   │              │ H      │
-              │                   │              └────┬───┘
-              │                   │                   ▼
-              │                   │              ┌────────┐
-              │                   │              │ I(Heap)│  (I 单线程验收前置 D/G/H；并发验收需 F)
-              │                   │              └────┬───┘
-              │                   │                   ▼
-              │                   │              ┌────────┐
-              │                   │              │ J(Txn) │  (J 集成测试需 F)
-              │                   │              └────┬───┘
-              └───────────────────┴──────────────────┘
+              ▼                   ▼                   ▼   (E/F/G 三路并行，都从 D 下降)
+         ┌────────┐          ┌────────────┐     ┌────────┐
+         │ E(FLM+ │          │ F(read_at/ │     │ G      │
+         │ PageFree│         │  write_at) │     └────┬───┘
+         │  redo) │          └────┬───────┘          ▼
+         └────┬───┘               │             ┌────────┐
+              │  Stage 0b 出口    │             │ H      │
+              │                   │             └────┬───┘
+              │                   │                  ▼
+              │                   │             ┌────────┐
+              │                   │             │ I(Heap)│  (I 前置 D/G/H；F 只影响并发数字)
+              │                   │             └────┬───┘
+              │                   │                  ▼
+              │                   │             ┌────────┐
+              │                   │             │ J(Txn) │
+              │                   │             └────┬───┘
+              └───────────────────┴─────────────────┘
                                   ▼
                     ┌─────────────────────────────────┐
                     │ K (Engine::open + M2a 100 线程) │ → M2a 出口
-                    │   前置 F/H/I/J                  │
+                    │   前置 E / H / I / J            │
                     └───────────┬─────────────────────┘
                           ▼
                      ┌────────┐
@@ -794,10 +815,10 @@ cargo bench -p pg-engine --bench m2c_100_conn
 ```
 
 **关键并行边界**：
-- Stage 0a 严格阻塞：A → {B, C} → D；B 与 C 是 A 的独立下游（B 修 WAL append 拆分，C 修 Superblock/WalRecordType/clog 目录），D 只依赖 A/C 的枚举扩展
+- Stage 0a 严格阻塞：A → {B, C} → D；B 与 C 是 A 的独立下游（B 修 WAL append 拆分，C 修 Superblock/WalRecordType/clog 目录），D 只依赖 A/C 的枚举扩展；D 一次性完成 `RedoRegistry` + `Engine::open` 装配（吸收了原 Stage F 的 wiring 工作）
 - Stage 0b 内 E / F 平级并行（互不依赖，都从 D 下降）；G/H 也从 D 下降，与 E/F 三路并行
-- M2a Stage G → H 顺序执行（H 前置 G）；G/H 整体与 Stage 0b 完全并行
-- M2a Stage I 单线程部分在 G/H 完成即可开工；I 的**并发**验收 + J 的**集成测试** + K 全流程依赖 F 就位
+- **Stage 0b 与 M2a 完全并行**：Stage D 吸收 F 的 clog/registry wiring 后，M2a Stage G / H / I / J 的**功能与集成测试**全部不再依赖 F 就位；F 的 `read_at/write_at` 无锁化仅影响 Stage K 100 线程压测数字
+- Stage K **必须等 E 就位**：`drop_table` emit `PageFree` WAL 记录，缺失 handler 会触发 v2.3-24 未注册硬失败
 - M2b 严格顺序（L → M → N → O），每 stage 依赖前一 stage 稳定 API
 - M2c Stage P 之后分两条并行支线：Q → R（B+Tree 并发 + 死锁检测）与 S（HOT + CLR）；两支在 T 汇合
 

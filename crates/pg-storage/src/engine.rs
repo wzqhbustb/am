@@ -13,15 +13,20 @@ use tracing::{info, warn};
 
 use crate::buffer_pool::BufferPool;
 use crate::checkpoint::CheckpointCoordinator;
+use crate::clog::NoOpClogAccessor;
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
 use crate::io::ensure_data_dir;
 use crate::page_allocator::PageAllocator;
+use crate::recovery::{
+    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, NoOpRedoHandler,
+    PageAllocRedoHandler, RedoContext, RedoRegistry,
+};
 use crate::superblock::Superblock;
-use crate::types::{Lsn, PageId};
+use crate::types::Lsn;
 use crate::wal::reader::WalReader;
-use crate::wal::record::WalRecord;
+use crate::wal::record::WalRecordType;
 use crate::wal::writer::WalWriter;
 
 /// Owning handle for a recovered or newly created storage engine.
@@ -212,21 +217,47 @@ impl StorageEngine {
             checkpoint_lsn,
         )?;
 
-        // Open the data file once and reuse it for all FullPageImage records.
+        // Open the data file once and share it with the FPI redo handler.
         let data_file_path = data_dir.join("data").join("datafile");
-        let mut data_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_file_path)
-            .map_err(StorageError::Io)?;
+        let data_file = Arc::new(Mutex::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&data_file_path)
+                .map_err(StorageError::Io)?,
+        ));
 
+        // Stage D: replay dispatches through the RedoRegistry. Every record
+        // type that can appear in an M1 WAL has exactly one registered
+        // handler; anything else is a hard failure (UnknownRecord) instead of
+        // being silently skipped.
+        let mut registry = RedoRegistry::new();
+        registry.register(Box::new(PageAllocRedoHandler));
+        registry.register(Box::new(FullPageImageRedoHandler::new(Arc::clone(
+            &data_file,
+        ))));
+        registry.register(Box::new(NoOpRedoHandler::new(
+            WalRecordType::CheckpointBegin,
+        )));
+        registry.register(Box::new(NoOpRedoHandler::new(WalRecordType::CheckpointEnd)));
+
+        let clog = NoOpClogAccessor;
+        let mut att = ActiveXactTable::new();
+        let mut dpt = DirtyPageTable::new();
+        let mut ctx = RedoContext {
+            buffer_pool: None,
+            page_allocator: &page_allocator,
+            clog: &clog,
+            att: &mut att,
+            dpt: &mut dpt,
+        };
         let mut records_replayed = 0usize;
 
         loop {
             match reader.next_record() {
                 Ok(Some(record)) => {
-                    Self::apply_record(&record, &mut data_file, Arc::clone(&page_allocator))?;
+                    registry.apply(&record, &mut ctx)?;
                     records_replayed += 1;
                 }
                 Ok(None) => break,
@@ -240,70 +271,9 @@ impl StorageEngine {
         }
 
         // Ensure all replayed FPIs are durable before returning.
-        data_file.sync_all().map_err(StorageError::Io)?;
+        data_file.lock().sync_all().map_err(StorageError::Io)?;
 
         info!(records_replayed, "WAL replay complete");
-        Ok(())
-    }
-
-    fn apply_record(
-        record: &WalRecord,
-        data_file: &mut std::fs::File,
-        page_allocator: Arc<Mutex<PageAllocator>>,
-    ) -> Result<()> {
-        use crate::wal::record::WalRecordType;
-        match record.record_type {
-            WalRecordType::PageAlloc => {
-                page_allocator.lock().replay_record(record)?;
-            }
-            WalRecordType::FullPageImage => {
-                let decoded: crate::wal::record::FullPageImageRecord =
-                    bincode::serde::decode_from_slice(
-                        &record.payload,
-                        crate::wal::record::bincode_config(),
-                    )
-                    .map_err(|e| StorageError::Serialize(e.to_string()))?
-                    .0;
-                // M1 design note: replaying an FPI overwrites the page with the
-                // image captured at the start of the checkpoint cycle. Any later
-                // in-place modifications made *after* that FPI but *before* the
-                // next checkpoint are lost on recovery because M1 has no redo
-                // records for heap/tuple updates. This is acceptable for M1
-                // (no Heap/BTree records); M2 will replay fine-grained redo
-                // records after the FPI to reconstruct the latest page state.
-                Self::write_page_image_to_data_file(data_file, &decoded.page_id, &decoded.image)?;
-            }
-            WalRecordType::CheckpointBegin | WalRecordType::CheckpointEnd => {
-                // Checkpoint markers carry no redo payload; nothing to replay.
-            }
-            other => {
-                // Reserved for M2+ (Heap*, BTree*, Txn*, PageFree, BTreeSplit*,
-                // Logical*, Segment*): recognized on disk but with no replay
-                // logic yet. Stage D's RedoRegistry will turn an unregistered
-                // record into a hard failure; until then, stay observable
-                // rather than silently dropping records.
-                warn!(
-                    record_type = ?other,
-                    lsn = %record.lsn,
-                    "ignoring recognized but unimplemented WAL record during replay"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn write_page_image_to_data_file(
-        data_file: &mut std::fs::File,
-        page_id: &PageId,
-        image: &[u8],
-    ) -> Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
-
-        let offset = (page_id.0 - 1) * crate::types::PAGE_SIZE as u64;
-        data_file
-            .seek(SeekFrom::Start(offset))
-            .map_err(StorageError::Io)?;
-        data_file.write_all(image).map_err(StorageError::Io)?;
         Ok(())
     }
 
@@ -362,6 +332,8 @@ impl StorageEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page::PAGE_HEADER_SIZE;
+    use crate::types::PageId;
 
     #[test]
     fn create_and_recover_empty_engine() {
@@ -388,7 +360,7 @@ mod tests {
             let engine = StorageEngine::open(tmp.path(), &config).unwrap();
             let mut guard = engine.buffer_pool().new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0..4].copy_from_slice(&[1, 2, 3, 4]);
+            guard.page_mut()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(&[1, 2, 3, 4]);
             drop(guard);
             engine.trigger_checkpoint().unwrap();
             id
@@ -397,7 +369,10 @@ mod tests {
         {
             let engine = StorageEngine::open(tmp.path(), &config).unwrap();
             let guard = engine.buffer_pool().pin(page_id).unwrap();
-            assert_eq!(&guard.page()[0..4], &[1, 2, 3, 4]);
+            assert_eq!(
+                &guard.page()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4],
+                &[1, 2, 3, 4]
+            );
         }
     }
 
@@ -436,7 +411,7 @@ mod tests {
         // Allocate and modify enough pages to span multiple WAL segments.
         for _ in 0..64 {
             let mut guard = engine.buffer_pool().new_page().unwrap();
-            guard.page_mut()[0] = 0xAB;
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xAB;
         }
 
         let wal_dir = tmp.path().join("wal");
@@ -477,10 +452,11 @@ mod tests {
         let page_id = {
             let engine = StorageEngine::open(tmp.path(), &config).unwrap();
 
-            // 1. Allocate and modify a page.
+            // 1. Allocate and modify a page (past the 32-byte page header so
+            //    pd_lsn is not clobbered).
             let mut guard = engine.buffer_pool().new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut().fill(0xCD);
+            guard.page_mut()[PAGE_HEADER_SIZE..].fill(0xCD);
             drop(guard);
 
             // 2. First checkpoint: establishes checkpoint_lsn and flushes the page.
@@ -496,7 +472,7 @@ mod tests {
             // 4. Reload and modify the page. The first pin_mut writes an FPI.
             {
                 let mut guard = engine.buffer_pool().pin_mut(id).unwrap();
-                guard.page_mut().fill(0xCD);
+                guard.page_mut()[PAGE_HEADER_SIZE..].fill(0xCD);
             }
 
             // 5. Ensure the FPI is durable in the WAL. We do not need a second
@@ -525,11 +501,13 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        // Recovery replays the FPI, repairing the torn page.
+        // Recovery replays the FPI, repairing the torn page. (Only the payload
+        // region past the page header is compared: the FPI replay patches
+        // pd_lsn at page[0..8] to the record's own LSN.)
         let engine = StorageEngine::open(tmp.path(), &config).unwrap();
         let guard = engine.buffer_pool().pin(page_id).unwrap();
         assert!(
-            guard.page().iter().all(|&b| b == 0xCD),
+            guard.page()[PAGE_HEADER_SIZE..].iter().all(|&b| b == 0xCD),
             "FPI did not repair the torn page"
         );
     }
@@ -551,7 +529,7 @@ mod tests {
 
             let mut guard = engine.buffer_pool().new_page().unwrap();
             let id = guard.page_id();
-            guard.page_mut()[0..8].copy_from_slice(b"bgckpt01");
+            guard.page_mut()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 8].copy_from_slice(b"bgckpt01");
             drop(guard);
 
             // Wait for at least one background checkpoint to run.
@@ -564,7 +542,10 @@ mod tests {
         // should have persisted the page.
         let engine = StorageEngine::open(tmp.path(), &config).unwrap();
         let guard = engine.buffer_pool().pin(page_id).unwrap();
-        assert_eq!(&guard.page()[0..8], b"bgckpt01");
+        assert_eq!(
+            &guard.page()[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 8],
+            b"bgckpt01"
+        );
     }
 
     #[test]
@@ -593,7 +574,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for _ in 0..25 {
                     if let Ok(mut g) = e.buffer_pool().new_page() {
-                        g.page_mut()[0] = 0xAB;
+                        g.page_mut()[PAGE_HEADER_SIZE] = 0xAB;
                         ids.lock().push(g.page_id());
                         s.fetch_add(1, Ordering::Relaxed);
                     }
@@ -630,7 +611,7 @@ mod tests {
             let mut ids = Vec::new();
             for i in 0..16u8 {
                 let mut guard = engine.buffer_pool().new_page().unwrap();
-                guard.page_mut()[0] = i;
+                guard.page_mut()[PAGE_HEADER_SIZE] = i;
                 ids.push(guard.page_id());
             }
 
@@ -641,7 +622,7 @@ mod tests {
             for (idx, id) in ids.iter().enumerate() {
                 if idx % 2 == 0 {
                     let mut guard = engine.buffer_pool().pin_mut(*id).unwrap();
-                    guard.page_mut()[1] = 0xCC;
+                    guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0xCC;
                 }
             }
 
@@ -654,9 +635,9 @@ mod tests {
         let engine = StorageEngine::open(tmp.path(), &config).unwrap();
         for (idx, id) in ids.iter().enumerate() {
             let guard = engine.buffer_pool().pin(*id).unwrap();
-            assert_eq!(guard.page()[0], idx as u8);
+            assert_eq!(guard.page()[PAGE_HEADER_SIZE], idx as u8);
             if idx % 2 == 0 {
-                assert_eq!(guard.page()[1], 0xCC);
+                assert_eq!(guard.page()[PAGE_HEADER_SIZE + 1], 0xCC);
             }
         }
     }

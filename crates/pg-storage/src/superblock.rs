@@ -31,6 +31,13 @@
 //! is initialized to [`Oid::FIRST_USER`], `created_at` is preserved, and the
 //! migrated v2 content is written back to both copies so the migration runs
 //! only once.
+//!
+//! **Scope limit**: this migrates *metadata only*. M1 (v1-era) data files
+//! are **not** supported from Stage D onward: their pages carry no `pd_lsn`
+//! in `page[0..8]`, so the buffer pool would read user data as the page LSN
+//! (a huge garbage value fails checkpoint/flush with `LsnNotAvailable`; a
+//! value ≥ checkpoint_lsn wrongly suppresses FPI protection). M1 databases
+//! were never released outside tests; recreate them instead of upgrading.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};

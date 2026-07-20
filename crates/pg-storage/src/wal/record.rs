@@ -17,8 +17,8 @@ pub const WAL_RECORD_HEADER_SIZE: usize = 32;
 ///
 /// Discriminants are part of the on-disk format and must never be renumbered.
 /// Values marked "reserved" have no producer or replay logic yet; recovery
-/// ignores them until the corresponding stage lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// fails them as unknown until the corresponding stage registers a handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum WalRecordType {
     /// Heap insert (M2 logic; value reserved).

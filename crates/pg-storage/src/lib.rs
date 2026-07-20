@@ -7,6 +7,10 @@
 //! - LSN clock
 //! - Checkpoint / recovery
 //!
+//! M2 additions so far (Stage 0a): page headers with the authoritative
+//! `pd_lsn` ([`mod@page`]), the commit-status abstraction ([`clog`]), and the
+//! redo-dispatch registry used by recovery ([`recovery`]).
+//!
 //! It intentionally does **not** expose a generic "File Manager" abstraction.
 //! File-management responsibilities live inside the components that own the
 //! crash-safety invariants.
@@ -16,13 +20,16 @@
 
 pub mod buffer_pool;
 pub mod checkpoint;
+pub mod clog;
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod freelist_meta;
 pub mod io;
 pub mod lsn_clock;
+pub mod page;
 pub mod page_allocator;
+pub mod recovery;
 pub mod superblock;
 pub mod types;
 pub mod wal;
