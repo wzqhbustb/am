@@ -284,6 +284,17 @@ Heap AM 编译期就依赖它。
 **关键 v2.3 约束**：无（属 §5）
 - §16 依赖：引入 `arc-swap = "1"`（Catalog 快照原子换代，DDL 生效）
 
+> ⚠️ **Stage C 遗留前置条件（next_oid 回滚窗口，H→N）**：本 stage 起开始分配 OID，但
+> CheckpointEnd v2（含 `next_oid` 字段）要到 Stage N 才切换。此窗口内 `next_oid` 仅随
+> checkpoint 持久化（superblock 为权威源），崩溃会把它回滚到上一个 checkpoint 的值——
+> 崩溃前已分配并写入 catalog 页的 OID 可能被重复分配。本 stage 必须含应对措施：
+> bootstrap / `Engine::open` 时扫描系统表既有 OID，取 `max(oid)+1` 与 superblock
+> `next_oid` 的较大者校正，并在分配后做存在性检查（PG 实践经验：OID 唯一性靠存在性
+> 检查保证，不依赖计数器精确）。**不推荐**"OID 分配先写 WAL 记录再使用"的路径：
+> 目前没有 OID 分配的 WAL 记录类型，新增即 on-disk 格式变更，与 Stage C 的格式冻结
+> 冲突。验收时需在 `test_bootstrap_from_empty_dir` 之外补一个崩溃回滚用例（分配
+> OID → 崩溃 → 重开 → 不出现 OID 冲突）。
+
 **验收标准**：
 - **功能**：空目录初始化后 `SELECT * FROM pg_class`（暂用程序化 API）返回自身
 - **正确性**：`test_catalog_self_describing`（pg_class 记录 pg_class 自己）
@@ -819,3 +830,4 @@ cargo bench -p pg-engine --bench m2c_100_conn
 
 Stage 0a 出口目标 tag `phase1-m1-debt-clean-0a` 应在两周内完成，Stage 0b 与 M2a 从
 第 3 周起并行推进。
+

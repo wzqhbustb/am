@@ -227,6 +227,9 @@ impl CheckpointCoordinator {
         self.wal_writer.flush_to(end_lsn)?;
 
         // 9. Update the superblock. The redo LSN is the CheckpointBegin LSN.
+        //    next_oid rides along in the v2 superblock: until the CheckpointEnd
+        //    WAL record switches to v2 (Stage N), the superblock — not the WAL —
+        //    is the authoritative source of next_oid across checkpoints.
         {
             let mut sb = self.superblock.lock();
             sb.checkpoint_lsn = begin_lsn;
@@ -420,6 +423,9 @@ mod tests {
         let sb = Superblock::read(&Superblock::path(&data_dir)).unwrap();
         assert_eq!(sb.checkpoint_lsn, begin_lsn);
         assert!(sb.next_page_id.0 > 1);
+        // Stage C: next_oid is persisted via the v2 superblock on every
+        // checkpoint (nothing allocates OIDs yet, so it stays FIRST_USER).
+        assert_eq!(sb.next_oid, crate::types::Oid::FIRST_USER);
     }
 
     #[test]

@@ -273,11 +273,20 @@ impl StorageEngine {
                 // records after the FPI to reconstruct the latest page state.
                 Self::write_page_image_to_data_file(data_file, &decoded.page_id, &decoded.image)?;
             }
-            _ => {
-                // M1 only handles PageAlloc and FullPageImage replay. All other
-                // record types (Heap*, BTree*, Txn*, PageFree, Logical*,
-                // Segment*) are ignored here; they will be implemented in later
-                // phases.
+            WalRecordType::CheckpointBegin | WalRecordType::CheckpointEnd => {
+                // Checkpoint markers carry no redo payload; nothing to replay.
+            }
+            other => {
+                // Reserved for M2+ (Heap*, BTree*, Txn*, PageFree, BTreeSplit*,
+                // Logical*, Segment*): recognized on disk but with no replay
+                // logic yet. Stage D's RedoRegistry will turn an unregistered
+                // record into a hard failure; until then, stay observable
+                // rather than silently dropping records.
+                warn!(
+                    record_type = ?other,
+                    lsn = %record.lsn,
+                    "ignoring recognized but unimplemented WAL record during replay"
+                );
             }
         }
         Ok(())

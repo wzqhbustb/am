@@ -14,31 +14,40 @@ use crate::types::{align_up, Lsn, PageId, TxnId};
 pub const WAL_RECORD_HEADER_SIZE: usize = 32;
 
 /// WAL record type with explicit discriminants for on-disk compatibility.
+///
+/// Discriminants are part of the on-disk format and must never be renumbered.
+/// Values marked "reserved" have no producer or replay logic yet; recovery
+/// ignores them until the corresponding stage lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
-    /// Heap insert (M2 logic; M1 reserves the value).
+    /// Heap insert (M2 logic; value reserved).
     HeapInsert = 1,
-    /// Heap update (M2 logic; M1 reserves the value).
+    /// Heap update (M2 logic; value reserved).
     HeapUpdate = 2,
-    /// Heap delete (M2 logic; M1 reserves the value).
+    /// Heap delete (M2 logic; value reserved).
     HeapDelete = 3,
-    /// B+Tree insert (M2 logic; M1 reserves the value).
+    /// B+Tree insert (M2 logic; value reserved).
     BTreeInsert = 4,
-    /// B+Tree split (M2 logic; M1 reserves the value).
-    BTreeSplit = 5,
-    /// B+Tree delete (M2 logic; M1 reserves the value).
+    /// B+Tree split prepare (M2 logic; value reserved). Renamed from M1's
+    /// `BTreeSplit`; the discriminant is unchanged (tech-selection v2.3-8).
+    BTreeSplitPrepare = 5,
+    /// B+Tree delete (M2 logic; value reserved).
     BTreeDelete = 6,
+    /// Heap HOT update (M2 logic; value reserved).
+    HeapHotUpdate = 7,
+    /// Heap cleanup (M2 logic; value reserved).
+    HeapCleanup = 8,
 
     /// Full page image written before the first modification of a page after a
     /// checkpoint (M1 implements).
     FullPageImage = 10,
 
-    /// Transaction begin (M2 logic; M1 reserves the value).
+    /// Transaction begin (M2 logic; value reserved).
     TxnBegin = 20,
-    /// Transaction commit (M2 logic; M1 reserves the value).
+    /// Transaction commit (M2 logic; value reserved).
     TxnCommit = 21,
-    /// Transaction abort (M2 logic; M1 reserves the value).
+    /// Transaction abort (M2 logic; value reserved).
     TxnAbort = 22,
 
     /// Checkpoint start marker (M1 implements).
@@ -48,8 +57,16 @@ pub enum WalRecordType {
 
     /// Page allocation (M1 implements).
     PageAlloc = 40,
-    /// Page free (M2 logic; M1 reserves the value).
+    /// Page free (M2 logic; value reserved).
     PageFree = 41,
+
+    /// B+Tree split compensation log record (M2c undo; value reserved).
+    BTreeSplitCLR = 50,
+    /// B+Tree split copy: redo recomputes the moved content from the left
+    /// page (M2 logic; value reserved).
+    BTreeSplitCopy = 51,
+    /// B+Tree split commit (M2 logic; value reserved).
+    BTreeSplitCommit = 52,
 
     /// Logical HNSW operation (Phase 2+).
     LogicalHnsw = 100,
@@ -79,8 +96,10 @@ impl WalRecordType {
             2 => Ok(WalRecordType::HeapUpdate),
             3 => Ok(WalRecordType::HeapDelete),
             4 => Ok(WalRecordType::BTreeInsert),
-            5 => Ok(WalRecordType::BTreeSplit),
+            5 => Ok(WalRecordType::BTreeSplitPrepare),
             6 => Ok(WalRecordType::BTreeDelete),
+            7 => Ok(WalRecordType::HeapHotUpdate),
+            8 => Ok(WalRecordType::HeapCleanup),
             10 => Ok(WalRecordType::FullPageImage),
             20 => Ok(WalRecordType::TxnBegin),
             21 => Ok(WalRecordType::TxnCommit),
@@ -89,6 +108,9 @@ impl WalRecordType {
             31 => Ok(WalRecordType::CheckpointEnd),
             40 => Ok(WalRecordType::PageAlloc),
             41 => Ok(WalRecordType::PageFree),
+            50 => Ok(WalRecordType::BTreeSplitCLR),
+            51 => Ok(WalRecordType::BTreeSplitCopy),
+            52 => Ok(WalRecordType::BTreeSplitCommit),
             100 => Ok(WalRecordType::LogicalHnsw),
             101 => Ok(WalRecordType::LogicalInverted),
             102 => Ok(WalRecordType::LogicalGraph),

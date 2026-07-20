@@ -19,13 +19,17 @@ use crate::error::{Result, StorageError};
 /// ├── data/
 /// ├── wal/
 /// ├── meta/
+/// ├── clog/
 /// └── tmp/
 /// ```
+///
+/// `clog/` is created from Stage C onward; it holds the transaction commit
+/// status (CLOG) segments used from M2b.
 ///
 /// The parent directory is fsynced after creation.
 pub fn ensure_data_dir(data_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)?;
-    for sub in ["data", "wal", "meta", "tmp"] {
+    for sub in ["data", "wal", "meta", "clog", "tmp"] {
         fs::create_dir_all(data_dir.join(sub))?;
     }
     sync_dir(data_dir)?;
@@ -109,6 +113,7 @@ mod tests {
         assert!(tmp.path().join("data").is_dir());
         assert!(tmp.path().join("wal").is_dir());
         assert!(tmp.path().join("meta").is_dir());
+        assert!(tmp.path().join("clog").is_dir());
         assert!(tmp.path().join("tmp").is_dir());
     }
 

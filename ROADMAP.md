@@ -556,6 +556,15 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | PITR | 基于 WAL 的 Point-in-Time Recovery |
 | WAL Shipping | 用于热备（不做主从自动切换） |
 
+**前置技术债（来自 Phase 1 Stage B）**：
+- **WAL LSN 空洞兼容性**：Phase 1 的 `LsnClock::reserve` 占位机制（用于 checkpoint
+  FPI race 消除）允许在 WAL 流中产生合法的零字节空洞（`reserve` 后进程崩溃、未执行
+  `append_at`）。当前 recovery scanner 将零字节视为 end-of-WAL，本地恢复行为正确。
+  但 WAL Shipping 场景下，receiver 端扫到零字节无法区分"sender 尚未发送完毕"与
+  "合法空洞即 WAL 结尾"。**解决方向**：引入类 PostgreSQL 的 WAL page header（含
+  `xlp_pageaddr` 连续性校验 + page magic），使 receiver 能通过 page header 判断页面
+  是否完整接收。此项必须在 WAL Shipping 实现前落地。
+
 ### Phase 7b：性能与压缩（3–4 个月）
 
 | 模块 | 说明 |

@@ -1,12 +1,36 @@
 //! Database superblock management.
 //!
 //! The superblock stores the anchor state required for recovery:
-//! checkpoint LSN, next page ID, next transaction ID, etc.
+//! checkpoint LSN, next page ID, next transaction ID, next OID, etc.
 //!
 //! It is stored in a dedicated file (`{data_dir}/superblock`) with two 512-byte
 //! copies (A and B). Updates are written to the inactive copy first; the copy
 //! with the highest valid `checkpoint_lsn` is considered active on recovery.
 //! This protects against torn writes during crash.
+//!
+//! # On-disk layout (v2, per 512-byte copy)
+//!
+//! | Offset  | Field           |
+//! |---------|-----------------|
+//! | 0..4    | magic "PGRS"    |
+//! | 4..8    | version (= 2)   |
+//! | 8..12   | page_size       |
+//! | 12..16  | padding         |
+//! | 16..24  | checkpoint_lsn  |
+//! | 24..32  | next_page_id    |
+//! | 32..40  | next_txn_id     |
+//! | 40..48  | next_oid        |
+//! | 48..56  | created_at      |
+//! | 56..60  | crc32           |
+//! | 60..512 | reserved (zero) |
+//!
+//! # v1 → v2 migration
+//!
+//! v1 had no `next_oid`; its `created_at` and `crc32` lived at 40..48 and
+//! 48..52. [`Superblock::read`] transparently migrates v1 copies: `next_oid`
+//! is initialized to [`Oid::FIRST_USER`], `created_at` is preserved, and the
+//! migrated v2 content is written back to both copies so the migration runs
+//! only once.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
@@ -16,17 +40,21 @@ use crc32fast::Hasher;
 
 use crate::error::{Result, StorageError};
 use crate::io::sync_dir;
-use crate::types::{Lsn, PageId, TxnId};
+use crate::types::{Lsn, Oid, PageId, TxnId};
 
-/// Result of reading the superblock file: the decoded superblock plus the
-/// offset of the active copy (0 or [`SUPERBLOCK_SIZE`]).
-type ReadResult = (Superblock, usize);
+/// Result of reading the superblock file: the decoded superblock, the offset
+/// of the active copy (0 or [`SUPERBLOCK_SIZE`]), and whether any valid copy
+/// was migrated from the v1 format.
+type ReadResult = (Superblock, usize, bool);
 
 /// Magic number for pg_rust superblocks: "PGRS" in little-endian.
 pub const SUPERBLOCK_MAGIC: u32 = 0x5047_5253;
 
-/// On-disk superblock format version.
-pub const SUPERBLOCK_VERSION: u32 = 1;
+/// Current on-disk superblock format version.
+pub const SUPERBLOCK_VERSION: u32 = 2;
+
+/// Legacy v1 format (no `next_oid`); accepted on read and migrated to v2.
+pub const SUPERBLOCK_VERSION_V1: u32 = 1;
 
 /// Size of a single superblock copy in bytes.
 pub const SUPERBLOCK_SIZE: usize = 512;
@@ -47,6 +75,10 @@ pub struct Superblock {
     pub next_page_id: PageId,
     /// Next transaction ID to allocate.
     pub next_txn_id: TxnId,
+    /// Next OID to allocate for catalog objects. Until CheckpointEnd WAL
+    /// records switch to v2 (Stage N), this field — not the WAL — is the
+    /// authoritative source of `next_oid` across checkpoints.
+    pub next_oid: Oid,
     /// Database creation timestamp (Unix epoch nanoseconds).
     pub created_at: u64,
 }
@@ -60,6 +92,7 @@ impl Superblock {
             checkpoint_lsn: Lsn::INVALID,
             next_page_id: PageId::FIRST,
             next_txn_id: TxnId::FIRST,
+            next_oid: Oid::FIRST_USER,
             created_at: now_nanos(),
         }
     }
@@ -89,9 +122,17 @@ impl Superblock {
 
     /// Read the superblock file and return the most recent valid copy.
     ///
+    /// v1 copies are migrated transparently (see the module-level migration
+    /// note); the migrated v2 content is then written back to both copies so
+    /// the migration only runs once.
+    ///
     /// If both copies are corrupted, returns an error.
     pub fn read(path: &Path) -> Result<Self> {
-        read_with_offset(path).map(|(sb, _)| sb)
+        let (sb, _offset, migrated) = read_with_offset(path)?;
+        if migrated {
+            write_both_copies(path, &sb)?;
+        }
+        Ok(sb)
     }
 
     /// Update the superblock file on disk.
@@ -100,19 +141,13 @@ impl Superblock {
     /// method so that the new copy is selected as active after a crash.
     pub fn write(&self, path: &Path) -> Result<()> {
         // Read the current active copy so we can write to the inactive one.
-        let (current, active_offset) = match read_with_offset(path) {
+        let (current, active_offset, _migrated) = match read_with_offset(path) {
             Ok(result) => result,
             Err(_) => {
                 // If we cannot read an existing superblock (e.g., partial
                 // initial write), overwrite both copies so that the file is
                 // immediately readable again.
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .map_err(StorageError::Io)?;
-                write_copy(&mut file, 0, self)?;
-                write_copy(&mut file, SUPERBLOCK_SIZE, self)?;
-                file.sync_all().map_err(StorageError::Io)?;
+                write_both_copies(path, self)?;
                 return Ok(());
             }
         };
@@ -159,8 +194,27 @@ fn write_copy(file: &mut File, offset: usize, sb: &Superblock) -> Result<()> {
     Ok(())
 }
 
-/// Read the superblock file and return the active copy together with its
-/// on-disk offset (0 or [`SUPERBLOCK_SIZE`]).
+/// Overwrite both copies with the same content.
+///
+/// Used when the on-disk state cannot be trusted to contain a valid older
+/// copy (the [`Superblock::write`] fallback path) and when persisting a
+/// v1 → v2 migration. The copies are written sequentially; a crash between
+/// them leaves one valid older copy and one valid newer copy, either of
+/// which is sufficient for recovery.
+fn write_both_copies(path: &Path, sb: &Superblock) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(StorageError::Io)?;
+    write_copy(&mut file, 0, sb)?;
+    write_copy(&mut file, SUPERBLOCK_SIZE, sb)?;
+    file.sync_all().map_err(StorageError::Io)?;
+    Ok(())
+}
+
+/// Read the superblock file and return the active copy, its on-disk offset
+/// (0 or [`SUPERBLOCK_SIZE`]), and whether any valid copy was in the legacy
+/// v1 format (meaning a migration write-back is due).
 fn read_with_offset(path: &Path) -> Result<ReadResult> {
     let mut file = File::open(path).map_err(StorageError::Io)?;
     let mut buf = [0u8; SUPERBLOCK_FILE_SIZE];
@@ -170,24 +224,27 @@ fn read_with_offset(path: &Path) -> Result<ReadResult> {
     let copy_b = decode(&buf[SUPERBLOCK_SIZE..SUPERBLOCK_FILE_SIZE]);
 
     match (copy_a, copy_b) {
-        (Ok(a), Ok(b)) => {
+        (Ok((a, migrated_a)), Ok((b, migrated_b))) => {
             // Pick the copy with the higher checkpoint LSN. If equal,
             // prefer A for determinism.
+            let migrated = migrated_a || migrated_b;
             if b.checkpoint_lsn.0 > a.checkpoint_lsn.0 {
-                Ok((b, SUPERBLOCK_SIZE))
+                Ok((b, SUPERBLOCK_SIZE, migrated))
             } else {
-                Ok((a, 0))
+                Ok((a, 0, migrated))
             }
         }
-        (Ok(a), Err(_)) => Ok((a, 0)),
-        (Err(_), Ok(b)) => Ok((b, SUPERBLOCK_SIZE)),
+        (Ok((a, migrated_a)), Err(_)) => Ok((a, 0, migrated_a)),
+        (Err(_), Ok((b, migrated_b))) => Ok((b, SUPERBLOCK_SIZE, migrated_b)),
         (Err(a_err), Err(b_err)) => Err(StorageError::MetadataCorrupted(format!(
             "both copies are corrupted: copy A: {a_err}; copy B: {b_err}"
         ))),
     }
 }
 
+/// Encode a superblock in the current (v2) format.
 fn encode(sb: &Superblock, buf: &mut [u8; SUPERBLOCK_SIZE]) {
+    debug_assert_eq!(sb.version, SUPERBLOCK_VERSION);
     buf[0..4].copy_from_slice(&SUPERBLOCK_MAGIC.to_le_bytes());
     buf[4..8].copy_from_slice(&sb.version.to_le_bytes());
     buf[8..12].copy_from_slice(&sb.page_size.to_le_bytes());
@@ -196,17 +253,22 @@ fn encode(sb: &Superblock, buf: &mut [u8; SUPERBLOCK_SIZE]) {
     buf[16..24].copy_from_slice(&sb.checkpoint_lsn.0.to_le_bytes());
     buf[24..32].copy_from_slice(&sb.next_page_id.0.to_le_bytes());
     buf[32..40].copy_from_slice(&sb.next_txn_id.0.to_le_bytes());
-    buf[40..48].copy_from_slice(&sb.created_at.to_le_bytes());
+    buf[40..48].copy_from_slice(&sb.next_oid.0.to_le_bytes());
+    buf[48..56].copy_from_slice(&sb.created_at.to_le_bytes());
 
     // Compute CRC over everything except the checksum field itself.
     let mut hasher = Hasher::new();
-    hasher.update(&buf[0..48]);
-    hasher.update(&buf[52..SUPERBLOCK_SIZE]);
+    hasher.update(&buf[0..56]);
+    hasher.update(&buf[60..SUPERBLOCK_SIZE]);
     let checksum = hasher.finalize();
-    buf[48..52].copy_from_slice(&checksum.to_le_bytes());
+    buf[56..60].copy_from_slice(&checksum.to_le_bytes());
 }
 
-fn decode(bytes: &[u8]) -> Result<Superblock> {
+/// Decode a superblock copy, accepting both v1 and v2 layouts.
+///
+/// Returns the superblock (always upgraded to the v2 in-memory form) and
+/// whether the on-disk copy was in the legacy v1 format.
+fn decode(bytes: &[u8]) -> Result<(Superblock, bool)> {
     if bytes.len() != SUPERBLOCK_SIZE {
         return Err(StorageError::MetadataCorrupted(
             "superblock copy has wrong size".to_string(),
@@ -220,21 +282,60 @@ fn decode(bytes: &[u8]) -> Result<Superblock> {
         )));
     }
 
-    let stored_checksum = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    match version {
+        SUPERBLOCK_VERSION => Ok((decode_v2(bytes)?, false)),
+        SUPERBLOCK_VERSION_V1 => Ok((decode_v1(bytes)?, true)),
+        _ => Err(StorageError::MetadataCorrupted(format!(
+            "unsupported version {version}"
+        ))),
+    }
+}
+
+fn decode_v2(bytes: &[u8]) -> Result<Superblock> {
+    let stored_checksum = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
     let mut hasher = Hasher::new();
-    hasher.update(&bytes[0..48]);
-    hasher.update(&bytes[52..SUPERBLOCK_SIZE]);
+    hasher.update(&bytes[0..56]);
+    hasher.update(&bytes[60..SUPERBLOCK_SIZE]);
     if hasher.finalize() != stored_checksum {
         return Err(StorageError::MetadataCorrupted(
             "checksum mismatch".to_string(),
         ));
     }
 
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if version != SUPERBLOCK_VERSION {
-        return Err(StorageError::MetadataCorrupted(format!(
-            "unsupported version {version}"
-        )));
+    let page_size = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let checkpoint_lsn = Lsn(u64::from_le_bytes(bytes[16..24].try_into().unwrap()));
+    let next_page_id = PageId(u64::from_le_bytes(bytes[24..32].try_into().unwrap()));
+    let next_txn_id = TxnId(u64::from_le_bytes(bytes[32..40].try_into().unwrap()));
+    let next_oid = Oid(u64::from_le_bytes(bytes[40..48].try_into().unwrap()));
+    let created_at = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+
+    Ok(Superblock {
+        version: SUPERBLOCK_VERSION,
+        page_size,
+        checkpoint_lsn,
+        next_page_id,
+        next_txn_id,
+        next_oid,
+        created_at,
+    })
+}
+
+/// Decode a legacy v1 copy and upgrade it to the v2 in-memory form.
+///
+/// v1 layout: `created_at` at 40..48, `crc32` at 48..52, no `next_oid`.
+/// The migrated superblock initializes `next_oid` to [`Oid::FIRST_USER`]:
+/// a database old enough to have a v1 superblock predates catalog objects,
+/// so no user OIDs have been handed out yet.
+fn decode_v1(bytes: &[u8]) -> Result<Superblock> {
+    let stored_checksum = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+    let mut hasher = Hasher::new();
+    hasher.update(&bytes[0..48]);
+    hasher.update(&bytes[52..SUPERBLOCK_SIZE]);
+    if hasher.finalize() != stored_checksum {
+        return Err(StorageError::MetadataCorrupted(
+            "checksum mismatch (v1)".to_string(),
+        ));
     }
 
     let page_size = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -244,11 +345,12 @@ fn decode(bytes: &[u8]) -> Result<Superblock> {
     let created_at = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
 
     Ok(Superblock {
-        version,
+        version: SUPERBLOCK_VERSION,
         page_size,
         checkpoint_lsn,
         next_page_id,
         next_txn_id,
+        next_oid: Oid::FIRST_USER,
         created_at,
     })
 }
@@ -273,6 +375,14 @@ mod tests {
         let sb = Superblock::create(&path, PAGE_SIZE as u32).unwrap();
         let read = Superblock::read(&path).unwrap();
         assert_eq!(sb, read);
+    }
+
+    #[test]
+    fn fresh_superblock_is_v2_with_first_user_oid() {
+        let sb = Superblock::new(PAGE_SIZE as u32);
+        assert_eq!(sb.version, SUPERBLOCK_VERSION);
+        assert_eq!(sb.version, 2);
+        assert_eq!(sb.next_oid, Oid::FIRST_USER);
     }
 
     #[test]
