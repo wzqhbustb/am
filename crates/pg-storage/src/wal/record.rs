@@ -57,7 +57,7 @@ pub enum WalRecordType {
 
     /// Page allocation (M1 implements).
     PageAlloc = 40,
-    /// Page free (M2 logic; value reserved).
+    /// Page free (M2 Stage E implements).
     PageFree = 41,
 
     /// B+Tree split compensation log record (M2c undo; value reserved).
@@ -131,6 +131,13 @@ pub struct PageAllocRecord {
     pub page_id: PageId,
 }
 
+/// Payload for a `PageFree` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageFreeRecord {
+    /// The page that was freed.
+    pub page_id: PageId,
+}
+
 /// Payload for a `FullPageImage` record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FullPageImageRecord {
@@ -174,6 +181,13 @@ impl WalRecord {
         let payload = bincode::serde::encode_to_vec(PageAllocRecord { page_id }, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?;
         Ok(Self::new(WalRecordType::PageAlloc, payload))
+    }
+
+    /// Create a `PageFree` record.
+    pub fn page_free(page_id: PageId) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(PageFreeRecord { page_id }, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::PageFree, payload))
     }
 
     /// Create a `FullPageImage` record.

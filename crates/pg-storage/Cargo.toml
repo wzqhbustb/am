@@ -61,3 +61,7 @@ harness = false
 [[bench]]
 name = "page_allocator"
 harness = false
+
+[[bench]]
+name = "freelist_crc"
+harness = false

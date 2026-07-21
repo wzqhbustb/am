@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::buffer_pool::BufferPool;
 use crate::checkpoint::CheckpointCoordinator;
@@ -21,7 +21,7 @@ use crate::io::ensure_data_dir;
 use crate::page_allocator::PageAllocator;
 use crate::recovery::{
     ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, NoOpRedoHandler,
-    PageAllocRedoHandler, RedoContext, RedoRegistry,
+    PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoRegistry,
 };
 use crate::superblock::Superblock;
 use crate::types::Lsn;
@@ -83,9 +83,8 @@ impl StorageEngine {
             Arc::clone(&wal_writer),
         )?);
 
-        // M1 has no persistent freelist state to load; this is a no-op that
-        // creates the file if it does not exist.
-        let _ = FreelistMeta::read_or_default(&data_dir)?;
+        // A fresh database has no freelist snapshot; the first checkpoint
+        // will write one. No load needed here.
 
         let checkpoint = CheckpointCoordinator::new(
             &data_dir,
@@ -144,9 +143,41 @@ impl StorageEngine {
             superblock.next_page_id,
         )?));
 
-        // 3. Load freelist snapshot. Corruption or absence is harmless because
-        //    the WAL replay below rebuilds the allocator state.
-        let _ = FreelistMeta::read_or_default(&data_dir);
+        // 3. Load freelist snapshot (acceleration; WAL is authoritative).
+        //    If the snapshot is corrupted (CRC mismatch), warn and skip — WAL
+        //    replay will rebuild the freelist from scratch. If the snapshot's
+        //    checkpoint_lsn matches the superblock's, seed the allocator so
+        //    replay only needs to apply post-checkpoint records.
+        //
+        //    If the snapshot's checkpoint_lsn does NOT match the superblock's,
+        //    pre-checkpoint frees are permanently leaked: WAL segments before
+        //    the superblock's checkpoint_lsn have already been recycled, so
+        //    they cannot be replayed, and the stale snapshot is the only other
+        //    source. This is a leak, not corruption — the pages remain
+        //    allocated and are simply never reused. We warn so operators can
+        //    investigate the mismatch.
+        match FreelistMeta::read(&FreelistMeta::path(&data_dir)) {
+            Ok(snap) => {
+                if snap.checkpoint_lsn == checkpoint_lsn {
+                    debug!(%checkpoint_lsn, count = snap.page_ids.len(), "seeding freelist from snapshot");
+                    page_allocator.lock().seed_freelist(&snap.page_ids);
+                } else {
+                    warn!(
+                        snapshot_lsn = %snap.checkpoint_lsn,
+                        superblock_lsn = %checkpoint_lsn,
+                        "freelist snapshot LSN does not match superblock; \
+                         skipping seed — pre-checkpoint frees are leaked (not corruption)"
+                    );
+                }
+            }
+            Err(StorageError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!("no freelist.meta found; rebuilding from WAL");
+            }
+            Err(StorageError::MetadataCorrupted(msg)) => {
+                warn!(error = %msg, "freelist.meta corrupted; rebuilding freelist from WAL");
+            }
+            Err(e) => return Err(e),
+        }
 
         // 4. Replay WAL from the checkpoint redo point. If no checkpoint has
         //    ever run, start from Lsn::FIRST so that all WAL records written
@@ -234,6 +265,7 @@ impl StorageEngine {
         // being silently skipped.
         let mut registry = RedoRegistry::new();
         registry.register(Box::new(PageAllocRedoHandler));
+        registry.register(Box::new(PageFreeRedoHandler));
         registry.register(Box::new(FullPageImageRedoHandler::new(Arc::clone(
             &data_file,
         ))));

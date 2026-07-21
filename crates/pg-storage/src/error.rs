@@ -49,6 +49,11 @@ pub enum StorageError {
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// An operation was requested on a page in an invalid state (e.g.
+    /// double-free, freeing an already-free page).
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
+
     /// A serialization or deserialization error (e.g. bincode payload).
     #[error("serialization error: {0}")]
     Serialize(String),

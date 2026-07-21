@@ -6,8 +6,8 @@
 //!
 //! M1 scope:
 //! - `alloc_page` writes a `PageAlloc` WAL record and extends the data file.
-//! - `free_page` is a no-op stub (real freeing comes in M2).
-//! - Recovery replays `PageAlloc` records to advance `next_page_id`.
+//! - `free_page` writes a `PageFree` WAL record and pushes onto the freelist.
+//! - Recovery replays `PageAlloc` / `PageFree` records to rebuild allocator state.
 //!
 //! # Crash-safety note: ghost pages
 //!
@@ -29,7 +29,7 @@ use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
 use crate::io::{ensure_data_dir, preallocate_file};
 use crate::types::{Lsn, PageId};
-use crate::wal::record::{bincode_config, PageAllocRecord, WalRecord};
+use crate::wal::record::{bincode_config, PageAllocRecord, PageFreeRecord, WalRecord};
 use crate::wal::writer::WalWriter;
 
 /// Name of the data file inside `{data_dir}/data/`.
@@ -189,12 +189,35 @@ impl PageAllocator {
 
     /// Free a page.
     ///
-    /// M1: this is a no-op stub. In M2 it should:
-    /// - Validate that `page_id` was previously allocated;
-    /// - Push it onto `self.freelist` so future `alloc_page` calls can reuse it;
-    /// - Write a `PageFree` WAL record so recovery can rebuild the freelist;
-    /// - Optionally clear the page content to avoid data leakage.
-    pub fn free_page(&mut self, _page_id: PageId) -> Result<()> {
+    /// Writes a `PageFree` WAL record, fsyncs it, then pushes `page_id` onto
+    /// the freelist so future `alloc_page` calls can reuse it.
+    ///
+    /// The WAL record is fsynced before the in-memory state is updated, matching
+    /// `alloc_page`'s WAL-before-data discipline: if we crash before the WAL is
+    /// durable, the page simply remains allocated (no corruption).
+    pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
+        if page_id == PageId::INVALID {
+            return Err(StorageError::InvalidOperation(
+                "cannot free PageId::INVALID".to_string(),
+            ));
+        }
+        if page_id.0 >= self.next_page_id.0 {
+            return Err(StorageError::InvalidOperation(format!(
+                "cannot free page {page_id}: it was never allocated (next_page_id={})",
+                self.next_page_id
+            )));
+        }
+        if self.freelist.contains(&page_id) {
+            return Err(StorageError::InvalidOperation(format!(
+                "double-free: page {page_id} is already on the freelist"
+            )));
+        }
+
+        let record = WalRecord::page_free(page_id)?;
+        let free_lsn = self.wal_writer.append(record)?;
+        self.wal_writer.flush_to(free_lsn)?;
+
+        self.freelist.push(page_id);
         Ok(())
     }
 
@@ -230,10 +253,9 @@ impl PageAllocator {
     ///
     /// The snapshot contains the freelist; `next_page_id` is stored in the
     /// `CheckpointEnd` record and superblock by the checkpoint coordinator.
-    ///
-    /// In M1 the freelist is always empty because `free_page` is a no-op, so
-    /// the clone is effectively free. Once M2 implements freeing, this will
-    /// copy the real freelist.
+    /// The snapshot is taken before the checkpoint flush phase so that
+    /// concurrent `free_page` calls during the flush are NOT captured (they
+    /// are applied by WAL replay instead, avoiding duplicate freelist entries).
     pub fn snapshot(&self, checkpoint_lsn: Lsn) -> FreelistMeta {
         FreelistMeta {
             checkpoint_lsn,
@@ -260,21 +282,63 @@ impl PageAllocator {
         Ok(())
     }
 
+    /// Apply a `PageFree` record during recovery.
+    ///
+    /// Pushes `page_id` onto the freelist so future allocations can reuse it.
+    /// Does not write a WAL record. Idempotent: if `page_id` is already on the
+    /// freelist, the push is skipped. This is a hard requirement for redo
+    /// handlers (tech-selection v2.3) — it tolerates WAL corruption (duplicate
+    /// PageFree records) and snapshot/WAL overlap without producing duplicate
+    /// freelist entries.
+    pub fn apply_page_free(&mut self, page_id: PageId) {
+        if self.freelist.contains(&page_id) {
+            return;
+        }
+        self.freelist.push(page_id);
+        self.recovery_applied = true;
+    }
+
+    /// Seed the freelist from a checkpoint snapshot.
+    ///
+    /// Used during recovery to accelerate freelist rebuild: the snapshot
+    /// provides the freelist as of `checkpoint_lsn`, and WAL replay from
+    /// `checkpoint_lsn` forward applies any subsequent `PageFree` / `PageAlloc`
+    /// records on top.
+    pub fn seed_freelist(&mut self, page_ids: &[PageId]) {
+        self.freelist = page_ids.to_vec();
+    }
+
+    /// Return a slice of the current freelist (for tests and diagnostics).
+    pub fn freelist(&self) -> &[PageId] {
+        &self.freelist
+    }
+
     /// Replay a single WAL record during recovery.
     ///
-    /// Non-allocator records are ignored. This is a convenience wrapper for
-    /// stage I's `recover()` loop.
+    /// Handles `PageAlloc` and `PageFree`; other record types are ignored.
+    /// This is a convenience wrapper for the recovery loop.
     pub fn replay_record(&mut self, record: &WalRecord) -> Result<()> {
         use crate::wal::record::WalRecordType;
-        if record.record_type != WalRecordType::PageAlloc {
-            return Ok(());
+        match record.record_type {
+            WalRecordType::PageAlloc => {
+                let (rec, _) = bincode::serde::decode_from_slice::<PageAllocRecord, _>(
+                    &record.payload,
+                    bincode_config(),
+                )
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+                self.apply_page_alloc(rec.page_id)
+            }
+            WalRecordType::PageFree => {
+                let (rec, _) = bincode::serde::decode_from_slice::<PageFreeRecord, _>(
+                    &record.payload,
+                    bincode_config(),
+                )
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+                self.apply_page_free(rec.page_id);
+                Ok(())
+            }
+            _ => Ok(()),
         }
-        let (rec, _) = bincode::serde::decode_from_slice::<PageAllocRecord, _>(
-            &record.payload,
-            bincode_config(),
-        )
-        .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        self.apply_page_alloc(rec.page_id)
     }
 
     fn ensure_data_file_capacity(&mut self, page_id: PageId) -> Result<()> {
@@ -375,15 +439,40 @@ mod tests {
     }
 
     #[test]
-    fn free_page_is_noop_in_m1() {
+    fn free_page_pushes_to_freelist_and_reuses_on_alloc() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp);
         let wal = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
         let mut allocator = PageAllocator::open(tmp.path(), &cfg, wal).unwrap();
 
-        let page_id = allocator.alloc_page().unwrap();
-        allocator.free_page(page_id).unwrap();
-        assert_eq!(allocator.next_page_id(), PageId(page_id.0 + 1));
+        let p1 = allocator.alloc_page().unwrap();
+        let p2 = allocator.alloc_page().unwrap();
+        assert_eq!(p1, PageId(1));
+        assert_eq!(p2, PageId(2));
+
+        allocator.free_page(p1).unwrap();
+        assert_eq!(allocator.freelist(), &[PageId(1)]);
+
+        // The freed page is reused on the next alloc.
+        let p3 = allocator.alloc_page().unwrap();
+        assert_eq!(p3, PageId(1));
+        assert!(allocator.freelist().is_empty());
+        assert_eq!(allocator.next_page_id(), PageId(3));
+    }
+
+    #[test]
+    fn free_page_rejects_invalid_page_ids() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp);
+        let wal = Arc::new(WalWriter::open(tmp.path(), &cfg).unwrap());
+        let mut allocator = PageAllocator::open(tmp.path(), &cfg, wal).unwrap();
+
+        let err = allocator.free_page(PageId::INVALID).unwrap_err();
+        assert!(matches!(err, StorageError::InvalidOperation(_)));
+
+        // Page 5 was never allocated (next_page_id is still 1).
+        let err = allocator.free_page(PageId(5)).unwrap_err();
+        assert!(matches!(err, StorageError::InvalidOperation(_)));
     }
 
     #[test]

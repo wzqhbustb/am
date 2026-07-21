@@ -189,6 +189,20 @@ impl RedoHandler for PageAllocRedoHandler {
     }
 }
 
+/// Redo handler for `PageFree` records: pushes the freed page back onto the
+/// allocator's freelist so it can be reused after recovery.
+pub struct PageFreeRedoHandler;
+
+impl RedoHandler for PageFreeRedoHandler {
+    fn kind(&self) -> WalRecordType {
+        WalRecordType::PageFree
+    }
+
+    fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        ctx.page_allocator.lock().replay_record(record)
+    }
+}
+
 /// Redo handler for `FullPageImage` records (M1 physical replay).
 ///
 /// M1 replay writes images directly to the data file because the buffer pool

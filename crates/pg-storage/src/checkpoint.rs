@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::buffer_pool::BufferPool;
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
+use crate::freelist_meta::FreelistMeta;
 use crate::page_allocator::PageAllocator;
 use crate::superblock::Superblock;
 use crate::types::{Lsn, TxnId};
@@ -143,37 +144,56 @@ impl CheckpointCoordinator {
     /// M1 had a race window between `wal_writer.append(begin_record)` returning
     /// and `set_checkpoint_lsn(begin_lsn)`: a `pin_mut` in that window could
     /// skip its FPI because `checkpoint_lsn` was still the old value. Stage B
-    /// eliminates the window by pre-reserving the LSN:
+    /// eliminates the window by pre-reserving the LSN and publishing it before
+    /// emitting the record.
     ///
-    /// 1. `reserve_lsn(CHECKPOINT_BEGIN_SIZE)` — advance the clock and return
-    ///    the future LSN without writing anything.
-    /// 2. `set_checkpoint_lsn(begin_lsn)` — publish the new checkpoint LSN
-    ///    immediately; any `pin_mut` from this point on will write an FPI.
-    /// 3. `append_at(begin_record, begin_lsn)` — emit the `CheckpointBegin`
-    ///    record into the already-reserved slot.
+    /// # Freelist snapshot atomicity (Stage E)
     ///
-    /// Because step 2 happens before step 3, there is no window in which a
-    /// page modification can miss its FPI.
+    /// `reserve_lsn`, `set_checkpoint_lsn`, and `freelist.snapshot` are
+    /// performed atomically under the `page_allocator` lock. This prevents a
+    /// concurrent `free_page` from interleaving between the LSN reservation and
+    /// the snapshot: such an interleaving would place the freed page in both
+    /// the snapshot (in-memory push) and WAL replay (post-begin_lsn record),
+    /// producing a duplicate freelist entry on recovery.
     pub fn trigger_checkpoint(&self) -> Result<Lsn> {
         // Serialize checkpoints so that manual and background checkpoints do not
         // interleave and produce redundant or overlapping checkpoint records.
         let _lock = self.checkpoint_lock.lock();
 
         // -- Phase 1: CheckpointBegin ----------------------------------------
-
-        // 1. Pre-reserve the CheckpointBegin LSN. A CheckpointBegin record has
-        //    an empty payload, so its total size is exactly WAL_RECORD_HEADER_SIZE
-        //    (32 bytes), already aligned to LSN_ALIGNMENT.
+        //
+        // 1. Atomically reserve the checkpoint LSN, publish it to the buffer
+        //    pool, and snapshot the freelist — all under the page_allocator
+        //    lock. This is the core correctness invariant for concurrent
+        //    free_page during a fuzzy checkpoint:
+        //
+        //    - A free_page that completes BEFORE this critical section has its
+        //      page in the snapshot AND its WAL record at LSN < begin_lsn (not
+        //      replayed). No duplicate.
+        //    - A free_page that runs AFTER this critical section has its page
+        //      NOT in the snapshot AND its WAL record at LSN > begin_lsn
+        //      (replayed exactly once). No duplicate.
+        //    - No free_page can run DURING this critical section (blocked on
+        //      the page_allocator lock), so there is no window where a page
+        //      is both in the snapshot and has a post-begin_lsn WAL record.
+        //
+        //    Lock order is page_allocator → WAL inner (reserve_lsn), which
+        //    matches free_page's lock order — no deadlock.
         const CHECKPOINT_BEGIN_SIZE: u64 = crate::wal::record::WAL_RECORD_HEADER_SIZE as u64;
-        let begin_lsn = self.wal_writer.reserve_lsn(CHECKPOINT_BEGIN_SIZE)?;
+        let (begin_lsn, freelist_snap) = {
+            let pa = self.page_allocator.lock();
+            let begin_lsn = self.wal_writer.reserve_lsn(CHECKPOINT_BEGIN_SIZE)?;
+            // Publish the checkpoint LSN immediately so any pin_mut from this
+            // point on writes an FPI. Must be inside the lock to preserve the
+            // Stage B FPI race fix (no window between reserve and publish).
+            self.buffer_pool.set_checkpoint_lsn(begin_lsn);
+            let snap = pa.snapshot(begin_lsn);
+            (begin_lsn, snap)
+        };
+        debug!(%begin_lsn, "checkpoint begin (LSN reserved, freelist snapshot taken)");
 
-        // 2. Publish the checkpoint LSN immediately. From this point on, the
-        //    first mutable access to any page in this checkpoint cycle will
-        //    write an FPI.
-        self.buffer_pool.set_checkpoint_lsn(begin_lsn);
-        debug!(%begin_lsn, "checkpoint begin (LSN pre-reserved)");
-
-        // 3. Emit the CheckpointBegin record into the reserved slot.
+        // 2. Emit the CheckpointBegin record into the reserved slot. This does
+        //    not need the page_allocator lock — it only writes WAL.
         let begin_record = WalRecord::checkpoint_begin();
         self.wal_writer
             .append_at(begin_record, begin_lsn, CHECKPOINT_BEGIN_SIZE)?;
@@ -181,12 +201,12 @@ impl CheckpointCoordinator {
 
         // -- Phase 2: Flush dirty pages --------------------------------------
 
-        // 4. Collect dirty pages. This is a snapshot; pages may become clean or
+        // 3. Collect dirty pages. This is a snapshot; pages may become clean or
         //    dirty while we iterate.
         let dirty_pages = self.buffer_pool.dirty_page_ids();
         debug!(count = dirty_pages.len(), "collected dirty pages");
 
-        // 5. Flush each dirty page. flush() enforces WAL-before-data internally.
+        // 4. Flush each dirty page. flush() enforces WAL-before-data internally.
         //    M1 is conservative: any flush failure aborts the checkpoint so that
         //    the superblock is never updated to a checkpoint that did not
         //    actually complete.
@@ -211,20 +231,38 @@ impl CheckpointCoordinator {
 
         // -- Phase 3: CheckpointEnd and superblock update ---------------------
 
-        // 6. Capture allocator state for the checkpoint end record.
+        // 5. Capture allocator state for the checkpoint end record.
         let next_page_id = self.page_allocator.lock().next_page_id();
         let next_txn_id = TxnId::FIRST; // M1 has no transactions.
 
-        // 7. Write CheckpointEnd. This marks the point at which the superblock
+        // 6. Write CheckpointEnd. This marks the point at which the superblock
         //    can be safely updated.
         let end_record = WalRecord::checkpoint_end(begin_lsn, next_page_id, next_txn_id)?;
         let end_lsn = self.wal_writer.append(end_record)?;
         debug!(%end_lsn, "checkpoint end");
 
-        // 8. Ensure CheckpointEnd and everything before it is fsynced before the
-        //    superblock is updated or old WAL segments are recycled. (append()
-        //    no longer fsyncs implicitly; this explicit flush_to is required.)
+        // 7. Ensure CheckpointEnd and everything before it is fsynced before the
+        //    freelist snapshot or superblock is written. (append() no longer
+        //    fsyncs implicitly; this explicit flush_to is required.)
         self.wal_writer.flush_to(end_lsn)?;
+
+        // 8. Write the freelist snapshot BEFORE the superblock. This is an
+        //    acceleration hint for recovery: if present and valid, recovery
+        //    seeds the allocator freelist from it and only replays
+        //    post-checkpoint WAL records. If the snapshot is lost or
+        //    corrupted, WAL replay rebuilds the freelist from scratch — so a
+        //    failure here is non-fatal.
+        //
+        //    Ordering rationale: the snapshot must be written before the
+        //    superblock so that a crash between the two leaves the superblock
+        //    with the OLD checkpoint_lsn. Recovery then replays from the old
+        //    LSN and sees all WAL records, correctly rebuilding the freelist.
+        //    If the superblock were written first, a crash before the snapshot
+        //    would leave recovery with the new LSN but a stale/missing
+        //    snapshot, losing pre-checkpoint frees.
+        if let Err(e) = freelist_snap.write(&FreelistMeta::path(&self.data_dir)) {
+            warn!(error = %e, "failed to write freelist snapshot; recovery will rebuild from WAL");
+        }
 
         // 9. Update the superblock. The redo LSN is the CheckpointBegin LSN.
         //    next_oid rides along in the v2 superblock: until the CheckpointEnd

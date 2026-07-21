@@ -207,7 +207,7 @@ Heap AM 编译期就依赖它。
 > 触发 v2.3-24 未注册 record 硬失败。
 
 **验收标准**：
-- **功能**：损坏 freelist 后 `Engine::open` 返回硬错，从 WAL 完整重建 freelist
+- **功能**：损坏 freelist 后 `FreelistMeta::read` 返回硬错（`MetadataCorrupted`）；`Engine::open` 捕获后 warn 并从 WAL 完整重建 freelist，不拒绝打开
 - **正确性**：`test_freelist_rebuild_from_wal` 断言 freelist 与预期完全相等（顺序无关）
 - **性能**：CRC 计算 < 1μs / 4KB freelist chunk（criterion）
 
