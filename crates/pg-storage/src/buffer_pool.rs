@@ -24,7 +24,16 @@
 //!   metadata is locked by an evictor, the hit falls back to the allocation path
 //!   instead of blocking.
 //! - **Eviction / allocation path**: `allocation_lock` → `try_lock(Frame::meta)`
-//!   → `page_table[shard]` → `data_file` → `Frame::content`.
+//!   → `page_table[shard]` → `Frame::content`.
+//! - **Flush path**: `Frame::meta` (clear dirty) → `Frame::content.read` →
+//!   (on I/O error only) `Frame::meta` (restore dirty). This follows the same
+//!   meta-before-content order as eviction. The nested re-acquisition of
+//!   `Frame::meta` on the error path is safe because `content.read` is a
+//!   shared lock that no other path holds exclusively while waiting for
+//!   `Frame::meta`, so no cycle can form.
+//!
+//! The data file itself is accessed through a lock-free `PositionedFile`
+//! (pread/pwrite), so it does not participate in the lock ordering above.
 //!
 //! The use of `try_lock` on `Frame::meta` from both directions prevents the
 //! classic page-table / frame-meta lock-order reversal deadlock.
@@ -36,9 +45,7 @@
 //! two locks are either held in one of the orders above or never nested.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -48,12 +55,10 @@ use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::page::{page_pd_lsn, set_page_pd_lsn};
 use crate::page_allocator::PageAllocator;
+use crate::positioned_file::PositionedFile;
 use crate::types::{FrameId, Lsn, PageId, PAGE_SIZE};
 use crate::wal::record::WalRecord;
 use crate::wal::writer::WalWriter;
-
-/// Name of the data file inside `{data_dir}/data/`.
-const DATA_FILE_NAME: &str = "datafile";
 
 /// Metadata for a buffer pool frame.
 #[derive(Debug)]
@@ -115,8 +120,7 @@ impl Default for Frame {
 #[derive(Debug)]
 pub struct BufferPool {
     config: StorageConfig,
-    data_file_path: PathBuf,
-    data_file: Mutex<File>,
+    data_file: PositionedFile,
     page_allocator: Arc<Mutex<PageAllocator>>,
     wal_writer: Arc<WalWriter>,
     page_table: Vec<Mutex<HashMap<PageId, FrameId>>>,
@@ -128,6 +132,13 @@ pub struct BufferPool {
     /// needs a Full Page Image before its first modification in the current
     /// checkpoint cycle.
     checkpoint_lsn: AtomicU64,
+    /// Monotonically increasing generation bumped after each `write_all_at` in
+    /// `flush_frame`. Used together with `synced_gen` for group-fsync coalescing.
+    flush_gen: AtomicU64,
+    /// Generation value as of the most recent completed `sync_all`. Writers
+    /// whose `flush_gen` ≤ `synced_gen` can skip their own fsync because a
+    /// later sync already covered their write.
+    synced_gen: AtomicU64,
 }
 
 impl BufferPool {
@@ -143,15 +154,9 @@ impl BufferPool {
     ) -> Result<Self> {
         config.validate()?;
 
-        let data_dir = data_dir.as_ref().to_path_buf();
-        let data_file_path = data_dir.join("data").join(DATA_FILE_NAME);
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_file_path)
-            .map_err(StorageError::Io)?;
+        crate::io::ensure_data_dir(data_dir.as_ref())?;
+        let data_file_path = crate::io::data_file_path(data_dir.as_ref());
+        let data_file = PositionedFile::open(&data_file_path)?;
 
         let frame_count = config.buffer_pool_size / config.page_size();
         let frames: Vec<Frame> = (0..frame_count).map(|_| Frame::default()).collect();
@@ -162,8 +167,7 @@ impl BufferPool {
 
         Ok(Self {
             config: config.clone(),
-            data_file_path,
-            data_file: Mutex::new(data_file),
+            data_file,
             page_allocator,
             wal_writer,
             page_table,
@@ -171,12 +175,9 @@ impl BufferPool {
             clock_hand: AtomicUsize::new(0),
             allocation_lock: Mutex::new(()),
             checkpoint_lsn: AtomicU64::new(Lsn::INVALID.0),
+            flush_gen: AtomicU64::new(0),
+            synced_gen: AtomicU64::new(0),
         })
-    }
-
-    /// Return the path to the data file.
-    pub fn data_file_path(&self) -> &Path {
-        &self.data_file_path
     }
 
     /// Update the checkpoint LSN used to decide FPI requirements.
@@ -554,66 +555,72 @@ impl BufferPool {
     /// `PageId(0)`, which is reserved as the invalid sentinel.
     fn read_page_from_disk(&self, page_id: PageId, frame_id: FrameId) -> Result<()> {
         let offset = (page_id.0 - 1) * self.config.page_size() as u64;
-        let mut file = self.data_file.lock();
-        file.seek(SeekFrom::Start(offset))
-            .map_err(StorageError::Io)?;
-
         let mut content = self.frames[frame_id.0].content.write();
-        file.read_exact(&mut *content).map_err(StorageError::Io)?;
+        self.data_file.read_exact_at(&mut *content, offset)?;
         Ok(())
     }
 
     /// Flush a single frame to disk if it is dirty.
     ///
-    /// **WAL-before-data invariant**: the content read lock must be held
-    /// continuously from the moment we sample `pd_lsn` through `flush_to`,
-    /// `write_all`, and `sync_all`. Otherwise a concurrent `pin_mut` on the
-    /// same frame can append a new WAL record and advance `pd_lsn` between
-    /// the LSN sample and the disk write, causing the data file to contain
-    /// a `pd_lsn` whose WAL record is not yet fsynced.
+    /// **Dirty flag protocol (PG-style clear-before-write)**: `meta.dirty` is
+    /// cleared *before* the write begins. If a concurrent `pin_mut` modifies
+    /// the page while this flush is in progress, it will re-set `dirty = true`,
+    /// ensuring the next checkpoint picks up the newer version. On I/O error
+    /// the flag is restored so the page is retried later.
     ///
-    /// **Lock order** (local to this function): `content.read → data_file →
-    /// meta`. This reverses the global `data_file → content.write` order
-    /// used by `read_page_from_disk`, but is deadlock-free because:
-    /// * `read_page_from_disk` acquires `content.write` on a *freshly
-    ///   allocated* frame `F_new` that is not yet published in
-    ///   `page_table`, so no other thread can target it.
-    /// * `flush_frame` targets an *already published* frame `F_a`. Eviction
-    ///   uses the `evicting` flag to prevent `F_a` from being reused as
-    ///   `F_new` while a flush is in progress.
-    /// * `F_new ≠ F_a` therefore holds; the two lock orders never share a
-    ///   frame and no cycle can form.
+    /// **WAL-before-data invariant**: the content read lock is held from the
+    /// moment we sample `pd_lsn` through `flush_to` and `write_all_at`. This
+    /// prevents a concurrent `pin_mut` from advancing `pd_lsn` between the WAL
+    /// flush and the data write.
+    ///
+    /// `sync_all` is issued **after** releasing `content.read()`. This is safe
+    /// because:
+    /// - During eviction the frame is marked `evicting = true`, which prevents
+    ///   new `pin_mut` calls from targeting it.
+    /// - `fsync` flushes all prior writes to the inode regardless of whether
+    ///   the content lock is still held.
+    ///
+    /// **Group-fsync coalescing**: multiple concurrent flushes share a single
+    /// `fsync` via the `flush_gen` / `synced_gen` atomic pair. A flusher that
+    /// observes `synced_gen >= its_gen` knows a concurrent fsync — one that
+    /// started after this thread's `write_all_at` returned — already made the
+    /// write durable, so it can skip its own syscall.
     fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
-        let (page_id, dirty) = {
-            let meta = self.frames[frame_id.0].meta.lock();
-            (meta.page_id, meta.dirty)
+        let page_id = {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            if !meta.dirty || meta.page_id == PageId::INVALID {
+                return Ok(());
+            }
+            meta.dirty = false;
+            meta.page_id
         };
 
-        if !dirty || page_id == PageId::INVALID {
-            return Ok(());
-        }
-
+        // Hold content.read across WAL flush + data write (WAL-before-data).
         let content = self.frames[frame_id.0].content.read();
         let page_lsn = page_pd_lsn(&content[..]);
         if page_lsn.is_valid() && self.wal_writer.synced_lsn() < page_lsn {
-            self.wal_writer.flush_to(page_lsn)?;
+            if let Err(e) = self.wal_writer.flush_to(page_lsn) {
+                self.frames[frame_id.0].meta.lock().dirty = true;
+                return Err(e);
+            }
         }
 
         let offset = (page_id.0 - 1) * self.config.page_size() as u64;
-        let mut file = self.data_file.lock();
-        file.seek(SeekFrom::Start(offset))
-            .map_err(StorageError::Io)?;
-        file.write_all(&*content).map_err(StorageError::Io)?;
-        // TODO(Stage I): checkpoint can batch multiple frame flushes and call
-        // sync_all() once at the end. For M1 per-page flush is correct but
-        // performs more fsyncs than necessary.
-        file.sync_all().map_err(StorageError::Io)?;
-        drop(file);
+        if let Err(e) = self.data_file.write_all_at(&*content, offset) {
+            self.frames[frame_id.0].meta.lock().dirty = true;
+            return Err(e);
+        }
+        let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
         drop(content);
 
-        {
-            let mut meta = self.frames[frame_id.0].meta.lock();
-            meta.dirty = false;
+        // Group-fsync coalescing: skip if a concurrent sync already covers us.
+        if self.synced_gen.load(Ordering::Acquire) < my_gen {
+            let covered_gen = self.flush_gen.load(Ordering::Acquire);
+            if let Err(e) = self.data_file.sync_all() {
+                self.frames[frame_id.0].meta.lock().dirty = true;
+                return Err(e);
+            }
+            self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
         }
 
         Ok(())
@@ -1192,6 +1199,85 @@ mod tests {
             pool.flush(*id).unwrap();
         }
         assert!(pool.dirty_page_ids().is_empty());
+    }
+
+    /// Regression test for the clear-before-write dirty protocol in
+    /// `flush_frame`.
+    ///
+    /// A `pin_mut` that overlaps an in-flight flush must leave the frame
+    /// dirty afterwards (so a later flush rewrites the page) — unless the
+    /// flush already wrote the latest content to disk. The old
+    /// clear-after-write protocol could wipe the dirty flag set by a
+    /// concurrent writer *after* having written a stale image, leaving the
+    /// page clean in memory but stale on disk; the next checkpoint would
+    /// advance the redo point past the modification's WAL records and the
+    /// change would be lost on crash recovery.
+    ///
+    /// Invariant checked after every iteration:
+    ///   `meta.dirty == true`  OR  on-disk content == latest written value.
+    ///
+    /// With clear-before-write the invariant holds deterministically: the
+    /// flusher clears `dirty` before touching content, so a dirty flag set
+    /// by an overlapping writer always survives; and a flusher that sampled
+    /// `dirty` after the writer's guard drop necessarily read the newer
+    /// content (the guard releases `content.write` before setting `dirty`
+    /// under the meta lock). With the old protocol this test fails whenever
+    /// the writer lands inside the write/fsync window — which the small
+    /// sleep below biases toward.
+    #[test]
+    fn concurrent_pin_mut_during_flush_never_loses_dirty_state() {
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+        let pool = Arc::new(pool);
+
+        let page_id = pool.new_page().unwrap().page_id();
+        pool.flush(page_id).unwrap();
+
+        const OFFSET: usize = PAGE_HEADER_SIZE;
+        const ITERATIONS: u8 = 100;
+
+        for iter in 0..ITERATIONS {
+            let v1 = iter.wrapping_mul(2); // first writer's value
+            let v2 = v1 + 1; // overlapping writer's value (always != v1)
+
+            // Dirty the page with v1.
+            {
+                let mut guard = pool.pin_mut(page_id).unwrap();
+                guard.page_mut()[OFFSET] = v1;
+            }
+
+            // Flush from a second thread; overlap a v2 write with it.
+            let flusher = {
+                let pool = Arc::clone(&pool);
+                thread::spawn(move || pool.flush(page_id).unwrap())
+            };
+            // Bias the v2 write into the flusher's write/fsync window.
+            thread::sleep(Duration::from_micros(200));
+            {
+                let mut guard = pool.pin_mut(page_id).unwrap();
+                guard.page_mut()[OFFSET] = v2;
+            }
+            flusher.join().unwrap();
+
+            let still_dirty = pool.dirty_page_ids().contains(&page_id);
+            if !still_dirty {
+                // The frame is clean, so the flush must have persisted the
+                // latest value. A stale v1 on disk with a clean frame is the
+                // lost-dirty bug.
+                let mut buf = [0u8; PAGE_SIZE];
+                let offset = (page_id.0 - 1) * PAGE_SIZE as u64;
+                pool.data_file.read_exact_at(&mut buf, offset).unwrap();
+                assert_eq!(
+                    buf[OFFSET], v2,
+                    "iteration {iter}: frame clean but disk has stale value \
+                     (expected {v2}, got {})",
+                    buf[OFFSET]
+                );
+            }
+        }
     }
 
     #[test]

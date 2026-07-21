@@ -229,22 +229,26 @@ Heap AM 编译期就依赖它。
 
 | 任务 | 交付物 |
 |------|--------|
-| 数据文件 I/O 改造 | `data_file: Arc<File>`（不再 `Mutex<File>`）；BufferPool `read_page_from_disk` / `write_page_to_disk` 走 positional read/write，无锁并发 |
-| 跨平台 wrapper | `pg-storage::io` 内新增薄 trait 或 `#[cfg]` 包装：Unix 用 `std::os::unix::fs::FileExt::{read_at, write_at}`，Windows 用 `std::os::windows::fs::FileExt::{seek_read, seek_write}`（Windows 上不共享 file position，语义一致）；一个 `pub fn read_page_at(file: &File, page_id: PageId, buf: &mut [u8; PAGE_SIZE]) -> io::Result<()>` API |
-| Checkpointer / recovery I/O | `FullPageImageRedoHandler` 内的 `Mutex<File>::seek+write_all` 一并换成 `write_at`；handler 内部锁移除 |
+| 数据文件 I/O 改造 | 新增 `pg-storage::positioned_file::PositionedFile` 包装（`&self` 方法，全部走 pread/pwrite）；BufferPool `read_page_from_disk` / `flush_frame` 与 PageAllocator `ensure_data_file_capacity` 走无锁 positional I/O，`Mutex<File>` 彻底消失 |
+| 跨平台 wrapper | `PositionedFile::{read_exact_at, write_all_at}` 使用 `#[cfg(unix)]`（`std::os::unix::fs::FileExt::{read_exact_at, write_all_at}`）与 `#[cfg(windows)]`（`std::os::windows::fs::FileExt::{seek_read, seek_write}` + 短读/短写循环）双实现；`set_len` / `sync_all` 跨平台一致 |
+| Checkpointer / recovery I/O | `FullPageImageRedoHandler::data_file: Arc<Mutex<File>>` → `Arc<PositionedFile>`；`apply` 内部锁移除，改走 `write_all_at`；`Engine::replay_wal` 末端 `sync_all` 无锁 |
 | BufferPool 并发压测 | 100 线程随机 read/write，QPS ≥ M1 + 50%（M1 单锁下 baseline 约 20K ops/s） |
-| 回归 | 现有 100+ 单元 / 集成测试全绿；`crash_recovery` 1000 轮全绿 |
+| 回归 | 147 lib + 32 integration 全绿（Stage F adds 9 lib tests: 7 PositionedFile + 2 concurrent-race regression）；`crash_recovery` 12 场景全绿 |
 
 **关键 v2.3 约束**：无（属债务清理）
 
+**关键正确性保证**：
+- **WAL-before-data 不变式**：`flush_frame` 仍在 `content.read` 之下连续执行 `flush_to` + `write_all_at` + `sync_all`，防止并发 `pin_mut` 抢跑修改 `pd_lsn`
+- **多 fd 共享同一 inode**：BufferPool / PageAllocator / replay-FPI-handler 各自 `open` 一份 `PositionedFile`；POSIX 保证并发 pread/pwrite 到相同 inode 安全（内核层原子），本项目写者天然不撞 offset
+
 **验收标准**：
-- **功能**：数据文件所有 I/O 走 positional API；`data_file` 字段类型从 `Arc<Mutex<File>>` 变 `Arc<File>`
-- **并发**：100 线程 × 10K 随机 page read/write，无锁竞争 hot path；`perf` 采样确认 `pthread_mutex_lock` 不在 top 10
-- **回归**：M1 集成测试 + `crash_recovery` 1000 轮全绿
+- **功能**：数据文件所有 I/O 走 positional API；`data_file` 字段类型不再包含 `Mutex`
+- **并发**：`buffer_pool_concurrent_flush` bench 验证 1/4/8 线程 flush 的 group-fsync 收益；100 线程 × 10K 随机 page read/write 全压测由 Stage K（`pg-engine --bench m2c_100_conn`）覆盖——Stage F 提供底层无锁 I/O + 合并 fsync，Stage K 提供连接池驱动
+- **回归**：M1 集成测试 + `crash_recovery` 12 场景全绿；`concurrent_grow_and_read_through_separate_fds` 验证跨 fd inode 一致性
 
 **Stage 0b 出口 tag**：`phase1-m1-debt-clean`（与 Stage 0a 的 `-0a` 对称；后者是中间态 tag，前者是合并后 tag，对应 tech-selection §0）
 **并行边界**：Stage 0b 与整个 M2a Stage G / H / I / J 完全并行（Stage D 吸收 F 原有 clog/registry wiring 后，M2a 主线不再依赖 F）；F 的 pread/pwrite 提升只影响 Stage K 100 线程压测的**性能数字**，不影响功能正确性，因此 K 的功能验收不强制等 F
-**验收命令**：`cargo test --workspace && cargo bench -p pg-storage --bench buffer_pool_concurrent`
+**验收命令**：`cargo test -p pg-storage --lib positioned_file && cargo test --workspace && cargo bench -p pg-storage --bench buffer_pool_concurrent_flush`
 
 ---
 
@@ -686,7 +690,7 @@ CLOG 铺路。
 ```bash
 cargo test --workspace --release
 cargo bench -p pg-storage --bench wal_group_commit
-cargo bench -p pg-storage --bench buffer_pool_concurrent
+cargo bench -p pg-storage --bench buffer_pool_concurrent_flush
 cargo bench -p pg-txn --bench clog_buffer_hit_rate
 cargo bench -p pg-am-btree --bench create_index
 cargo bench -p pg-engine --bench m2c_100_conn

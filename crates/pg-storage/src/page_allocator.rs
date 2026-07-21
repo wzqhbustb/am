@@ -20,20 +20,17 @@
 //! is extended in 1 MB chunks anyway. M2 can introduce a page bitmap or similar
 //! mechanism to track truly free pages precisely.
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
-use crate::io::{ensure_data_dir, preallocate_file};
+use crate::io::ensure_data_dir;
+use crate::positioned_file::PositionedFile;
 use crate::types::{Lsn, PageId};
 use crate::wal::record::{bincode_config, PageAllocRecord, PageFreeRecord, WalRecord};
 use crate::wal::writer::WalWriter;
-
-/// Name of the data file inside `{data_dir}/data/`.
-const DATA_FILE_NAME: &str = "datafile";
 
 /// Data file growth granularity in bytes (1 MB = 128 x 8 KB pages).
 ///
@@ -43,15 +40,17 @@ const DATA_FILE_GROWTH_BYTES: u64 = 1024 * 1024;
 
 /// Manages allocation and deallocation of data pages.
 ///
-/// `alloc_page` requires `&mut self` and the type holds an open `File` handle,
-/// so `PageAllocator` is `!Sync`. In M1 it is intended to be used from a single
-/// thread or wrapped by the caller (e.g. `Mutex<PageAllocator>` in the Buffer
-/// Pool) when concurrent access is needed.
+/// `alloc_page` requires `&mut self`, so `PageAllocator` is `!Sync`. In M1 it
+/// is intended to be used from a single thread or wrapped by the caller (e.g.
+/// `Mutex<PageAllocator>` in the Buffer Pool) when concurrent access is
+/// needed. The underlying data file is accessed via [`PositionedFile`], which
+/// itself is lock-free — grow (`set_len`) coordinates with concurrent
+/// pread/pwrite from other handles via POSIX semantics.
 #[derive(Debug)]
 pub struct PageAllocator {
     wal_writer: Arc<WalWriter>,
     data_file_path: PathBuf,
-    data_file: File,
+    data_file: PositionedFile,
     /// Cached length of `data_file` to avoid a `stat` on every allocation.
     current_file_len: u64,
     next_page_id: PageId,
@@ -104,18 +103,11 @@ impl PageAllocator {
         // components (e.g. Superblock::create), so this is a harmless
         // redundancy that keeps `PageAllocator::open` self-contained.
         ensure_data_dir(data_dir.as_ref())?;
-        let data_dir = data_dir.as_ref().to_path_buf();
-        let data_file_path = data_dir.join("data").join(DATA_FILE_NAME);
+        let data_file_path = crate::io::data_file_path(data_dir.as_ref());
 
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&data_file_path)
-            .map_err(StorageError::Io)?;
+        let data_file = PositionedFile::open(&data_file_path)?;
 
-        let current_file_len = data_file.metadata().map_err(StorageError::Io)?.len();
+        let current_file_len = data_file.len()?;
         let page_size = config.page_size();
         if current_file_len % page_size as u64 != 0 {
             return Err(StorageError::MetadataCorrupted(format!(
@@ -347,8 +339,8 @@ impl PageAllocator {
             // Extend in 1 MB chunks rather than to the exact required size.
             let growth = DATA_FILE_GROWTH_BYTES;
             let target = required.div_ceil(growth) * growth;
-            preallocate_file(&self.data_file, target)?;
-            self.data_file.sync_all().map_err(StorageError::Io)?;
+            self.data_file.set_len(target)?;
+            self.data_file.sync_all()?;
             self.current_file_len = target;
         }
         Ok(())

@@ -65,3 +65,7 @@ harness = false
 [[bench]]
 name = "freelist_crc"
 harness = false
+
+[[bench]]
+name = "buffer_pool_concurrent_flush"
+harness = false

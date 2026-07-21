@@ -443,7 +443,7 @@ fn crash_fpi_after_eviction_repairs_torn_page() {
     let expected_total = 2 + 4 * frame_count;
 
     // Corrupt the first half of each protected page to simulate a torn write.
-    let data_file_path = data_dir.join("data").join("datafile");
+    let data_file_path = pg_storage::io::data_file_path(data_dir);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(&data_file_path)

@@ -15,8 +15,6 @@
 //! from their crates; `Engine::open` assembles them in one place (Stage F).
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -26,6 +24,7 @@ use crate::clog::ClogAccessor;
 use crate::error::{Result, StorageError};
 use crate::page::set_page_pd_lsn;
 use crate::page_allocator::PageAllocator;
+use crate::positioned_file::PositionedFile;
 use crate::types::{Lsn, PageId, TxnId, PAGE_SIZE};
 use crate::wal::record::{bincode_config, FullPageImageRecord, WalRecord, WalRecordType};
 
@@ -210,12 +209,12 @@ impl RedoHandler for PageFreeRedoHandler {
 /// `pd_lsn` is patched to the record's own LSN — matching PG, where the page
 /// LSN becomes the LSN of the most recent redo record that touched it.
 pub struct FullPageImageRedoHandler {
-    data_file: Arc<Mutex<File>>,
+    data_file: Arc<PositionedFile>,
 }
 
 impl FullPageImageRedoHandler {
     /// Create a handler that writes page images to `data_file`.
-    pub fn new(data_file: Arc<Mutex<File>>) -> Self {
+    pub fn new(data_file: Arc<PositionedFile>) -> Self {
         Self { data_file }
     }
 }
@@ -242,10 +241,10 @@ impl RedoHandler for FullPageImageRedoHandler {
         set_page_pd_lsn(&mut image, record.lsn);
 
         let offset = (decoded.page_id.0 - 1) * PAGE_SIZE as u64;
-        let mut file = self.data_file.lock();
-        file.seek(SeekFrom::Start(offset))
-            .map_err(StorageError::Io)?;
-        file.write_all(&image).map_err(StorageError::Io)?;
+        self.data_file.write_all_at(&image, offset)?;
+        // Durability: individual apply calls skip fsync for throughput;
+        // engine::replay_wal issues a single data_file.sync_all() after the
+        // replay loop completes.
         Ok(())
     }
 }

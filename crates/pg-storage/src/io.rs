@@ -10,6 +10,17 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, StorageError};
 
+/// File name of the data file inside `{data_dir}/data/`.
+///
+/// Centralized here so BufferPool, PageAllocator, recovery, and tests all
+/// refer to the same on-disk path via [`data_file_path`].
+pub const DATA_FILE_NAME: &str = "datafile";
+
+/// Build the absolute path of the data file for a given data directory.
+pub fn data_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("data").join(DATA_FILE_NAME)
+}
+
 /// Create the database directory and its standard subdirectories.
 ///
 /// Layout:

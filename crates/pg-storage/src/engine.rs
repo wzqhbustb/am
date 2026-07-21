@@ -19,6 +19,7 @@ use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
 use crate::io::ensure_data_dir;
 use crate::page_allocator::PageAllocator;
+use crate::positioned_file::PositionedFile;
 use crate::recovery::{
     ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, NoOpRedoHandler,
     PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoRegistry,
@@ -249,15 +250,13 @@ impl StorageEngine {
         )?;
 
         // Open the data file once and share it with the FPI redo handler.
-        let data_file_path = data_dir.join("data").join("datafile");
-        let data_file = Arc::new(Mutex::new(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&data_file_path)
-                .map_err(StorageError::Io)?,
-        ));
+        // This is a replay-scoped temporary handle that must NOT be reused for
+        // normal operation — each subsystem (BufferPool, PageAllocator) opens
+        // its own PositionedFile for the same on-disk file after replay
+        // completes, carrying its own state (e.g. cached file length) that
+        // would be unsynchronized with a shared replay handle.
+        let data_file_path = crate::io::data_file_path(&data_dir);
+        let data_file = Arc::new(PositionedFile::open(&data_file_path)?);
 
         // Stage D: replay dispatches through the RedoRegistry. Every record
         // type that can appear in an M1 WAL has exactly one registered
@@ -303,7 +302,7 @@ impl StorageEngine {
         }
 
         // Ensure all replayed FPIs are durable before returning.
-        data_file.lock().sync_all().map_err(StorageError::Io)?;
+        data_file.sync_all()?;
 
         info!(records_replayed, "WAL replay complete");
         Ok(())
@@ -521,7 +520,7 @@ mod tests {
         };
 
         // Corrupt the first half of the page in the data file (torn write).
-        let data_file_path = tmp.path().join("data").join("datafile");
+        let data_file_path = crate::io::data_file_path(tmp.path());
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&data_file_path)
@@ -672,5 +671,76 @@ mod tests {
                 assert_eq!(guard.page()[PAGE_HEADER_SIZE + 1], 0xCC);
             }
         }
+    }
+
+    #[test]
+    fn concurrent_grow_and_read_through_separate_fds() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = StorageConfig::new(tmp.path());
+        config.buffer_pool_size = 4 * 1024 * 1024;
+        config.wal_group_commit_timeout_ms = 1;
+        config.wal_group_commit_batch_size = 8;
+
+        let engine = Arc::new(StorageEngine::open(tmp.path(), &config).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let allocated: Arc<Mutex<Vec<(PageId, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let alloc_engine = Arc::clone(&engine);
+        let alloc_ids = Arc::clone(&allocated);
+        let alloc_stop = Arc::clone(&stop);
+        let allocator = thread::spawn(move || {
+            let mut count = 0u64;
+            while !alloc_stop.load(AOrdering::Relaxed) && count < 512 {
+                let mut guard = alloc_engine.buffer_pool().new_page().unwrap();
+                let tag = (count & 0xFF) as u8;
+                guard.page_mut()[PAGE_HEADER_SIZE] = tag;
+                guard.page_mut()[PAGE_HEADER_SIZE + 1] = !tag;
+                alloc_ids.lock().push((guard.page_id(), tag));
+                count += 1;
+            }
+            count
+        });
+
+        let read_engine = Arc::clone(&engine);
+        let read_ids = Arc::clone(&allocated);
+        let read_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            let mut reads = 0u64;
+            while !read_stop.load(AOrdering::Relaxed) {
+                let snapshot: Vec<(PageId, u8)> = read_ids.lock().clone();
+                for &(id, expected_tag) in &snapshot {
+                    let guard = read_engine.buffer_pool().pin(id).unwrap();
+                    let page = guard.page();
+                    assert_eq!(
+                        page[PAGE_HEADER_SIZE], expected_tag,
+                        "page {:?} content mismatch after concurrent grow",
+                        id
+                    );
+                    assert_eq!(
+                        page[PAGE_HEADER_SIZE + 1],
+                        !expected_tag,
+                        "page {:?} second byte mismatch after concurrent grow",
+                        id
+                    );
+                    reads += 1;
+                }
+                if snapshot.is_empty() {
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }
+            reads
+        });
+
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, AOrdering::Relaxed);
+
+        let alloc_count = allocator.join().unwrap();
+        let read_count = reader.join().unwrap();
+        assert!(alloc_count > 0, "allocator thread produced no pages");
+        assert!(read_count > 0, "reader thread completed no reads");
     }
 }

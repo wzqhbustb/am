@@ -29,6 +29,7 @@ pub mod io;
 pub mod lsn_clock;
 pub mod page;
 pub mod page_allocator;
+pub mod positioned_file;
 pub mod recovery;
 pub mod superblock;
 pub mod types;
