@@ -486,10 +486,13 @@ name = "pg-catalog"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "pg-am-heap",
  "pg-storage",
  "pg-txn",
  "serde",
+ "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

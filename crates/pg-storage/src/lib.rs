@@ -27,6 +27,7 @@ pub mod error;
 pub mod freelist_meta;
 pub mod io;
 pub mod lsn_clock;
+pub mod oid;
 pub mod page;
 pub mod page_allocator;
 pub mod positioned_file;

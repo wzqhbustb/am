@@ -6,13 +6,26 @@
 //! - `AccessMethod` / `UpdatableAM` trait definitions
 //! - `TableOid` / `TypeOid` newtype aliases
 //!
-//! It depends on `pg-storage` for physical types and `pg-txn` for snapshots.
+//! It depends on `pg-storage` for physical types, `pg-txn` for snapshots,
+//! and — since Stage H — `pg-am-heap` for the tuple codec and slotted-page
+//! operations used by bootstrap (an addition to the tech-selection §一
+//! dependency graph; no cycle, since `pg-am-heap` only depends on
+//! `pg-storage`).
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod bootstrap;
+pub mod builtin_types;
+pub mod catalog;
+pub mod oid;
+pub mod system_tables;
+
 use pg_storage::types::{Oid, Tid, TxnId};
 use serde::{Deserialize, Serialize};
+
+pub use catalog::{AmRow, AttributeRow, Catalog, RelationRow, TypeRow};
+pub use oid::OidAllocator;
 
 /// Result type used by catalog and access method operations.
 pub type Result<T> = std::result::Result<T, CatalogError>;
@@ -23,6 +36,20 @@ pub enum CatalogError {
     /// The operation is not yet implemented (Stage A skeleton).
     #[error("not implemented")]
     NotImplemented,
+
+    /// A storage engine operation failed.
+    #[error("storage error: {0}")]
+    Storage(#[from] pg_storage::error::StorageError),
+
+    /// A heap tuple or slotted-page operation failed.
+    #[error("heap error: {0}")]
+    Heap(#[from] pg_am_heap::HeapError),
+
+    /// Catalog content read back from disk is malformed (wrong column type,
+    /// negative OID, etc.). Distinct from [`CatalogError::Heap`], which
+    /// covers malformed *encoding*; this is malformed *content*.
+    #[error("corrupted catalog: {0}")]
+    Corrupted(String),
 }
 
 /// A table (relation) object identifier.
@@ -94,7 +121,8 @@ impl From<TypeOid> for Oid {
 }
 
 // ---------------------------------------------------------------------------
-// Access Method traits (Stage A minimal skeleton; expanded in Stage I/L)
+// Access Method traits (Stage A introduced the skeleton; Stage I adds the
+// heap implementation and the full trait surface)
 // ---------------------------------------------------------------------------
 
 /// Base trait for all access methods (heap, B+Tree, future HNSW/Inverted).

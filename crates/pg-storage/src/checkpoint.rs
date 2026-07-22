@@ -21,6 +21,7 @@ use crate::buffer_pool::BufferPool;
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
+use crate::oid::OidCounter;
 use crate::page_allocator::PageAllocator;
 use crate::superblock::Superblock;
 use crate::types::{Lsn, TxnId};
@@ -39,6 +40,24 @@ pub struct CheckpointCoordinator {
     /// Serializes checkpoint execution so that manual and background checkpoints
     /// do not interleave.
     checkpoint_lock: Arc<Mutex<()>>,
+    /// Source of the next OID to allocate, written into the v2 superblock
+    /// on every checkpoint (Stage H). Initialized from the superblock's
+    /// persisted `next_oid`, so checkpoints never roll the value back — not
+    /// even to `Oid::FIRST_USER` — before the catalog wires its allocator
+    /// via [`set_next_oid_source`](Self::set_next_oid_source).
+    ///
+    /// The counter holds the *next OID to hand out* (same semantics as
+    /// `Superblock::next_oid`). Until the CheckpointEnd WAL record switches
+    /// to v2 (Stage N), the superblock — not the WAL — is the authoritative
+    /// source of `next_oid` across checkpoints.
+    ///
+    /// Wrapped in `Arc<Mutex<..>>` and shared with the background thread's
+    /// clone so that a [`set_next_oid_source`](Self::set_next_oid_source)
+    /// call made *after* the background checkpointer starts (the catalog
+    /// wires its allocator only once `Catalog::open` runs, which may follow
+    /// [`start_background_checkpointing`](Self::start_background_checkpointing))
+    /// is still observed by background checkpoints.
+    next_oid_source: Arc<Mutex<OidCounter>>,
     shutdown: Arc<AtomicBool>,
     background_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -58,6 +77,10 @@ impl CheckpointCoordinator {
         page_allocator: Arc<Mutex<PageAllocator>>,
         wal_writer: Arc<WalWriter>,
     ) -> Self {
+        // Seed the OID source from the persisted superblock value so every
+        // checkpoint — including ones fired before the catalog wires its
+        // allocator — persists a monotone `next_oid`.
+        let next_oid = superblock.lock().next_oid;
         Self {
             data_dir: data_dir.into(),
             config: config.clone(),
@@ -66,9 +89,28 @@ impl CheckpointCoordinator {
             page_allocator,
             wal_writer,
             checkpoint_lock: Arc::new(Mutex::new(())),
+            next_oid_source: Arc::new(Mutex::new(OidCounter::new(next_oid))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background_handle: Mutex::new(None),
         }
+    }
+
+    /// Install the source of `next_oid` values persisted by checkpoints
+    /// (Stage H wiring).
+    ///
+    /// `source` must hold the next OID to hand out; each
+    /// [`trigger_checkpoint`](Self::trigger_checkpoint) reads it and writes the
+    /// value into the v2 superblock. The coordinator starts with a counter
+    /// seeded from the persisted superblock value; installing the catalog's
+    /// allocator replaces it. The source is read once per checkpoint, so it
+    /// may be replaced between checkpoints.
+    ///
+    /// The slot is shared (via `Arc`) with the background checkpoint thread's
+    /// clone, so installing a source *after*
+    /// [`start_background_checkpointing`](Self::start_background_checkpointing)
+    /// still takes effect on the next background checkpoint.
+    pub fn set_next_oid_source(&self, source: OidCounter) {
+        *self.next_oid_source.lock() = source;
     }
 
     /// Start a background thread that triggers checkpoints periodically.
@@ -267,12 +309,16 @@ impl CheckpointCoordinator {
         // 9. Update the superblock. The redo LSN is the CheckpointBegin LSN.
         //    next_oid rides along in the v2 superblock: until the CheckpointEnd
         //    WAL record switches to v2 (Stage N), the superblock — not the WAL —
-        //    is the authoritative source of next_oid across checkpoints.
+        //    is the authoritative source of next_oid across checkpoints. The
+        //    source is always installed (seeded from the superblock at
+        //    creation, replaced by the catalog's allocator later), so the
+        //    persisted value is monotone.
         {
             let mut sb = self.superblock.lock();
             sb.checkpoint_lsn = begin_lsn;
             sb.next_page_id = next_page_id;
             sb.next_txn_id = next_txn_id;
+            sb.next_oid = self.next_oid_source.lock().current();
             let sb_path = Superblock::path(&self.data_dir);
             sb.write(&sb_path)?;
         }
@@ -313,6 +359,10 @@ impl CheckpointCoordinator {
             // Share the checkpoint lock with the foreground coordinator so that
             // manual and background checkpoints are mutually exclusive.
             checkpoint_lock: Arc::clone(&self.checkpoint_lock),
+            // Share the next_oid source slot so a source installed after the
+            // background thread starts (e.g. by Catalog::open) is still seen
+            // by background checkpoints.
+            next_oid_source: Arc::clone(&self.next_oid_source),
             shutdown: Arc::clone(&self.shutdown),
             background_handle: Mutex::new(None),
         }
@@ -333,6 +383,7 @@ mod tests {
     use crate::page::PAGE_HEADER_SIZE;
     use crate::page_allocator::PageAllocator;
     use crate::superblock::Superblock;
+    use crate::types::Oid;
     use crate::wal::writer::WalWriter;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -462,9 +513,74 @@ mod tests {
         let sb = Superblock::read(&Superblock::path(&data_dir)).unwrap();
         assert_eq!(sb.checkpoint_lsn, begin_lsn);
         assert!(sb.next_page_id.0 > 1);
-        // Stage C: next_oid is persisted via the v2 superblock on every
-        // checkpoint (nothing allocates OIDs yet, so it stays FIRST_USER).
+        // Stage H: the OID source is seeded from the superblock at creation,
+        // so on a fresh data directory checkpoints persist FIRST_USER — not
+        // as a placeholder fallback, but because that is the persisted value.
         assert_eq!(sb.next_oid, crate::types::Oid::FIRST_USER);
+    }
+
+    #[test]
+    fn checkpoint_persists_next_oid_from_source() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool,
+            page_allocator,
+            wal_writer,
+        );
+
+        // Stage H wiring: the catalog installs its OID allocator's counter as
+        // the next_oid source; checkpoints persist its current value into the
+        // v2 superblock.
+        let source = OidCounter::new(Oid(20_000));
+        coordinator.set_next_oid_source(source.clone());
+
+        coordinator.trigger_checkpoint().unwrap();
+        let sb = Superblock::read(&Superblock::path(&data_dir)).unwrap();
+        assert_eq!(sb.next_oid, crate::types::Oid(20_000));
+
+        // The source is read on every checkpoint, so allocations that advance
+        // the counter are picked up by the next checkpoint.
+        assert_eq!(source.alloc(), Oid(20_000));
+        coordinator.trigger_checkpoint().unwrap();
+        let sb = Superblock::read(&Superblock::path(&data_dir)).unwrap();
+        assert_eq!(sb.next_oid, crate::types::Oid(20_001));
+    }
+
+    /// Regression: a next_oid source installed *after* the background thread's
+    /// clone is created must still be observed by that clone. This guards the
+    /// shared-`Arc` slot — the catalog wires its allocator in `Catalog::open`,
+    /// which may run after `start_background_checkpointing`.
+    #[test]
+    fn background_clone_observes_source_installed_after_clone() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool,
+            page_allocator,
+            wal_writer,
+        );
+
+        // Clone for the background thread FIRST (source still the default
+        // seeded from the superblock), then wire the source on the foreground
+        // coordinator — the order a real startup hits when open() spawns the
+        // checkpointer before Catalog::open.
+        let background = coordinator.clone_for_background_thread();
+        coordinator.set_next_oid_source(OidCounter::new(Oid(30_000)));
+
+        // The background clone shares the slot, so its checkpoint persists the
+        // late-installed source rather than the default it was cloned with.
+        background.trigger_checkpoint().unwrap();
+        let sb = Superblock::read(&Superblock::path(&data_dir)).unwrap();
+        assert_eq!(sb.next_oid, crate::types::Oid(30_000));
     }
 
     #[test]

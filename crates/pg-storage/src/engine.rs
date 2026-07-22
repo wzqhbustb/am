@@ -343,6 +343,23 @@ impl StorageEngine {
         &self.checkpoint
     }
 
+    /// Return the `next_oid` currently recorded in the superblock.
+    ///
+    /// Stage H (catalog bootstrap) uses this to initialize the OID allocator:
+    /// the superblock is the authoritative source of `next_oid` across
+    /// checkpoints until CheckpointEnd WAL records switch to v2 (Stage N).
+    pub fn next_oid(&self) -> crate::types::Oid {
+        self.superblock.lock().next_oid
+    }
+
+    /// Install the source of `next_oid` values persisted by checkpoints
+    /// (Stage H wiring). Forwards to
+    /// [`CheckpointCoordinator::set_next_oid_source`]; the catalog calls this
+    /// once its OID allocator exists.
+    pub fn set_next_oid_source(&self, source: crate::oid::OidCounter) {
+        self.checkpoint.set_next_oid_source(source);
+    }
+
     /// Manually trigger a checkpoint.
     pub fn trigger_checkpoint(&self) -> Result<Lsn> {
         self.checkpoint.trigger_checkpoint()
