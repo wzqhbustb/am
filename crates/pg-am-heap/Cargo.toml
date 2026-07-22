@@ -8,12 +8,29 @@ license.workspace = true
 description = "pg_rust heap access method — slotted page, tuple encoding, TOAST"
 
 [dependencies]
+# Only pg-storage for now (page format + types). pg-catalog and pg-txn are
+# re-added by the stage that actually uses them (Stage H/I), per the
+# "declared when needed" convention.
 pg-storage = { path = "../pg-storage" }
-pg-txn = { path = "../pg-txn" }
-pg-catalog = { path = "../pg-catalog" }
 
 # error types
 thiserror = "2"
 
 # serialization
 serde = { version = "1", features = ["derive"] }
+
+# t_trace_id / Uuid column values (tech-selection §16 dependency list)
+uuid = "1"
+
+[dev-dependencies]
+# property-based testing
+# Pinned to ~1.4 to avoid proptest 1.5+ -> rand 0.9 -> getrandom 0.3 -> wasip2,
+# which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
+proptest = "~1.4"
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "tuple_ops"
+harness = false

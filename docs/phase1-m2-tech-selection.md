@@ -287,6 +287,10 @@ Tuple layout (M2)  —— 所有偏移 8 字节对齐
 └───────────────────────────────────────────────────┘
 ```
 
+**M2 null bitmap 语义（与 PG 相反，有意为之）**：bit i = 1 表示 column i **是 NULL**；
+PG 惯例是 bit i = 1 = NOT NULL。M2 格式与 PG 不 dump 兼容（64B vs 23B header），
+自洽即可；后续 dump 工具需自行反相。写 redo handler / 工具时不要按 PG 习惯想当然。
+
 **t_infomask bit 定义**：
 ```
 HEAP_HASNULL         0x0001
@@ -301,7 +305,7 @@ HEAP_UPDATED         0x2000
 
 **t_infomask2 bit 定义**：
 ```
-natts:                 bits 0..10  (最多 2048 列)
+natts:                 bits 0..10  (11 bit，最多 2047 列)
 HEAP_KEYS_UPDATED:     0x2000
 HEAP_HOT_UPDATED:      0x4000
 HEAP_ONLY_TUPLE:       0x8000

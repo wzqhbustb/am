@@ -1,12 +1,25 @@
 //! pg_rust heap access method — Phase 1 M2.
 //!
-//! This crate implements the heap AM:
+//! Current stage (M2a Stage G) implements the **in-memory page format** only:
 //! - Slotted page layout (line pointer array + tuple data)
 //! - Tuple encoding/decoding (64-byte header + null bitmap + attributes)
-//! - TOAST (oversized attribute storage)
-//! - Heap redo handlers (`HeapInsert`, `HeapUpdate`, `HeapDelete`)
+//! - TOAST pointer encoding (oversized attribute storage)
 //!
-//! It implements `pg-catalog::AccessMethod + UpdatableAM + Vacuumable`.
+//! Trait implementations (`pg-catalog::AccessMethod`, `UpdatableAM`,
+//! `Vacuumable`), heap redo handlers (`HeapInsert`, `HeapUpdate`,
+//! `HeapDelete`) and TOAST chunk table I/O land in Stage I.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
+
+pub mod error;
+pub mod line_pointer;
+pub mod slotted_page;
+pub mod toast;
+pub mod tuple;
+
+pub use error::{HeapError, Result};
+pub use line_pointer::{LinePointer, LpFlags};
+pub use slotted_page::SlottedPage;
+pub use toast::ToastPointer;
+pub use tuple::{ColumnType, Datum, TupleHeader};

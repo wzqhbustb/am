@@ -264,7 +264,7 @@ Heap AM 编译期就依赖它。
 | LinePointer 布局 | 32-bit LP：`lp_off:15 / lp_flags:2 / lp_len:15`；`LpFlags::{Unused, Normal, Redirect, Dead}` |
 | Tuple 编解码 | TupleHeader 64B 固定（字段顺序按 §3 表），`t_cid @ offset 60..64`；null bitmap；定长 + varlena 列 |
 | TOAST pointer 20B | `TOAST pointer` 5×u32 布局；vl_len_ 高 2 位标记 external |
-| TOAST chunk 走 HeapInsert/Delete | 不引入新 record；`pg_toast_<oid>` 表隐式关联；**用户表首次触发 TOAST 时由 Heap AM 隐式创建** |
+| TOAST chunk 走 HeapInsert/Delete | 不引入新 record；`pg_toast_<oid>` 表隐式关联；**用户表首次触发 TOAST 时由 Heap AM 隐式创建**（⚠️ 移至 Stage I 交付：chunk 表读写依赖 HeapInsert/Delete WAL producer，Stage G 是纯内存格式层，本 stage 只交付 pointer 编解码与 external varlena round-trip） |
 | free-space / add_tuple / delete_tuple | slotted page 增删 API，维护 `pd_lower / pd_upper` |
 | proptest | 随机插入/删除 100 万次，pd_lower ≤ pd_upper 恒成立、LP 数组无重叠 |
 
