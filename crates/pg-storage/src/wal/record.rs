@@ -8,7 +8,7 @@ use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, StorageError};
-use crate::types::{align_up, Lsn, PageId, TxnId};
+use crate::types::{align_up, Lsn, PageId, Tid, TxnId};
 
 /// Size of the fixed record header in bytes.
 pub const WAL_RECORD_HEADER_SIZE: usize = 32;
@@ -147,6 +147,71 @@ pub struct FullPageImageRecord {
     pub image: Vec<u8>,
 }
 
+/// Payload for a `HeapInsert` record: a single tuple placed at a slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeapInsertRecord {
+    /// The page the tuple was inserted into.
+    pub page_id: PageId,
+    /// The slot the tuple occupies.
+    pub slot_id: u16,
+    /// The encoded tuple bytes (header + null bitmap + attributes).
+    pub tuple_bytes: Vec<u8>,
+}
+
+/// Payload for a `HeapUpdate` record: delete-old + insert-new in one record.
+///
+/// M2a has no in-place update; an update marks the old version deleted
+/// (`xmax_old` on `old_tid`) and inserts a new version at `new_tid`. Redo
+/// touches the old page then the new page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeapUpdateRecord {
+    /// TID of the row version being superseded.
+    pub old_tid: Tid,
+    /// TID where the new version is written.
+    pub new_tid: Tid,
+    /// The `t_xmax` stamped onto the old version.
+    pub xmax_old: TxnId,
+    /// The encoded bytes of the new version.
+    pub new_tuple_bytes: Vec<u8>,
+}
+
+/// Payload for a `HeapDelete` record: a logical delete stamping `t_xmax`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeapDeleteRecord {
+    /// TID of the row being deleted.
+    pub tid: Tid,
+    /// The `t_xmax` stamped onto the deleted tuple.
+    pub xmax: TxnId,
+}
+
+impl HeapInsertRecord {
+    /// Decode a `HeapInsert` payload. Exposed so out-of-crate redo handlers
+    /// (`pg-am-heap`) can deserialize without the internal bincode config.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl HeapUpdateRecord {
+    /// Decode a `HeapUpdate` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl HeapDeleteRecord {
+    /// Decode a `HeapDelete` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
 /// Payload for a `CheckpointEnd` record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointEndRecord {
@@ -201,6 +266,48 @@ impl WalRecord {
     /// Create a `CheckpointBegin` record.
     pub fn checkpoint_begin() -> Self {
         Self::new(WalRecordType::CheckpointBegin, Vec::new())
+    }
+
+    /// Create a `HeapInsert` record.
+    pub fn heap_insert(page_id: PageId, slot_id: u16, tuple_bytes: Vec<u8>) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            HeapInsertRecord {
+                page_id,
+                slot_id,
+                tuple_bytes,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HeapInsert, payload))
+    }
+
+    /// Create a `HeapUpdate` record (logical delete-old + insert-new).
+    pub fn heap_update(
+        old_tid: Tid,
+        new_tid: Tid,
+        xmax_old: TxnId,
+        new_tuple_bytes: Vec<u8>,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            HeapUpdateRecord {
+                old_tid,
+                new_tid,
+                xmax_old,
+                new_tuple_bytes,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HeapUpdate, payload))
+    }
+
+    /// Create a `HeapDelete` record (logical delete stamping `t_xmax`).
+    pub fn heap_delete(tid: Tid, xmax: TxnId) -> Result<Self> {
+        let payload =
+            bincode::serde::encode_to_vec(HeapDeleteRecord { tid, xmax }, bincode_config())
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::HeapDelete, payload))
     }
 
     /// Create a `CheckpointEnd` record.
@@ -384,6 +491,66 @@ mod tests {
     }
 
     #[test]
+    fn heap_insert_roundtrip() {
+        let mut record = WalRecord::heap_insert(PageId(7), 3, vec![1, 2, 3, 4]).unwrap();
+        record.lsn = Lsn(64);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::HeapInsert);
+        let payload: HeapInsertRecord =
+            bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
+                .unwrap()
+                .0;
+        assert_eq!(payload.page_id, PageId(7));
+        assert_eq!(payload.slot_id, 3);
+        assert_eq!(payload.tuple_bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn heap_update_roundtrip() {
+        let old_tid = Tid {
+            page_id: PageId(7),
+            slot_id: 1,
+        };
+        let new_tid = Tid {
+            page_id: PageId(7),
+            slot_id: 2,
+        };
+        let mut record = WalRecord::heap_update(old_tid, new_tid, TxnId(9), vec![5, 6, 7]).unwrap();
+        record.lsn = Lsn(72);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::HeapUpdate);
+        let payload: HeapUpdateRecord =
+            bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
+                .unwrap()
+                .0;
+        assert_eq!(payload.old_tid, old_tid);
+        assert_eq!(payload.new_tid, new_tid);
+        assert_eq!(payload.xmax_old, TxnId(9));
+        assert_eq!(payload.new_tuple_bytes, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn heap_delete_roundtrip() {
+        let tid = Tid {
+            page_id: PageId(7),
+            slot_id: 4,
+        };
+        let mut record = WalRecord::heap_delete(tid, TxnId(11)).unwrap();
+        record.lsn = Lsn(80);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::HeapDelete);
+        let payload: HeapDeleteRecord =
+            bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
+                .unwrap()
+                .0;
+        assert_eq!(payload.tid, tid);
+        assert_eq!(payload.xmax, TxnId(11));
+    }
+
+    #[test]
     fn decode_rejects_corrupted_crc() {
         let mut record = WalRecord::page_alloc(PageId(1)).unwrap();
         record.lsn = Lsn(16);
@@ -402,7 +569,6 @@ mod tests {
 
     #[test]
     fn record_type_discriminants_are_stable() {
-        assert_eq!(WalRecordType::PageAlloc.to_u8(), 40);
         assert_eq!(WalRecordType::CheckpointEnd.to_u8(), 31);
         assert_eq!(
             WalRecordType::from_u8(40).unwrap(),

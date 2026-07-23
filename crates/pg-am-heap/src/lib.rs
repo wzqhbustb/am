@@ -12,14 +12,23 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod access_method;
 pub mod error;
+pub mod heap_am;
 pub mod line_pointer;
+pub mod redo;
 pub mod slotted_page;
 pub mod toast;
 pub mod tuple;
 
+pub use access_method::{
+    AccessMethod, BuildContext, DeleteContext, InsertContext, RelationDesc, ScanContext,
+    UpdatableAM, UpdateContext, Vacuumable,
+};
 pub use error::{HeapError, Result};
+pub use heap_am::HeapAM;
 pub use line_pointer::{LinePointer, LpFlags};
+pub use redo::{heap_redo_handlers, HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
 pub use slotted_page::SlottedPage;
 pub use toast::ToastPointer;
 pub use tuple::{ColumnType, Datum, TupleHeader};

@@ -8,10 +8,12 @@ license.workspace = true
 description = "pg_rust heap access method — slotted page, tuple encoding, TOAST"
 
 [dependencies]
-# Only pg-storage for now (page format + types). pg-catalog and pg-txn are
-# re-added by the stage that actually uses them (Stage H/I), per the
-# "declared when needed" convention.
+# pg-storage: page format + physical types, buffer pool, WAL, redo dispatch.
 pg-storage = { path = "../pg-storage" }
+# pg-txn (Stage I): Snapshot + visibility for heap scan. No cycle — pg-txn
+# depends only on pg-storage, and this crate does not expose its types back to
+# pg-txn (is_visible takes primitive TxnId fields).
+pg-txn = { path = "../pg-txn" }
 
 # error types
 thiserror = "2"
@@ -28,9 +30,16 @@ uuid = "1"
 # which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
 proptest = "~1.4"
 
+# integration tests drive a real StorageEngine on a temp data dir
+tempfile = "3"
+
 # benchmarks
 criterion = "0.5"
 
 [[bench]]
 name = "tuple_ops"
+harness = false
+
+[[bench]]
+name = "heap_insert"
 harness = false

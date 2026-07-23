@@ -76,8 +76,13 @@ struct FrameMeta {
     /// authoritative value lives in the page itself; readers that need
     /// correctness (e.g. `flush_frame`) must read `page[0..8]` directly.
     cached_lsn: Lsn,
-    /// True if the page still needs a `FullPageImage` WAL record before the
-    /// first modification in this residency.
+    /// True if the page has an on-disk image that a torn write could corrupt,
+    /// so the next modification must be preceded by a `FullPageImage` record.
+    /// Set on load-from-disk and after any successful `flush_frame` (a resident
+    /// page flushed in place at a checkpoint now has an on-disk version);
+    /// cleared only for freshly allocated pages that have never been flushed.
+    /// Whether an FPI is actually written is additionally gated in `pin_mut` by
+    /// `pd_lsn < checkpoint_lsn` (i.e. not yet modified in this checkpoint cycle).
     needs_fpi: bool,
     /// True if this frame is in the process of being evicted. New pins must
     /// reject the frame even if `page_id` still matches.
@@ -236,23 +241,26 @@ impl BufferPool {
         // the exact state just before this modification.
         let mut content_guard = self.frames[frame_id.0].content.write();
 
-        // Write FPI if this page has not been modified since the current
-        // checkpoint begin. The `needs_fpi` flag tracks whether this residency
-        // has already written an FPI; the page's own `pd_lsn` (authoritative,
-        // `page[0..8]`) tells us whether the page was last modified in the
-        // current checkpoint cycle.
+        // Write FPI if this page has a prior on-disk version and has not yet
+        // been modified in the current checkpoint cycle. `needs_fpi` means "this
+        // page has an on-disk image": true for pages loaded from disk and for
+        // pages flushed in place at a checkpoint (still resident), false for
+        // freshly allocated pages that have never been flushed. The page's own
+        // `pd_lsn` (authoritative, `page[0..8]`) tells us whether the page was
+        // last modified in the current checkpoint cycle.
         //
         // If no checkpoint has ever run (`checkpoint_lsn` is invalid), we skip
-        // the FPI. This is correct for M1 because pages allocated before the
-        // first checkpoint have no prior on-disk version that needs protecting.
+        // the FPI. This is correct because pages allocated before the first
+        // checkpoint have no prior on-disk version that needs protecting.
         //
-        // Conservative deviation from PG: `needs_fpi` is only reset on
-        // eviction/reload, not on checkpoint. A page already FPI'd in this
-        // residency gets no new FPI after a later checkpoint begins, even when
-        // its pd_lsn falls behind the new checkpoint_lsn — PG would write one.
-        // This is M1's accepted loss window (post-checkpoint in-place
-        // modifications are not redo-protected); it closes when Stage I adds
-        // heap redo records.
+        // `needs_fpi` is NOT cleared after writing an FPI: the `pd_lsn <
+        // checkpoint_lsn` gate alone decides whether an FPI is due. After we
+        // stamp the page's pd_lsn to the FPI LSN below, a second modification in
+        // the same cycle sees `pd_lsn >= checkpoint_lsn` and skips the FPI; once
+        // a later checkpoint advances `checkpoint_lsn` past that pd_lsn, the
+        // next modification re-fires the FPI. Because `flush_frame` re-sets
+        // `needs_fpi`, this holds whether the page was evicted+reloaded or
+        // stayed resident across the checkpoint (Stage I, Step 7).
         let needs_fpi = {
             let meta = self.frames[frame_id.0].meta.lock();
             meta.needs_fpi
@@ -287,7 +295,6 @@ impl BufferPool {
             // pd_lsn; recovery patches it to the record's own LSN.
             set_page_pd_lsn(&mut content_guard[..], fpi_lsn);
             let mut meta = self.frames[frame_id.0].meta.lock();
-            meta.needs_fpi = false;
             meta.cached_lsn = fpi_lsn;
             meta.dirty = true;
         }
@@ -623,6 +630,14 @@ impl BufferPool {
             self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
         }
 
+        // The page now has an on-disk image, so a subsequent modification in a
+        // later checkpoint cycle must be preceded by an FPI (torn-write
+        // protection). This is what closes the cross-checkpoint window for pages
+        // that stay RESIDENT across a checkpoint (never evicted): eviction+reload
+        // sets needs_fpi via locate_or_load, but an in-place checkpoint flush
+        // keeps the page resident, so flush must mark it here.
+        self.frames[frame_id.0].meta.lock().needs_fpi = true;
+
         Ok(())
     }
 
@@ -839,6 +854,104 @@ mod tests {
         assert!(
             found_fpi,
             "pin_mut should have written a FullPageImage record"
+        );
+    }
+
+    #[test]
+    fn fpi_fires_for_resident_page_across_checkpoint() {
+        // A freshly allocated page that stays RESIDENT (never evicted) across a
+        // checkpoint must still get an FPI on its next modification: after the
+        // checkpoint flush it has an on-disk image a torn write could corrupt.
+        // Regression for the Stage I Step 7 gap where `needs_fpi` was only set
+        // on eviction+reload, so resident pages skipped the FPI.
+        let tmp = TempDir::new().unwrap();
+        let (_, _wal, pool) = setup(&tmp);
+
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xCD;
+            id
+        };
+        // Flush in place (as a checkpoint would), keeping the page resident.
+        pool.flush(page_id).unwrap();
+        pool.set_checkpoint_lsn(Lsn(10_000_000));
+
+        // Next modification of the still-resident page must write an FPI.
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0x01;
+        }
+
+        let mut reader = crate::wal::reader::WalReader::open(
+            tmp.path().join("wal"),
+            test_config(&tmp).wal_segment_size,
+        )
+        .unwrap();
+        let mut fpi_count = 0;
+        while let Some(record) = reader.next_record().unwrap() {
+            if record.record_type == crate::wal::record::WalRecordType::FullPageImage {
+                fpi_count += 1;
+            }
+        }
+        assert_eq!(
+            fpi_count, 1,
+            "resident page needs an FPI after a checkpoint (got {fpi_count})"
+        );
+    }
+
+    #[test]
+    fn fpi_refires_across_checkpoint_boundary() {
+        // Within a single residency, an FPI must be re-written after each new
+        // checkpoint begins. The `needs_fpi` flag is never cleared, so the
+        // `pd_lsn < checkpoint_lsn` gate alone drives the decision (Step 7).
+        let tmp = TempDir::new().unwrap();
+        let (_, _wal, pool) = setup(&tmp);
+
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            let id = guard.page_id();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 0xCD;
+            id
+        };
+
+        // First checkpoint, then evict so the reloaded page has needs_fpi=true.
+        pool.set_checkpoint_lsn(Lsn(1_000));
+        for _ in 0..pool.frame_count() + 10 {
+            let _ = pool.new_page().unwrap();
+        }
+
+        // Modification #1 in checkpoint cycle 1 -> FPI #1. The page stays
+        // resident afterwards (no eviction), so needs_fpi is not re-set.
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0x01;
+        }
+
+        // A second checkpoint advances checkpoint_lsn past the FPI #1 pd_lsn.
+        pool.set_checkpoint_lsn(Lsn(10_000_000));
+
+        // Modification #2 in checkpoint cycle 2 -> FPI #2 (page_lsn < new
+        // checkpoint_lsn), proving the cross-checkpoint window is closed.
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 2] = 0x02;
+        }
+
+        let mut reader = crate::wal::reader::WalReader::open(
+            tmp.path().join("wal"),
+            test_config(&tmp).wal_segment_size,
+        )
+        .unwrap();
+        let mut fpi_count = 0;
+        while let Some(record) = reader.next_record().unwrap() {
+            if record.record_type == crate::wal::record::WalRecordType::FullPageImage {
+                fpi_count += 1;
+            }
+        }
+        assert_eq!(
+            fpi_count, 2,
+            "FPI must re-fire after the second checkpoint (got {fpi_count})"
         );
     }
 

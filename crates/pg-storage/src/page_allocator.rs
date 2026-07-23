@@ -227,15 +227,6 @@ impl PageAllocator {
         self.next_page_id
     }
 
-    /// Replace the WAL writer used for future allocations.
-    ///
-    /// This is used during recovery: a temporary WAL writer is supplied while
-    /// replaying old records, and then replaced by the real writer once the
-    /// storage engine is fully opened.
-    pub fn set_wal_writer(&mut self, wal_writer: Arc<WalWriter>) {
-        self.wal_writer = wal_writer;
-    }
-
     /// Return the path to the data file.
     pub fn data_file_path(&self) -> &Path {
         &self.data_file_path

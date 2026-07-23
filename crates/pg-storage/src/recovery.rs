@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use crate::buffer_pool::BufferPool;
 use crate::clog::ClogAccessor;
 use crate::error::{Result, StorageError};
-use crate::page::set_page_pd_lsn;
+use crate::page::{page_pd_lsn, set_page_pd_lsn};
 use crate::page_allocator::PageAllocator;
 use crate::positioned_file::PositionedFile;
 use crate::types::{Lsn, PageId, TxnId, PAGE_SIZE};
@@ -202,12 +202,19 @@ impl RedoHandler for PageFreeRedoHandler {
     }
 }
 
-/// Redo handler for `FullPageImage` records (M1 physical replay).
+/// Redo handler for `FullPageImage` records.
 ///
-/// M1 replay writes images directly to the data file because the buffer pool
-/// does not exist yet at replay time. After applying the image, the page's
-/// `pd_lsn` is patched to the record's own LSN — matching PG, where the page
-/// LSN becomes the LSN of the most recent redo record that touched it.
+/// From Stage I onwards recovery opens the buffer pool *before* replay, so
+/// FPI images are applied through the pool (pin_mut → overwrite → patch
+/// pd_lsn → drop marks dirty), sharing the same dispatch and idempotency
+/// contract as fine-grained heap redo. The direct-write path against
+/// `data_file` is retained as a fallback for callers that replay with no
+/// buffer pool (`RedoContext.buffer_pool == None`).
+///
+/// After applying the image, the page's `pd_lsn` is patched to the record's
+/// own LSN (taking the max against the current page LSN so re-applying an
+/// older FPI never rolls pd_lsn backwards) — matching PG, where the page LSN
+/// becomes the LSN of the most recent redo record that touched it.
 pub struct FullPageImageRedoHandler {
     data_file: Arc<PositionedFile>,
 }
@@ -224,19 +231,31 @@ impl RedoHandler for FullPageImageRedoHandler {
         WalRecordType::FullPageImage
     }
 
-    fn apply(&self, record: &WalRecord, _ctx: &mut RedoContext<'_>) -> Result<()> {
+    fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
         let decoded: FullPageImageRecord =
             bincode::serde::decode_from_slice(&record.payload, bincode_config())
                 .map_err(|e| StorageError::Serialize(e.to_string()))?
                 .0;
 
-        // M1 design note: replaying an FPI overwrites the page with the image
-        // captured at the start of the checkpoint cycle. Any later in-place
-        // modifications made *after* that FPI but *before* the next checkpoint
-        // are lost on recovery because M1 has no redo records for heap/tuple
-        // updates. This is acceptable for M1 (no Heap/BTree records); M2 will
-        // replay fine-grained redo records after the FPI to reconstruct the
-        // latest page state.
+        if let Some(pool) = ctx.buffer_pool {
+            let mut guard = pool.pin_mut(decoded.page_id)?;
+            let page = guard.page_mut();
+            // An FPI is restored unconditionally: the on-disk page may be torn
+            // (garbage pd_lsn), so we cannot trust a pd_lsn >= record.lsn guard
+            // here — repairing torn writes is the entire purpose of the image.
+            // Idempotency across replays is preserved because replay always
+            // starts at the checkpoint redo point and reapplies the FPI plus any
+            // later fine-grained records in LSN order.
+            page.copy_from_slice(&decoded.image);
+            let new_lsn = record.lsn.max(page_pd_lsn(page));
+            set_page_pd_lsn(page, new_lsn);
+            // Drop marks the frame dirty; engine flushes after the replay loop.
+            return Ok(());
+        }
+
+        // Fallback: no buffer pool at replay time — write straight to the data
+        // file. The FPI image keeps its captured pd_lsn; patch it to this
+        // record's LSN so the on-disk page reflects the replay point.
         let mut image = decoded.image;
         set_page_pd_lsn(&mut image, record.lsn);
 

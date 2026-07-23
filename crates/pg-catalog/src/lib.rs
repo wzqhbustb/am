@@ -21,7 +21,7 @@ pub mod catalog;
 pub mod oid;
 pub mod system_tables;
 
-use pg_storage::types::{Oid, Tid, TxnId};
+use pg_storage::types::Oid;
 use serde::{Deserialize, Serialize};
 
 pub use catalog::{AmRow, AttributeRow, Catalog, RelationRow, TypeRow};
@@ -121,42 +121,18 @@ impl From<TypeOid> for Oid {
 }
 
 // ---------------------------------------------------------------------------
-// Access Method traits (Stage A introduced the skeleton; Stage I adds the
-// heap implementation and the full trait surface)
+// Access Method traits
 // ---------------------------------------------------------------------------
-
-/// Base trait for all access methods (heap, B+Tree, future HNSW/Inverted).
-///
-/// Stage A only defines the identity method. Additional methods (`build`,
-/// `insert`, `scan`, `delete`, `redo_handlers`) are added in Stage I once
-/// `RedoHandler` and Context types are available from Stage D.
-pub trait AccessMethod: Send + Sync {
-    /// AM name, corresponds to `pg_am.amname`.
-    fn name(&self) -> &'static str;
-}
-
-/// AMs that support in-place tuple updates.
-///
-/// In M2 only the heap AM implements this. Index AMs (B+Tree) do not —
-/// index updates are modeled as delete + insert.
-///
-/// Stage A is an empty marker trait; `update` is added in Stage I.
-pub trait UpdatableAM: AccessMethod {}
-
-/// AMs that support vacuum / garbage collection.
-///
-/// M2 only defines the interface; `scan_dead_tuples` is implemented by heap
-/// in Stage I for MVCC correctness testing. `reclaim` and `notify_indexes`
-/// are deferred to M3.
-///
-/// TODO(M3): When autovacuum is introduced, consider changing the return
-/// type from `Vec<Tid>` to an iterator or callback pattern to avoid
-/// materializing all dead tuples on the heap for large tables.
-pub trait Vacuumable {
-    /// Scan for dead tuples whose `xmax` is committed and older than
-    /// `oldest_xmin`.
-    fn scan_dead_tuples(&self, oldest_xmin: TxnId) -> Result<Vec<Tid>>;
-}
+//
+// Stage I moved these traits (and their operation contexts) down into
+// `pg-am-heap`, so that `HeapAM` and its impls live beside the tuple /
+// slotted-page primitives they build on. They are re-exported here unchanged
+// to keep the catalog's public API stable — existing `pg_catalog::AccessMethod`
+// paths keep working.
+pub use pg_am_heap::access_method::{
+    AccessMethod, BuildContext, DeleteContext, InsertContext, RelationDesc, ScanContext,
+    UpdatableAM, UpdateContext, Vacuumable,
+};
 
 #[cfg(test)]
 mod tests {
@@ -204,41 +180,5 @@ mod tests {
         let (decoded, _): (TypeOid, usize) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(ty, decoded);
-    }
-
-    // Dummy AM to verify trait bounds compile and are implementable.
-    struct DummyHeap;
-
-    impl AccessMethod for DummyHeap {
-        fn name(&self) -> &'static str {
-            "heap"
-        }
-    }
-
-    impl UpdatableAM for DummyHeap {}
-
-    impl Vacuumable for DummyHeap {
-        fn scan_dead_tuples(&self, _oldest_xmin: TxnId) -> Result<Vec<Tid>> {
-            Ok(vec![])
-        }
-    }
-
-    #[test]
-    fn access_method_name() {
-        let am = DummyHeap;
-        assert_eq!(am.name(), "heap");
-    }
-
-    #[test]
-    fn updatable_am_extends_access_method() {
-        fn assert_updatable<T: UpdatableAM>(_: &T) {}
-        assert_updatable(&DummyHeap);
-    }
-
-    #[test]
-    fn vacuumable_scan_returns_empty() {
-        let vac = DummyHeap;
-        let dead = vac.scan_dead_tuples(TxnId(100)).unwrap();
-        assert!(dead.is_empty());
     }
 }

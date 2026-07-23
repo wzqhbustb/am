@@ -13,7 +13,9 @@ use pg_catalog::system_tables::{
 use pg_catalog::{Catalog, TableOid};
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
+use pg_storage::page::set_page_pd_lsn;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
+use pg_storage::wal::record::WalRecord;
 
 fn open_engine(dir: &std::path::Path) -> StorageEngine {
     let config = StorageConfig::new(dir);
@@ -42,6 +44,18 @@ fn insert_pg_class_row(engine: &StorageEngine, oid: Oid, name: &str) {
     ];
     let bytes = encode_tuple(header, &PG_CLASS.column_types(), &row).unwrap();
     SlottedPage::add_tuple(page, &bytes).unwrap();
+
+    // Durably log the write so it survives crash recovery. A raw, unlogged page
+    // write is not recoverable once a prior checkpoint has armed full-page-image
+    // torn-write protection: `pin_mut` emits a pre-image FPI that recovery would
+    // replay, rolling the unlogged tuple back. Logging the post-insert page
+    // image (replayed by the default FullPageImageRedoHandler) makes it durable.
+    let image = page.to_vec();
+    let lsn = engine
+        .wal_writer()
+        .append(WalRecord::full_page_image(PG_CLASS.first_page, image).unwrap())
+        .unwrap();
+    set_page_pd_lsn(page, lsn);
 }
 
 #[test]

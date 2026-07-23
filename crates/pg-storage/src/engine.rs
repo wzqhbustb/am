@@ -22,7 +22,7 @@ use crate::page_allocator::PageAllocator;
 use crate::positioned_file::PositionedFile;
 use crate::recovery::{
     ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, NoOpRedoHandler,
-    PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoRegistry,
+    PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler, RedoRegistry,
 };
 use crate::superblock::Superblock;
 use crate::types::Lsn;
@@ -51,13 +51,28 @@ impl StorageEngine {
     /// Background checkpointing is not started automatically; call
     /// [`Self::start_background_checkpointing`] to enable it.
     pub fn open(data_dir: impl AsRef<Path>, config: &StorageConfig) -> Result<Self> {
+        Self::open_with_redo_handlers(data_dir, config, Vec::new())
+    }
+
+    /// Open or create a storage engine, injecting extra redo handlers.
+    ///
+    /// `extra_redo_handlers` are registered into the recovery [`RedoRegistry`]
+    /// alongside the built-in storage handlers before WAL replay. This is how
+    /// upper layers (e.g. the heap AM) supply redo handlers for their own
+    /// record types without `pg-storage` depending on them. On a fresh
+    /// database the handlers are unused (nothing to replay).
+    pub fn open_with_redo_handlers(
+        data_dir: impl AsRef<Path>,
+        config: &StorageConfig,
+        extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+    ) -> Result<Self> {
         config.validate()?;
         let data_dir = data_dir.as_ref().to_path_buf();
         ensure_data_dir(&data_dir)?;
 
         let sb_path = Superblock::path(&data_dir);
         if sb_path.exists() {
-            Self::recover(data_dir, config)
+            Self::recover_with_redo_handlers(data_dir, config, extra_redo_handlers)
         } else {
             Self::create_new(data_dir, config)
         }
@@ -123,6 +138,21 @@ impl StorageEngine {
     ///    - A truncated or CRC-bad final record is treated as end-of-WAL.
     /// 5. Open the WAL writer and buffer pool at the recovered state.
     pub fn recover(data_dir: PathBuf, config: &StorageConfig) -> Result<Self> {
+        Self::recover_with_redo_handlers(data_dir, config, Vec::new())
+    }
+
+    /// Recover, injecting `extra_redo_handlers` into the redo registry.
+    ///
+    /// From Stage I recovery opens the buffer pool **before** replay so that
+    /// redo handlers can pin/dirty pages through it (`RedoContext.buffer_pool`
+    /// is `Some`). Order: superblock → WAL writer → page allocator → freelist
+    /// snapshot → buffer pool → replay → flush dirty pages → checkpoint
+    /// coordinator.
+    pub fn recover_with_redo_handlers(
+        data_dir: PathBuf,
+        config: &StorageConfig,
+        extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+    ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "recovering storage engine");
 
         let sb_path = Superblock::path(&data_dir);
@@ -130,17 +160,17 @@ impl StorageEngine {
         let checkpoint_lsn = superblock.checkpoint_lsn;
         info!(%checkpoint_lsn, "loaded superblock");
 
-        // 2. Initialize the page allocator from the checkpointed next_page_id.
-        //    We need a temporary WAL writer for replay; it will be replaced by
-        //    the real one after recovery.
-        //
-        // TODO(M2): avoid creating a throwaway WalWriter. The allocator only
-        // needs a writer for future allocations; replay itself does not write WAL.
-        let replay_wal = Arc::new(WalWriter::open(&data_dir, config)?);
+        // 2. Open the WAL writer once. WalWriter::open scans the durable WAL and
+        //    resumes appending after the last complete record, so it is
+        //    consistent with the on-disk state. Replay itself writes no WAL
+        //    (redo is idempotent and, because the buffer pool's checkpoint_lsn
+        //    stays invalid during recovery, pin_mut emits no FPI), so opening it
+        //    up front is safe and lets the allocator + buffer pool share it.
+        let wal_writer = Arc::new(WalWriter::open(&data_dir, config)?);
         let page_allocator = Arc::new(Mutex::new(PageAllocator::open_at(
             &data_dir,
             config,
-            Arc::clone(&replay_wal),
+            Arc::clone(&wal_writer),
             superblock.next_page_id,
         )?));
 
@@ -180,7 +210,17 @@ impl StorageEngine {
             Err(e) => return Err(e),
         }
 
-        // 4. Replay WAL from the checkpoint redo point. If no checkpoint has
+        // 4. Open the buffer pool before replay so redo handlers can route
+        //    through it. Its checkpoint_lsn starts invalid, which keeps pin_mut
+        //    from emitting FPIs during redo (no WAL recursion).
+        let buffer_pool = Arc::new(BufferPool::open(
+            &data_dir,
+            config,
+            Arc::clone(&page_allocator),
+            Arc::clone(&wal_writer),
+        )?);
+
+        // 5. Replay WAL from the checkpoint redo point. If no checkpoint has
         //    ever run, start from Lsn::FIRST so that all WAL records written
         //    before the first checkpoint are replayed.
         let replay_start = if checkpoint_lsn.is_valid() {
@@ -193,27 +233,11 @@ impl StorageEngine {
             data_dir.clone(),
             config,
             replay_start,
-            Arc::clone(&page_allocator),
+            &page_allocator,
+            &buffer_pool,
+            extra_redo_handlers,
         )?;
         page_allocator.lock().mark_recovery_complete();
-
-        // 5. Open WAL writer and buffer pool at the recovered state.
-        //    WalWriter::open scans the durable WAL and resumes appending from the
-        //    byte position immediately after the last complete record, so the new
-        //    writer is consistent with the file state left by replay (and by the
-        //    temporary replay writer, which did not write any records).
-        let wal_writer = Arc::new(WalWriter::open(&data_dir, config)?);
-        // Replace the temporary replay writer with the real one so that future
-        // allocations go through the same WAL writer as the buffer pool.
-        page_allocator
-            .lock()
-            .set_wal_writer(Arc::clone(&wal_writer));
-        let buffer_pool = Arc::new(BufferPool::open(
-            &data_dir,
-            config,
-            Arc::clone(&page_allocator),
-            Arc::clone(&wal_writer),
-        )?);
 
         let superblock = Arc::new(Mutex::new(superblock));
         let checkpoint = CheckpointCoordinator::new(
@@ -241,7 +265,9 @@ impl StorageEngine {
         data_dir: PathBuf,
         config: &StorageConfig,
         checkpoint_lsn: Lsn,
-        page_allocator: Arc<Mutex<PageAllocator>>,
+        page_allocator: &Arc<Mutex<PageAllocator>>,
+        buffer_pool: &BufferPool,
+        extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
     ) -> Result<()> {
         let mut reader = WalReader::open_at(
             data_dir.join("wal"),
@@ -249,19 +275,18 @@ impl StorageEngine {
             checkpoint_lsn,
         )?;
 
-        // Open the data file once and share it with the FPI redo handler.
+        // The FPI handler routes through the buffer pool when present (it is,
+        // here), but still needs a data-file handle for its no-pool fallback.
         // This is a replay-scoped temporary handle that must NOT be reused for
-        // normal operation — each subsystem (BufferPool, PageAllocator) opens
-        // its own PositionedFile for the same on-disk file after replay
-        // completes, carrying its own state (e.g. cached file length) that
-        // would be unsynchronized with a shared replay handle.
+        // normal operation.
         let data_file_path = crate::io::data_file_path(&data_dir);
         let data_file = Arc::new(PositionedFile::open(&data_file_path)?);
 
         // Stage D: replay dispatches through the RedoRegistry. Every record
-        // type that can appear in an M1 WAL has exactly one registered
-        // handler; anything else is a hard failure (UnknownRecord) instead of
-        // being silently skipped.
+        // type that can appear in the WAL has exactly one registered handler;
+        // anything else is a hard failure (UnknownRecord) instead of being
+        // silently skipped. Stage I injects heap handlers via
+        // `extra_redo_handlers`.
         let mut registry = RedoRegistry::new();
         registry.register(Box::new(PageAllocRedoHandler));
         registry.register(Box::new(PageFreeRedoHandler));
@@ -272,13 +297,16 @@ impl StorageEngine {
             WalRecordType::CheckpointBegin,
         )));
         registry.register(Box::new(NoOpRedoHandler::new(WalRecordType::CheckpointEnd)));
+        for handler in extra_redo_handlers {
+            registry.register(handler);
+        }
 
         let clog = NoOpClogAccessor;
         let mut att = ActiveXactTable::new();
         let mut dpt = DirtyPageTable::new();
         let mut ctx = RedoContext {
-            buffer_pool: None,
-            page_allocator: &page_allocator,
+            buffer_pool: Some(buffer_pool),
+            page_allocator,
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
@@ -301,8 +329,12 @@ impl StorageEngine {
             }
         }
 
-        // Ensure all replayed FPIs are durable before returning.
-        data_file.sync_all()?;
+        // Flush all pages dirtied by redo through the buffer pool, which makes
+        // them durable (WAL-before-data + fsync). This replaces the M1
+        // direct-write + data_file.sync_all() path.
+        for page_id in buffer_pool.dirty_page_ids() {
+            buffer_pool.flush(page_id)?;
+        }
 
         info!(records_replayed, "WAL replay complete");
         Ok(())
@@ -650,7 +682,10 @@ mod tests {
     fn multiple_checkpoints_keep_data_consistent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = StorageConfig::new(tmp.path());
-        config.wal_segment_size = 4096;
+        // Use the default WAL segment size: modifying a resident page after a
+        // checkpoint now correctly emits a full-page image (~8 KiB), which does
+        // not fit the tiny segments some other tests use. Segment recycling is
+        // covered by `checkpoint_recycles_old_wal_segments`.
         config.wal_group_commit_timeout_ms = 1;
         config.wal_group_commit_batch_size = 1;
 
@@ -759,5 +794,65 @@ mod tests {
         let read_count = reader.join().unwrap();
         assert!(alloc_count > 0, "allocator thread produced no pages");
         assert!(read_count > 0, "reader thread completed no reads");
+    }
+
+    #[test]
+    fn redo_context_pool_is_some_during_recovery() {
+        use crate::recovery::RedoContext;
+        use crate::wal::record::{WalRecord, WalRecordType};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A probe handler for HeapInsert records that records whether the
+        // buffer pool was present in the RedoContext when it ran.
+        struct ProbeHandler {
+            saw_pool: Arc<AtomicBool>,
+            applied: Arc<AtomicBool>,
+        }
+
+        impl RedoHandler for ProbeHandler {
+            fn kind(&self) -> WalRecordType {
+                WalRecordType::HeapInsert
+            }
+
+            fn apply(&self, _record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+                self.applied.store(true, Ordering::Relaxed);
+                self.saw_pool
+                    .store(ctx.buffer_pool.is_some(), Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = StorageConfig::new(tmp.path());
+
+        // Create an engine and append a HeapInsert record to the WAL, then make
+        // it durable and abandon the engine (simulate crash).
+        {
+            let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+            let record = WalRecord::heap_insert(PageId(1), 0, vec![1, 2, 3, 4]).unwrap();
+            engine.wal_writer().append(record).unwrap();
+            engine.wal_writer().flush().unwrap();
+            std::mem::forget(engine);
+        }
+
+        let saw_pool = Arc::new(AtomicBool::new(false));
+        let applied = Arc::new(AtomicBool::new(false));
+        let handlers: Vec<Box<dyn RedoHandler>> = vec![Box::new(ProbeHandler {
+            saw_pool: Arc::clone(&saw_pool),
+            applied: Arc::clone(&applied),
+        })];
+
+        // Recovery must replay the HeapInsert record through the probe handler,
+        // and the buffer pool must exist at that point.
+        let _engine =
+            StorageEngine::open_with_redo_handlers(tmp.path(), &config, handlers).unwrap();
+        assert!(
+            applied.load(Ordering::Relaxed),
+            "probe handler was never invoked during recovery"
+        );
+        assert!(
+            saw_pool.load(Ordering::Relaxed),
+            "RedoContext.buffer_pool was None during recovery replay"
+        );
     }
 }

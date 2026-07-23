@@ -475,8 +475,10 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "pg-storage",
+ "pg-txn",
  "proptest",
  "serde",
+ "tempfile",
  "thiserror",
  "uuid",
 ]

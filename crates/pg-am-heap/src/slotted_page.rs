@@ -54,6 +54,19 @@ impl SlottedPage {
         }
     }
 
+    /// Initialize the page only if it has never been initialized.
+    ///
+    /// A validly initialized heap page always has `pd_upper >= PAGE_HEADER_SIZE`
+    /// (it starts at `PAGE_SIZE` and only shrinks toward `pd_lower`), so
+    /// `pd_upper == 0` uniquely identifies a fresh, all-zero page — for example
+    /// one materialized by extending the data file with zeros during recovery,
+    /// before any `HeapInsert` redo has run against it.
+    pub fn init_if_fresh(page: &mut [u8; PAGE_SIZE]) {
+        if Self::header(page).pd_upper == 0 {
+            Self::init(page);
+        }
+    }
+
     /// Decode the page header.
     pub fn header(page: &[u8; PAGE_SIZE]) -> PageHeader {
         PageHeader::read_from(page)

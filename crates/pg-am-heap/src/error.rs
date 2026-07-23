@@ -37,6 +37,17 @@ pub enum HeapError {
     /// [`HeapError::Corrupted`], which describes bad on-disk bytes.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// No live tuple exists at the given TID (out-of-range page/slot, or the
+    /// slot holds a dead/unused line pointer). Raised by update/delete when
+    /// the target row cannot be found.
+    #[error("tuple not found at {0:?}")]
+    TupleNotFound(pg_storage::types::Tid),
+
+    /// A lower-level storage engine operation failed (buffer pool, WAL, page
+    /// allocator).
+    #[error("storage error: {0}")]
+    Storage(#[from] pg_storage::error::StorageError),
 }
 
 /// A convenient type alias for heap-AM results.

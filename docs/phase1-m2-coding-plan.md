@@ -354,6 +354,7 @@ Heap AM 编译期就依赖它。
 - **并发**：100 线程 INSERT 无 slot 冲突（Stage F pread/pwrite 就位后 QPS 数字更高，功能不变）
 - **性能**：单线程 INSERT ≥ 30K ops/s（criterion，纯 heap AM 路径，尚未叠加 TxnManager / CLOG；
   该数字是后续 Stage K/T 的性能上限，加层后会逐步下降）
+  - **实测约束**：Stage I 阶段 `PageAllocator::alloc_page` 每次分配同步 `flush_to` fsync，纯 heap AM 路径达不到 30K ops/s；该目标需等 Stage J 的 `TxnManager` 在 commit 时统一 `flush_to`（摊销逐页 fsync）后才真正达成，详见阶段 J
 
 **验收命令**：
 ```bash
@@ -380,6 +381,7 @@ CLOG 铺路。
 | In-Memory `ClogAccessor` | `pg-txn::InMemoryClogAccessor`：`parking_lot::RwLock<HashMap<TxnId, TxnState>>`；实现同一 trait |
 | **ABORTED 禁清** | checkpoint 时只清 `COMMITTED` 且 `xid < checkpoint_next_txn_id`；ABORTED 一律保留 |
 | 保底不清 | `EngineConfig.m2a_clog_never_gc = true`（M2a 默认；M2b 换磁盘版后自动关闭） |
+| **page_alloc flush 攒批** | `PageAllocator::alloc_page` 现每次分配都同步 `flush_to(alloc_lsn)`（~100μs fsync/次），是 Stage I 纯 heap AM INSERT 吞吐的主要瓶颈；`TxnManager` 在事务 commit 时统一 `flush_to`（对应 `page_allocator.rs` 的 `TODO(M2)`），把逐页 fsync 摊销到一次 commit fsync，Stage I 未达标的 30K ops/s 目标在此阶段才真正达成 |
 
 **关键 v2.3 约束**：
 - v2.3-1：删除 v2.1 `AbortedXidSet` 概念，全走 `ClogAccessor`
@@ -391,7 +393,8 @@ CLOG 铺路。
 - **正确性**：`test_commit_hard_order`（注入 WAL flush 失败 → CLOG 不更新）；
   `test_aborted_never_gc`（checkpoint 后 aborted xid 仍在 map 中）
 - **并发**：100 事务并发 commit / abort，`ClogAccessor::get_state` 无 race
-- **性能**：单事务 commit 延迟 ≤ 5ms（本地 SSD，含 fsync）
+- **性能**：单事务 commit 延迟 ≤ 5ms（本地 SSD，含 fsync）；单线程 INSERT 吞吐 ≥ 30K ops/s
+  —— 靠 commit 时统一 `flush_to` 摊销逐页 `page_alloc` fsync 达成（此为 Stage I 目标真正落地处）
 
 **验收命令**：`cargo test -p pg-txn --test commit_hard_order && cargo test -p pg-txn --test aborted_never_gc`
 

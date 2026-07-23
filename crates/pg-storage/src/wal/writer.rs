@@ -71,7 +71,16 @@ impl WalWriter {
             Lsn::FIRST
         };
 
-        Self::open_with_segment_manager(segment_manager, config, start_lsn)
+        // A resumed WAL is durable up to `start_lsn`; a WAL with no records
+        // (start_lsn still at FIRST — the segment file is preallocated so its
+        // length alone does not imply records) has nothing synced yet.
+        let initial_synced_lsn = if start_lsn > Lsn::FIRST {
+            start_lsn
+        } else {
+            Lsn::INVALID
+        };
+
+        Self::open_with_segment_manager(segment_manager, config, start_lsn, initial_synced_lsn)
     }
 
     /// Open or create the WAL writer in `{data_dir}/wal`, starting at
@@ -107,20 +116,30 @@ impl WalWriter {
             )));
         }
 
-        Self::open_with_segment_manager(segment_manager, config, start_lsn)
+        Self::open_with_segment_manager(segment_manager, config, start_lsn, start_lsn)
     }
 
     fn open_with_segment_manager(
         segment_manager: WalSegmentManager,
         config: &StorageConfig,
         start_lsn: Lsn,
+        initial_synced_lsn: Lsn,
     ) -> Result<Self> {
         let lsn_clock = LsnClock::new(start_lsn);
 
         let inner = Arc::new(Mutex::new(WriterState {
             lsn_clock,
             segment_manager,
-            synced_lsn: Lsn::INVALID,
+            // For a resumed WAL, everything on disk up to `start_lsn` is durable
+            // by definition (open scans past the last complete record), so the
+            // synced position starts there. This lets `flush_to` for a record
+            // that predates this open return immediately instead of waiting on
+            // the worker — which only advances `synced_lsn` when there are
+            // freshly appended `pending` bytes. Recovery relies on this when
+            // flushing replayed pages (WAL-before-data) without appending any
+            // new WAL. A brand-new (empty) WAL has nothing durable yet, so it
+            // passes `Lsn::INVALID`.
+            synced_lsn: initial_synced_lsn,
             pending: 0,
             last_flush: Instant::now(),
             shutdown: false,
