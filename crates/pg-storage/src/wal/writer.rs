@@ -48,12 +48,30 @@ impl WalWriter {
     /// from the byte position immediately after the last complete record. This
     /// prevents recovery code from accidentally overwriting existing WAL.
     ///
-    /// # Preconditions
+    /// # Recycled segments
     ///
-    /// This method assumes the complete WAL is still present in `{data_dir}/wal`
-    /// (i.e. no segments have been recycled by a checkpoint). If older segments
-    /// are missing, use [`Self::open_at`] with the checkpoint redo LSN instead.
+    /// Checkpoints may have recycled segments older than the redo point; the
+    /// resume scan therefore starts at the oldest segment still on disk (see
+    /// [`Self::discover_resume_lsn`]), so a `wal` directory whose numbering
+    /// does not start at segment 0 is handled correctly. Callers that know
+    /// the checkpoint redo LSN should prefer
+    /// [`Self::open_with_scan_start`]: the oldest retained segment can begin
+    /// with the tail bytes of a record that started in a recycled segment,
+    /// and only a guaranteed record boundary is a safe scan start.
     pub fn open(data_dir: impl AsRef<Path>, config: &StorageConfig) -> Result<Self> {
+        Self::open_with_scan_start(data_dir, config, Lsn::INVALID)
+    }
+
+    /// Open like [`Self::open`], but start the resume scan at
+    /// `scan_start_hint` when it is valid (e.g. the superblock's checkpoint
+    /// redo LSN — a guaranteed record boundary that lies inside the oldest
+    /// retained segment). Pass [`Lsn::INVALID`] to fall back to scanning
+    /// from the oldest segment on disk.
+    pub fn open_with_scan_start(
+        data_dir: impl AsRef<Path>,
+        config: &StorageConfig,
+        scan_start_hint: Lsn,
+    ) -> Result<Self> {
         let wal_dir = data_dir.as_ref().join("wal");
         let mut segment_manager = WalSegmentManager::open(&wal_dir, config.wal_segment_size)?;
 
@@ -66,7 +84,7 @@ impl WalWriter {
                 > 0;
 
         let start_lsn = if has_existing_records {
-            Self::discover_resume_lsn(&wal_dir, config.wal_segment_size)?
+            Self::discover_resume_lsn(&wal_dir, config.wal_segment_size, scan_start_hint)?
         } else {
             Lsn::FIRST
         };
@@ -166,8 +184,36 @@ impl WalWriter {
     /// complete record. Torn or partial records at the tail are discarded: the
     /// returned LSN points to the start of the torn record, allowing the next
     /// append to overwrite it.
-    fn discover_resume_lsn(wal_dir: &Path, segment_size: u64) -> Result<Lsn> {
-        let mut reader = WalReader::open_at(wal_dir, segment_size, Lsn::FIRST)?;
+    ///
+    /// Scan start selection (records may span segment boundaries):
+    ///
+    /// - `scan_start_hint` valid (the checkpoint redo LSN): use it. It is a
+    ///   guaranteed record boundary and lies inside the oldest retained
+    ///   segment (`recycle_before` keeps the segment containing it).
+    /// - Otherwise: the oldest segment still on disk. Checkpoints recycle
+    ///   segments older than the redo point, so segment 0 may be gone;
+    ///   starting at [`Lsn::FIRST`] would fail to open the missing file.
+    ///
+    /// Starting at the oldest segment's *boundary* when a hint is available
+    /// is NOT safe: the retained segment can begin with the tail bytes of a
+    /// record whose head lived in a recycled segment, and decoding those
+    /// orphan bytes either fails or — worse — is mistaken for the torn tail,
+    /// truncating every record that follows.
+    fn discover_resume_lsn(wal_dir: &Path, segment_size: u64, scan_start_hint: Lsn) -> Result<Lsn> {
+        let oldest = WalSegmentManager::discover_oldest_segment_id(wal_dir)?;
+        // Segment 0 begins at Lsn::FIRST (Lsn(0) is INVALID); later segments
+        // begin at their segment boundary.
+        let oldest_start = if oldest == 0 {
+            Lsn::FIRST
+        } else {
+            Lsn(oldest * segment_size)
+        };
+        let scan_start = if scan_start_hint.is_valid() && scan_start_hint > oldest_start {
+            scan_start_hint
+        } else {
+            oldest_start
+        };
+        let mut reader = WalReader::open_at(wal_dir, segment_size, scan_start)?;
         while reader.next_record()?.is_some() {}
         Ok(reader.current_lsn())
     }

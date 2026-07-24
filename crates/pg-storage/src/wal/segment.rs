@@ -185,6 +185,28 @@ impl WalSegmentManager {
         Ok(max_id.unwrap_or(0))
     }
 
+    /// Discover the oldest existing segment ID (the lowest `wal-*.log`
+    /// sequence number), or 0 if the directory has no segments.
+    ///
+    /// Checkpoints recycle segments older than the redo point, so segment 0
+    /// may not exist; recovery scans must start here, not at [`Lsn::FIRST`].
+    pub(crate) fn discover_oldest_segment_id(wal_dir: &Path) -> Result<u64> {
+        let mut min_id: Option<u64> = None;
+        if wal_dir.exists() {
+            for entry in fs::read_dir(wal_dir).map_err(StorageError::Io)? {
+                let entry = entry.map_err(StorageError::Io)?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id) = Self::parse_segment_id(&name) {
+                    if min_id.is_none_or(|m| id < m) {
+                        min_id = Some(id);
+                    }
+                }
+            }
+        }
+        Ok(min_id.unwrap_or(0))
+    }
+
     fn parse_segment_id(name: &str) -> Option<u64> {
         let name = name.strip_prefix("wal-")?.strip_suffix(".log")?;
         let one_based: u64 = name.parse().ok()?;
@@ -223,6 +245,27 @@ mod tests {
     fn wal_filename_is_one_based() {
         assert_eq!(wal_filename(0), "wal-00000001.log");
         assert_eq!(wal_filename(42), "wal-00000043.log");
+    }
+
+    #[test]
+    fn discover_oldest_segment_id_returns_lowest() {
+        let tmp = TempDir::new().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        fs::create_dir(&wal_dir).unwrap();
+        // Segment 0 and 1 recycled by a checkpoint; 2 and 4 remain.
+        File::create(wal_dir.join(wal_filename(2))).unwrap();
+        File::create(wal_dir.join(wal_filename(4))).unwrap();
+        assert_eq!(
+            WalSegmentManager::discover_oldest_segment_id(&wal_dir).unwrap(),
+            2
+        );
+
+        // No segments at all: recovery scans from segment 0.
+        let empty = TempDir::new().unwrap();
+        assert_eq!(
+            WalSegmentManager::discover_oldest_segment_id(empty.path()).unwrap(),
+            0
+        );
     }
 
     #[test]

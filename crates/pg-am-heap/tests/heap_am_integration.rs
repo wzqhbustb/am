@@ -533,10 +533,24 @@ fn scan_dead_tuples_is_relation_scoped() {
 
     // oldest_xmin past the deleter (xid 100) so both deletes count as dead.
     let dead_in_a = heap.scan_dead_tuples(rel_a, TxnId(1_000)).unwrap();
-    assert_eq!(dead_in_a, vec![dead_a], "relation A sees only its own dead tuple");
-    assert!(!dead_in_a.contains(&dead_b), "B's dead tuple must not leak into A");
+    assert_eq!(
+        dead_in_a,
+        vec![dead_a],
+        "relation A sees only its own dead tuple"
+    );
+    assert!(
+        !dead_in_a.contains(&dead_b),
+        "B's dead tuple must not leak into A"
+    );
 
     let dead_in_b = heap.scan_dead_tuples(rel_b, TxnId(1_000)).unwrap();
-    assert_eq!(dead_in_b, vec![dead_b], "relation B sees only its own dead tuple");
-    assert!(!dead_in_b.contains(&dead_a), "A's dead tuple must not leak into B");
+    assert_eq!(
+        dead_in_b,
+        vec![dead_b],
+        "relation B sees only its own dead tuple"
+    );
+    assert!(
+        !dead_in_b.contains(&dead_a),
+        "A's dead tuple must not leak into B"
+    );
 }

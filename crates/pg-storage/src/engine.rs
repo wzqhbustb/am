@@ -124,19 +124,11 @@ impl StorageEngine {
 
     /// Recover a storage engine from disk after a crash or clean shutdown.
     ///
-    /// Recovery follows the M1 procedure from `docs/phase1-m1-tech-selection.md`
-    /// §十一:
-    ///
-    /// 1. Read the superblock to obtain the redo point (`checkpoint_lsn`).
-    /// 2. Initialize the page allocator with the checkpointed `next_page_id`.
-    /// 3. Load the freelist snapshot (M1: always empty).
-    /// 4. Replay WAL from `checkpoint_lsn`:
-    ///    - `PageAlloc` advances `next_page_id`.
-    ///    - `FullPageImage` overwrites the data file page, repairing torn writes.
-    ///    - `CheckpointBegin` / `CheckpointEnd` are ignored (anchor state is
-    ///      already in the superblock).
-    ///    - A truncated or CRC-bad final record is treated as end-of-WAL.
-    /// 5. Open the WAL writer and buffer pool at the recovered state.
+    /// This is the convenience entry without extra redo handlers; see
+    /// [`Self::recover_with_redo_handlers`] for the full (Stage I) procedure.
+    /// Callers opening a data directory that may contain heap WAL records
+    /// must use [`Self::open_with_redo_handlers`] with the heap handlers
+    /// injected, or replay will fail on the unregistered record types.
     pub fn recover(data_dir: PathBuf, config: &StorageConfig) -> Result<Self> {
         Self::recover_with_redo_handlers(data_dir, config, Vec::new())
     }
@@ -160,13 +152,20 @@ impl StorageEngine {
         let checkpoint_lsn = superblock.checkpoint_lsn;
         info!(%checkpoint_lsn, "loaded superblock");
 
-        // 2. Open the WAL writer once. WalWriter::open scans the durable WAL and
-        //    resumes appending after the last complete record, so it is
-        //    consistent with the on-disk state. Replay itself writes no WAL
-        //    (redo is idempotent and, because the buffer pool's checkpoint_lsn
-        //    stays invalid during recovery, pin_mut emits no FPI), so opening it
+        // 2. Open the WAL writer once. WalWriter::open_with_scan_start scans
+        //    the durable WAL from the checkpoint redo point (a guaranteed
+        //    record boundary inside the oldest retained segment — the oldest
+        //    segment's boundary itself may cut through a record) and resumes
+        //    appending after the last complete record, so it is consistent
+        //    with the on-disk state. Replay itself writes no WAL (redo is
+        //    idempotent and, because the buffer pool's checkpoint_lsn stays
+        //    invalid during recovery, pin_mut emits no FPI), so opening it
         //    up front is safe and lets the allocator + buffer pool share it.
-        let wal_writer = Arc::new(WalWriter::open(&data_dir, config)?);
+        let wal_writer = Arc::new(WalWriter::open_with_scan_start(
+            &data_dir,
+            config,
+            checkpoint_lsn,
+        )?);
         let page_allocator = Arc::new(Mutex::new(PageAllocator::open_at(
             &data_dir,
             config,
@@ -238,6 +237,18 @@ impl StorageEngine {
             extra_redo_handlers,
         )?;
         page_allocator.lock().mark_recovery_complete();
+
+        // Seed the buffer pool's checkpoint_lsn from the superblock. Without
+        // this it stays INVALID until the first new checkpoint, and
+        // `pin_mut`'s FPI gate (checkpoint_lsn.is_valid()) means every page
+        // modification in that window goes without FPI protection — while
+        // the pages involved DO have on-disk images after a restart. A torn
+        // write there would leave a garbage pd_lsn that heap redo's
+        // idempotency check (page_pd_lsn >= record.lsn) reads as "already
+        // applied", skipping the record — silent corruption. Seeding the
+        // last checkpoint's LSN restores PG's post-recovery rule: first
+        // touch of any page whose pd_lsn predates that LSN writes an FPI.
+        buffer_pool.set_checkpoint_lsn(checkpoint_lsn);
 
         let superblock = Arc::new(Mutex::new(superblock));
         let checkpoint = CheckpointCoordinator::new(
@@ -723,6 +734,118 @@ mod tests {
                 assert_eq!(guard.page()[PAGE_HEADER_SIZE + 1], 0xCC);
             }
         }
+    }
+
+    /// Regression for the P0 bug where `WalWriter::open`'s resume scan
+    /// started at `Lsn::FIRST`: once WAL spanned more than one segment and a
+    /// checkpoint recycled the older ones, reopening the engine failed with
+    /// "No such file or directory" — the database could not start.
+    ///
+    /// The second phase additionally guards the follow-up bug: the resume
+    /// scan must not start at the oldest retained segment's *boundary*,
+    /// because that boundary can cut through a record (records span
+    /// segments). With 40-byte PageAlloc records and 4096-byte segments,
+    /// segment 1's boundary (byte 4096) falls in the middle of record #102
+    /// (bytes 4088..4128); a boundary-start scan would misread the orphan
+    /// tail as the end of the WAL and truncate every record after it.
+    #[test]
+    fn reopen_after_wal_segment_recycle() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp = tmp_dir.path();
+        let mut config = StorageConfig::new(tmp);
+        config.wal_segment_size = 4096; // tiny segments to force recycling
+
+        let written;
+        let begin_lsn;
+        {
+            let engine = StorageEngine::open(tmp, &config).unwrap();
+            // 150 PageAlloc records (~40 B each) put the checkpoint begin_lsn
+            // into segment 1, whose boundary cuts through record #102.
+            for _ in 0..150 {
+                let mut guard = engine.buffer_pool().new_page().unwrap();
+                guard.page_mut()[PAGE_HEADER_SIZE] = 0xAB;
+            }
+            written = engine.page_allocator().lock().next_page_id();
+            // Checkpoint recycles every segment before its begin_lsn.
+            begin_lsn = engine.trigger_checkpoint().unwrap();
+            engine.shutdown();
+        }
+
+        // Segment 0 must be gone, or this test exercises nothing.
+        assert!(
+            !tmp.join("wal").join("wal-00000001.log").exists(),
+            "segment 0 was not recycled; test is vacuous"
+        );
+
+        // Reopen must succeed and the data must be intact.
+        let engine = StorageEngine::open(tmp, &config).unwrap();
+        assert_eq!(engine.page_allocator().lock().next_page_id(), written);
+        let guard = engine.buffer_pool().pin(PageId(1)).unwrap();
+        assert_eq!(guard.page()[PAGE_HEADER_SIZE], 0xAB);
+
+        // The resume scan must have found the true end of the WAL: a new
+        // append belongs AFTER the checkpoint records, not at the recycled
+        // segment's boundary (which would overwrite them).
+        let appended = engine
+            .wal_writer()
+            .append(crate::wal::record::WalRecord::checkpoint_begin())
+            .unwrap();
+        assert!(
+            appended > begin_lsn,
+            "resume scan truncated the WAL: appended at {appended}, checkpoint began at {begin_lsn}"
+        );
+    }
+
+    /// P1-1 regression: after a restart, the buffer pool's checkpoint_lsn
+    /// must be seeded from the superblock, so the first modification of an
+    /// on-disk page writes an FPI. Before the fix, checkpoint_lsn stayed
+    /// INVALID until the first new checkpoint and post-recovery
+    /// modifications went without torn-write protection.
+    #[test]
+    fn recover_seeds_buffer_pool_checkpoint_lsn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = StorageConfig::new(tmp.path());
+
+        // Create a page, checkpoint (page is durable on disk), shut down.
+        {
+            let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+            {
+                let mut guard = engine.buffer_pool().new_page().unwrap();
+                guard.page_mut()[PAGE_HEADER_SIZE] = 0x5A;
+                // The guard must drop BEFORE the checkpoint: it holds the
+                // frame's content write lock, and flush_frame would block on
+                // content.read forever (self-deadlock).
+            }
+            engine.trigger_checkpoint().unwrap();
+            engine.shutdown();
+        }
+
+        // Reopen and modify the on-disk page: with the seeded checkpoint_lsn
+        // this must write an FPI.
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        {
+            let mut guard = engine.buffer_pool().pin_mut(PageId(1)).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE + 1] = 0x01;
+        }
+
+        // Exactly one FullPageImage record in the WAL (nothing before the
+        // reopen could have produced one: new pages skip FPI, checkpoints do
+        // not write them).
+        let mut reader = crate::wal::reader::WalReader::open(
+            tmp.path().join("wal"),
+            config.wal_segment_size,
+        )
+        .unwrap();
+        let mut fpi_count = 0;
+        while let Some(record) = reader.next_record().unwrap() {
+            if record.record_type == crate::wal::record::WalRecordType::FullPageImage {
+                fpi_count += 1;
+            }
+        }
+        assert_eq!(
+            fpi_count, 1,
+            "first post-recovery modification must write an FPI (got {fpi_count})"
+        );
     }
 
     #[test]

@@ -340,7 +340,7 @@ Heap AM 编译期就依赖它。
 | `RedoRegistry` 注册 | Heap AM 在 `Engine::open` 时把 3 个 handler 注册；duplicate 触发 panic 单测 |
 | 跨 record 幂等 crash test | `test_fpi_then_heap_record_idempotent`：FPI(page,lsn=100) → HeapInsert(page,lsn=200) → 崩溃 → 重放两条 → 再崩溃 → 重放两条，断言 `page_pd_lsn == 200` 且 tuple 内容一致（验证 FPI handler 的 `set_page_pd_lsn(&mut image, record.lsn)` patching 与后续 record 的比较逻辑一致，不会因 image 内旧 pd_lsn 引发死锁式重放） |
 | 关闭 Stage D 遗留 FPI 窗口 | Stage D 保守偏差：同一驻留内跨 checkpoint 边界的第二次修改**不补 FPI**（`needs_fpi` 只在 evict/reload 重置）。本 stage 让 heap 写路径在每次 checkpoint 后重新检查"page.pd_lsn < checkpoint_lsn"，跨边界即强制写 FPI；补 `test_fpi_across_checkpoint_boundary`（驻留期间连续两次 checkpoint 后修改，crash-restart 数据完整） |
-| 集成测试 | INSERT 100 万条 + kill -9 + restart → 数据完全一致；abort 事务 tuple 在下轮 SELECT 中不可见（xmin ABORTED via CLOG） |
+| 集成测试 | INSERT + kill -9 + restart → 数据一致（本 stage 交付小规模版本：~10 行 + `mem::forget` 模拟崩溃）。**两条子项移交**：① 100 万行级 + 真 kill -9 全量一致性 → Stage K（HeapAM 页目录为纯内存结构，溢出页映射需 catalog relfilenode 持久化后才能诚实验收）；② abort 事务 tuple 在下轮 SELECT 中不可见（xmin ABORTED via CLOG）→ Stage J（M2a 此时只有 NoOpClogAccessor，恒 committed，无法判定 abort） |
 
 **关键 v2.3 约束**：
 - §14 P0-2：`insert` 返回 `Result<()>` 由 `out_tid` 回填

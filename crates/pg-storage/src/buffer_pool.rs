@@ -449,8 +449,30 @@ impl BufferPool {
 
         // Double-check: another thread may have loaded the page while we were
         // waiting for the allocation lock.
-        if let Some(frame_id) = self.try_pin_resident(page_id) {
-            return Ok(frame_id);
+        //
+        // `try_pin_resident` fails *spuriously* when the frame's meta lock is
+        // momentarily contended — the page may well be resident. Proceeding
+        // to `shard.insert` in that case would overwrite the live mapping and
+        // create a second frame for the same page_id (two copies of the page
+        // evolving independently: duplicate slots, lost writes). So before
+        // allocating a new frame we consult the page table itself:
+        //
+        // - Page present in the table: it is resident and will become
+        //   pinnable as soon as the meta lock is released. Eviction cannot be
+        //   in flight (`evict_frame` runs entirely under this same
+        //   allocation lock), and the current meta holder never needs the
+        //   allocation lock to release, so this retry loop terminates.
+        // - Page absent from the table: nobody else can insert a mapping
+        //   (all inserts happen under this lock), so it is safe to allocate.
+        loop {
+            if let Some(frame_id) = self.try_pin_resident(page_id) {
+                return Ok(frame_id);
+            }
+            let shard_idx = self.shard_index(page_id);
+            if !self.page_table[shard_idx].lock().contains_key(&page_id) {
+                break;
+            }
+            std::thread::yield_now();
         }
 
         let frame_id = self.evict_frame()?;
@@ -618,6 +640,20 @@ impl BufferPool {
             return Err(e);
         }
         let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // Mark needs_fpi BEFORE releasing the content lock. The page now has
+        // an on-disk image (the write is issued; durability follows from the
+        // fsync below or a later one), so a subsequent modification in a
+        // later checkpoint cycle must be preceded by an FPI (torn-write
+        // protection). This is what closes the cross-checkpoint window for
+        // pages that stay RESIDENT across a checkpoint (never evicted):
+        // eviction+reload sets needs_fpi via locate_or_load, but an in-place
+        // checkpoint flush keeps the page resident, so flush must mark it
+        // here. Doing it before `drop(content)` also closes the race where a
+        // pin_mut slipping in after the drop would observe needs_fpi ==
+        // false and modify the page WITHOUT an FPI. (content.read → meta is
+        // the sanctioned nesting order, same as pin_mut.)
+        self.frames[frame_id.0].meta.lock().needs_fpi = true;
         drop(content);
 
         // Group-fsync coalescing: skip if a concurrent sync already covers us.
@@ -629,14 +665,6 @@ impl BufferPool {
             }
             self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
         }
-
-        // The page now has an on-disk image, so a subsequent modification in a
-        // later checkpoint cycle must be preceded by an FPI (torn-write
-        // protection). This is what closes the cross-checkpoint window for pages
-        // that stay RESIDENT across a checkpoint (never evicted): eviction+reload
-        // sets needs_fpi via locate_or_load, but an in-place checkpoint flush
-        // keeps the page resident, so flush must mark it here.
-        self.frames[frame_id.0].meta.lock().needs_fpi = true;
 
         Ok(())
     }

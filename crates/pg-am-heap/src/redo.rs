@@ -66,7 +66,16 @@ impl RedoHandler for HeapInsertHandler {
         }
         SlottedPage::init_if_fresh(page);
         let slot = SlottedPage::add_tuple(page, &rec.tuple_bytes).map_err(heap_to_storage)?;
-        debug_assert_eq!(slot, rec.slot_id, "HeapInsert redo slot diverged");
+        // Slot divergence means the page on disk is inconsistent with the
+        // WAL stream (e.g. torn base page). Hard-fail rather than silently
+        // writing the tuple to the wrong slot (§11.6: redo never skips
+        // silently).
+        if slot != rec.slot_id {
+            return Err(StorageError::MetadataCorrupted(format!(
+                "HeapInsert redo slot diverged: record expects slot {}, page gives {slot}",
+                rec.slot_id
+            )));
+        }
         stamp_pd_lsn(page, record.lsn);
         Ok(())
     }
@@ -99,7 +108,12 @@ impl RedoHandler for HeapUpdateHandler {
                 stamp_deleted(page, rec.old_tid, rec.xmax_old, true).map_err(heap_to_storage)?;
                 let slot =
                     SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
-                debug_assert_eq!(slot, rec.new_tid.slot_id, "HeapUpdate redo slot diverged");
+                if slot != rec.new_tid.slot_id {
+                    return Err(StorageError::MetadataCorrupted(format!(
+                        "HeapUpdate redo slot diverged: record expects slot {}, page gives {slot}",
+                        rec.new_tid.slot_id
+                    )));
+                }
                 stamp_pd_lsn(page, record.lsn);
             }
             return Ok(());
@@ -130,7 +144,12 @@ impl RedoHandler for HeapUpdateHandler {
                 SlottedPage::init_if_fresh(page);
                 let slot =
                     SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
-                debug_assert_eq!(slot, rec.new_tid.slot_id, "HeapUpdate redo slot diverged");
+                if slot != rec.new_tid.slot_id {
+                    return Err(StorageError::MetadataCorrupted(format!(
+                        "HeapUpdate redo slot diverged: record expects slot {}, page gives {slot}",
+                        rec.new_tid.slot_id
+                    )));
+                }
                 stamp_pd_lsn(page, record.lsn);
             }
         }
