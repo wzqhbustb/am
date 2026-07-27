@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pg_storage::buffer_pool::{BufferPool, PageGuardMut};
-use pg_storage::clog::{ClogAccessor, NoOpClogAccessor, TxnState};
+use pg_storage::clog::{ClogAccessor, TxnState};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn, PAGE_HEADER_SIZE};
 use pg_storage::recovery::RedoHandler;
 use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId, PAGE_SIZE};
@@ -202,11 +202,18 @@ impl AccessMethod for HeapAM {
     fn insert(&self, ctx: InsertContext<'_>) -> Result<()> {
         let InsertContext {
             rel,
-            snapshot: _,
+            snapshot,
             tuple,
             out_tid,
         } = ctx;
         Self::validate_tuple_len(tuple)?;
+        // A tuple written with an INVALID writer XID would be invisible to
+        // every scan forever (`is_effectively_committed` rejects INVALID on
+        // sight) — a silent dead row. That is always a caller bug; catch it.
+        debug_assert!(
+            snapshot.current_xid != pg_storage::types::TxnId::INVALID,
+            "heap insert with INVALID current_xid produces an unreadable tuple"
+        );
 
         let needed = tuple.len() + LINE_POINTER_SIZE;
         let mut guard = self.acquire_page_with_room(&rel, needed, PageId::INVALID)?;
@@ -216,7 +223,7 @@ impl AccessMethod for HeapAM {
         // add_tuple always appends on a heap page (no Unused slots to recycle),
         // so the slot is known before the mutation — build the WAL record first.
         let slot = SlottedPage::slot_count(page) as u16;
-        let rec = WalRecord::heap_insert(page_id, slot, tuple.to_vec())?;
+        let rec = WalRecord::heap_insert(page_id, slot, tuple.to_vec(), snapshot.current_xid)?;
         let lsn = self.wal_writer.append(rec)?;
         let actual = SlottedPage::add_tuple(page, tuple)?;
         debug_assert_eq!(actual, slot, "heap slot prediction diverged from add_tuple");
@@ -232,7 +239,7 @@ impl AccessMethod for HeapAM {
     }
 
     fn scan(&self, ctx: ScanContext<'_>) -> Result<Vec<(Tid, Vec<Option<crate::tuple::Datum>>)>> {
-        let clog = NoOpClogAccessor;
+        let clog = ctx.clog;
         let mut out = Vec::new();
         for page_id in self.relation_pages(&ctx.rel) {
             let guard = self.buffer_pool.pin(page_id)?;
@@ -247,7 +254,7 @@ impl AccessMethod for HeapAM {
                     continue;
                 };
                 let (header, values) = decode_tuple(bytes, ctx.rel.columns)?;
-                if is_visible(header.t_xmin, header.t_xmax, ctx.snapshot, &clog) {
+                if is_visible(header.t_xmin, header.t_xmax, ctx.snapshot, clog) {
                     out.push((
                         Tid {
                             page_id,
@@ -279,7 +286,7 @@ impl AccessMethod for HeapAM {
             }
         }
 
-        let rec = WalRecord::heap_delete(tid, xmax)?;
+        let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
         let lsn = self.wal_writer.append(rec)?;
         Self::stamp_deleted(page, tid, xmax, false)?;
         stamp_pd_lsn(page, lsn);
@@ -334,7 +341,7 @@ impl UpdatableAM for HeapAM {
                 page_id,
                 slot_id: new_slot,
             };
-            let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.to_vec())?;
+            let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.to_vec(), xmax)?;
             let lsn = self.wal_writer.append(rec)?;
             Self::stamp_deleted(old_page, old_tid, xmax, true)?;
             let actual = SlottedPage::add_tuple(old_page, new_tuple)?;
@@ -360,7 +367,7 @@ impl UpdatableAM for HeapAM {
             slot_id: new_slot,
         };
 
-        let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.to_vec())?;
+        let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.to_vec(), xmax)?;
         let lsn = self.wal_writer.append(rec)?;
 
         {
@@ -383,14 +390,26 @@ impl UpdatableAM for HeapAM {
 }
 
 impl Vacuumable for HeapAM {
-    fn scan_dead_tuples(&self, rel: RelationDesc<'_>, oldest_xmin: TxnId) -> Result<Vec<Tid>> {
-        // A dead tuple is one whose deleter (`t_xmax`) is committed and older
-        // than `oldest_xmin`, so no live snapshot can still see the row. M2a
-        // reads committed state from NoOpClogAccessor (every XID committed), so
-        // the effective test is `t_xmax` set and `< oldest_xmin`; Stage J's real
-        // CLOG makes the aborted-deleter case observable. Only the tuple header
-        // is needed (t_xmax lives at a fixed offset), so no schema is required.
-        let clog = NoOpClogAccessor;
+    fn scan_dead_tuples(
+        &self,
+        rel: RelationDesc<'_>,
+        oldest_xmin: TxnId,
+        clog: &dyn ClogAccessor,
+    ) -> Result<Vec<Tid>> {
+        // A dead tuple is one of:
+        //
+        // 1. **Aborted inserter** (`t_xmin` aborted): the row was never
+        //    visible to anyone and never will be, so it is dead regardless of
+        //    `oldest_xmin`. Stage J made this reachable — before real aborts
+        //    existed, no such rows could be produced. PG's vacuum reclaims
+        //    aborted-insert tuples by the same rule.
+        // 2. **Committed deleter** (`t_xmax` committed and older than
+        //    `oldest_xmin`): no live snapshot can still see the row.
+        //
+        // The caller-supplied `clog` decides committedness authoritatively: a
+        // tuple whose deleter aborted is NOT dead (the delete never took
+        // effect). Only the tuple header is needed (xmin/xmax live at fixed
+        // offsets), so no schema is required.
         let page_ids = self.relation_pages(&rel);
 
         let mut dead = Vec::new();
@@ -405,7 +424,29 @@ impl Vacuumable for HeapAM {
                 let Some(bytes) = SlottedPage::tuple(page, slot)? else {
                     continue;
                 };
-                let header = TupleHeader::read_from(bytes)?;
+                let header = match TupleHeader::read_from(bytes) {
+                    Ok(h) => h,
+                    // A single corrupted tuple must not abort the whole scan:
+                    // vacuum is a background maintenance pass, so skip the
+                    // unreadable slot and keep going (the corruption itself is
+                    // surfaced loudly via the log).
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            %page_id,
+                            slot,
+                            "scan_dead_tuples: skipping undecodable tuple"
+                        );
+                        continue;
+                    }
+                };
+                if clog.get_state(header.t_xmin) == TxnState::Aborted {
+                    dead.push(Tid {
+                        page_id,
+                        slot_id: slot,
+                    });
+                    continue;
+                }
                 let xmax = header.t_xmax;
                 if xmax != TxnId::INVALID
                     && xmax.0 < oldest_xmin.0

@@ -33,6 +33,7 @@ pub mod page_allocator;
 pub mod positioned_file;
 pub mod recovery;
 pub mod superblock;
+pub mod txn_id;
 pub mod types;
 pub mod wal;
 

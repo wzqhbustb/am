@@ -154,18 +154,27 @@ impl PageAllocator {
         //    reopen.
         self.ensure_data_file_capacity(page_id)?;
 
-        // 2. Write the allocation to the WAL and explicitly fsync it before
-        //    updating in-memory state. (append() no longer fsyncs implicitly;
-        //    this flush_to preserves the WAL-before-data invariant for page
-        //    allocation.)
+        // 2. Append the allocation to the WAL. This is append-only: the record
+        //    bytes are written to the segment file synchronously, but the fsync
+        //    is deferred to the group-commit worker (or an explicit flush at
+        //    transaction commit / checkpoint). We deliberately do NOT
+        //    `flush_to` here.
         //
-        // TODO(M2): batch page_alloc flushes at transaction commit time. When
-        // the transaction manager batches multiple operations, the per-page
-        // flush_to can be deferred to commit, amortizing fsync latency across
-        // bulk allocations (e.g. CREATE TABLE with many pages).
+        //    Durability is still correct:
+        //    - WAL-before-data: `BufferPool::flush_frame` flushes the WAL up to
+        //      the page's `pd_lsn` before writing the page to the data file.
+        //      Since the LSN clock is monotonic, that flush covers this
+        //      `PageAlloc` record (whose LSN precedes any modification LSN),
+        //      so a durable data page is always backed by a durable PageAlloc.
+        //    - Torn/lost-extension safety: `ensure_data_file_capacity` may have
+        //      extended (and fsynced) the data file above. If we crash before
+        //      the PageAlloc is fsynced, the extra space is a harmless leaked
+        //      page on reopen — never corruption.
+        //    - Commit batching: `TxnManager::commit_txn` issues a single
+        //      `flush_to` that amortizes every deferred alloc fsync accumulated
+        //      during the transaction into one syscall.
         let record = WalRecord::page_alloc(page_id)?;
-        let alloc_lsn = self.wal_writer.append(record)?;
-        self.wal_writer.flush_to(alloc_lsn)?;
+        self.wal_writer.append(record)?;
 
         // 3. Update allocator state.
         if page_id == self.next_page_id {
@@ -181,12 +190,15 @@ impl PageAllocator {
 
     /// Free a page.
     ///
-    /// Writes a `PageFree` WAL record, fsyncs it, then pushes `page_id` onto
-    /// the freelist so future `alloc_page` calls can reuse it.
+    /// Appends a `PageFree` WAL record, then pushes `page_id` onto the freelist
+    /// so future `alloc_page` calls can reuse it.
     ///
-    /// The WAL record is fsynced before the in-memory state is updated, matching
-    /// `alloc_page`'s WAL-before-data discipline: if we crash before the WAL is
-    /// durable, the page simply remains allocated (no corruption).
+    /// Like `alloc_page`, this is append-only: the fsync is deferred to the
+    /// group-commit worker or an explicit commit/checkpoint flush. If we crash
+    /// before the record is durable, the page simply remains allocated (no
+    /// corruption): recovery never sees the free, and the page stays owned by
+    /// whatever allocated it. When the free *is* recovered, `apply_page_free`
+    /// rebuilds the freelist entry idempotently.
     pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
         if page_id == PageId::INVALID {
             return Err(StorageError::InvalidOperation(
@@ -206,8 +218,7 @@ impl PageAllocator {
         }
 
         let record = WalRecord::page_free(page_id)?;
-        let free_lsn = self.wal_writer.append(record)?;
-        self.wal_writer.flush_to(free_lsn)?;
+        self.wal_writer.append(record)?;
 
         self.freelist.push(page_id);
         Ok(())

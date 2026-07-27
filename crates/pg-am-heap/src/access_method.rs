@@ -10,6 +10,7 @@
 //! relation's physical location and column schema are supplied explicitly via
 //! [`RelationDesc`] rather than resolved from the catalog.
 
+use pg_storage::clog::ClogAccessor;
 use pg_storage::recovery::RedoHandler;
 use pg_storage::types::{Oid, PageId, Tid, TxnId};
 use pg_txn::Snapshot;
@@ -51,6 +52,11 @@ pub struct ScanContext<'a> {
     pub rel: RelationDesc<'a>,
     /// Snapshot controlling tuple visibility.
     pub snapshot: &'a Snapshot,
+    /// Commit-status oracle. A tuple whose `t_xmin` aborted (or is otherwise
+    /// not committed) must not be yielded; the real CLOG makes that decision
+    /// observable. M1 callers may pass `&NoOpClogAccessor` (every XID reads as
+    /// committed) to preserve legacy behavior.
+    pub clog: &'a dyn ClogAccessor,
 }
 
 /// Inputs to [`UpdatableAM::update`].
@@ -137,5 +143,14 @@ pub trait Vacuumable {
     /// Scan `rel` for dead tuples whose `xmax` is committed and older than
     /// `oldest_xmin`. Scoped to a single relation so callers (e.g. an M3
     /// autovacuum worker) need not filter results by OID.
-    fn scan_dead_tuples(&self, rel: RelationDesc<'_>, oldest_xmin: TxnId) -> Result<Vec<Tid>>;
+    ///
+    /// `clog` decides whether a deleter committed: a tuple deleted by an
+    /// aborted transaction is NOT dead (the delete never took effect), so the
+    /// committed check is authoritative rather than assumed.
+    fn scan_dead_tuples(
+        &self,
+        rel: RelationDesc<'_>,
+        oldest_xmin: TxnId,
+        clog: &dyn ClogAccessor,
+    ) -> Result<Vec<Tid>>;
 }

@@ -18,6 +18,9 @@ pg-txn = { path = "../pg-txn" }
 # error types
 thiserror = "2"
 
+# logging / tracing (warnings on skipped corrupt tuples in vacuum scans)
+tracing = "0.1"
+
 # serialization
 serde = { version = "1", features = ["derive"] }
 
@@ -42,4 +45,8 @@ harness = false
 
 [[bench]]
 name = "heap_insert"
+harness = false
+
+[[bench]]
+name = "txn_commit_concurrent"
 harness = false

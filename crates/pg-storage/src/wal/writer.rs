@@ -35,6 +35,12 @@ struct WriterState {
     synced_lsn: Lsn,
     pending: usize,
     last_flush: Instant,
+    /// Set by `flush_to` when a caller is blocked waiting for durability; makes
+    /// the worker fsync immediately instead of waiting out the group-commit
+    /// batch/timeout thresholds (which would add up to `timeout_ms` of latency
+    /// to every synchronous commit — or hang forever if the thresholds are
+    /// configured out of reach).
+    flush_requested: bool,
     shutdown: bool,
     last_error: Option<String>,
 }
@@ -159,6 +165,7 @@ impl WalWriter {
             // passes `Lsn::INVALID`.
             synced_lsn: initial_synced_lsn,
             pending: 0,
+            flush_requested: false,
             last_flush: Instant::now(),
             shutdown: false,
             last_error: None,
@@ -348,8 +355,10 @@ impl WalWriter {
             return Ok(());
         }
 
-        // Wake the worker so it flushes immediately rather than waiting for the
-        // timeout.
+        // Ask the worker to fsync immediately rather than waiting for the
+        // group-commit batch/timeout thresholds: a blocked flush_to caller is
+        // a synchronous durability request (e.g. a commit).
+        state.flush_requested = true;
         self.cond.notify_one();
 
         while state.synced_lsn < lsn {
@@ -359,6 +368,13 @@ impl WalWriter {
                     "wal writer shut down".to_string(),
                 ));
             }
+            // Re-assert the request on every iteration: the worker clears
+            // `flush_requested` after each fsync wave, and this caller may not
+            // have been covered by that wave (e.g. its record landed in a
+            // segment rotated past mid-fsync). Without re-asserting, the
+            // waiter could sleep until the next group-commit timeout.
+            state.flush_requested = true;
+            self.cond.notify_one();
             self.cond.wait(&mut state);
         }
         Ok(())
@@ -367,6 +383,17 @@ impl WalWriter {
     /// Return the latest LSN that has been fsynced to disk.
     pub fn synced_lsn(&self) -> Lsn {
         self.inner.lock().synced_lsn
+    }
+
+    /// Return the current end-of-WAL LSN: the byte immediately following the
+    /// last record handed out by the clock, whether or not it is fsynced yet.
+    ///
+    /// Unlike [`Self::synced_lsn`], this reflects appended-but-not-yet-durable
+    /// records. It is the right bound for `checkpoint_lsn` (which gates FPIs on
+    /// "modified since the last checkpoint" and does not require durability of
+    /// the boundary itself).
+    pub fn current_lsn(&self) -> Lsn {
+        self.inner.lock().lsn_clock.current()
     }
 
     /// Reserve a contiguous chunk of LSN space without writing any record.
@@ -420,7 +447,8 @@ impl WalWriter {
             }
 
             let should_flush = state.pending > 0
-                && (state.pending >= config.wal_group_commit_batch_size
+                && (state.flush_requested
+                    || state.pending >= config.wal_group_commit_batch_size
                     || state.last_flush.elapsed() >= timeout);
 
             if !should_flush && !state.shutdown {
@@ -436,25 +464,62 @@ impl WalWriter {
                 continue;
             }
 
-            // Perform the fsync. On failure record the error, mark the writer
-            // as shut down, and wake all waiters. The worker exits so that it
-            // does not retry fsync on a potentially corrupted state; subsequent
-            // appends will fail with the recorded error.
+            // Capture what this fsync wave covers, dup the current segment
+            // file, then RELEASE the state lock before fsyncing: the fsync
+            // (milliseconds on consumer SSDs / macOS F_FULLFSYNC) must not
+            // serialize appends behind it — group-commit throughput comes
+            // precisely from appends flowing while one fsync covers a whole
+            // wave of waiters.
+            let cover_lsn = state.lsn_clock.current();
+            let cover_segment = state.segment_manager.current_segment_id();
+            let cover_pending = state.pending;
+            let sync_file = match state.segment_manager.current_file().try_clone() {
+                Ok(f) => f,
+                Err(e) => {
+                    state.last_error = Some(format!("wal dup-for-fsync failed: {e}"));
+                    state.shutdown = true;
+                    cond.notify_all();
+                    break;
+                }
+            };
+            drop(state);
+
+            // Perform the fsync WITHOUT holding the lock. fsync operates on
+            // the file (inode), not the fd, so the dup'd handle covers every
+            // byte appended through the original before the call. On failure
+            // record the error, mark the writer as shut down, and wake all
+            // waiters. The worker exits so that it does not retry fsync on a
+            // potentially corrupted state; subsequent appends will fail with
+            // the recorded error.
             //
             // TODO(M2+): there is no recovery path today. Future work could
             // reopen/rotate the segment or surface the error to the caller for
             // a higher-level decision.
-            if let Err(e) = state.segment_manager.current_file().sync_all() {
+            let fsync_result = sync_file.sync_all();
+
+            let mut state = inner.lock();
+            if let Err(e) = fsync_result {
                 state.last_error = Some(format!("wal fsync failed: {e}"));
                 state.shutdown = true;
                 cond.notify_all();
                 break;
             }
 
-            // Fsync succeeded: clear any transient error and advance synced_lsn.
+            // Fsync succeeded: clear any transient error and advance
+            // synced_lsn. If appends rotated to a newer segment while we were
+            // fsyncing lock-free, only the end of the fsynced segment is
+            // provably durable (rotation itself fsyncs the old segment's
+            // tail, so that end point is solid); otherwise everything up to
+            // `cover_lsn` is durable.
+            let durable = if state.segment_manager.current_segment_id() == cover_segment {
+                cover_lsn
+            } else {
+                Lsn((cover_segment + 1) * state.segment_manager.segment_size())
+            };
             state.last_error = None;
-            state.synced_lsn = state.lsn_clock.current();
-            state.pending = 0;
+            state.synced_lsn = state.synced_lsn.max(durable);
+            state.pending -= cover_pending;
+            state.flush_requested = false;
             state.last_flush = Instant::now();
             cond.notify_all();
         }

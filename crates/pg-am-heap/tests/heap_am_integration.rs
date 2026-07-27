@@ -9,6 +9,7 @@ use pg_am_heap::access_method::{
 use pg_am_heap::tuple::{encode_tuple, ColumnType, Datum, TupleHeader};
 use pg_am_heap::{heap_redo_handlers, HeapAM};
 
+use pg_storage::clog::NoOpClogAccessor;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::types::{Oid, PageId, Tid, TxnId};
@@ -94,6 +95,7 @@ fn insert_scan_roundtrip() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), n as usize);
@@ -151,6 +153,7 @@ fn update_then_delete_visibility() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), 1, "only the new version is visible");
@@ -169,6 +172,7 @@ fn update_then_delete_visibility() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert!(rows.is_empty(), "deleted row must be invisible");
@@ -231,6 +235,7 @@ fn heap_crash_recovery_after_update() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), 1, "the updated row must survive the crash");
@@ -280,6 +285,7 @@ fn heap_crash_recovery() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), 8, "all inserted rows must survive the crash");
@@ -362,6 +368,7 @@ fn heap_cross_page_update_crash_recovery() {
             .scan(ScanContext {
                 rel: rel(first_page, 2),
                 snapshot: &scan_snap,
+                clog: &NoOpClogAccessor,
             })
             .unwrap();
         assert_eq!(rows.len(), 2);
@@ -389,6 +396,7 @@ fn heap_cross_page_update_crash_recovery() {
         .scan(ScanContext {
             rel: rel(first_page, 2),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(
@@ -461,6 +469,7 @@ fn rejected_delete_leaves_no_poison_wal_record() {
         .scan(ScanContext {
             rel: rel(first_page, 1),
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), 1, "the untouched row must survive recovery");
@@ -532,7 +541,9 @@ fn scan_dead_tuples_is_relation_scoped() {
     let dead_b = dead(rel_b, 100);
 
     // oldest_xmin past the deleter (xid 100) so both deletes count as dead.
-    let dead_in_a = heap.scan_dead_tuples(rel_a, TxnId(1_000)).unwrap();
+    let dead_in_a = heap
+        .scan_dead_tuples(rel_a, TxnId(1_000), &NoOpClogAccessor)
+        .unwrap();
     assert_eq!(
         dead_in_a,
         vec![dead_a],
@@ -543,7 +554,9 @@ fn scan_dead_tuples_is_relation_scoped() {
         "B's dead tuple must not leak into A"
     );
 
-    let dead_in_b = heap.scan_dead_tuples(rel_b, TxnId(1_000)).unwrap();
+    let dead_in_b = heap
+        .scan_dead_tuples(rel_b, TxnId(1_000), &NoOpClogAccessor)
+        .unwrap();
     assert_eq!(
         dead_in_b,
         vec![dead_b],

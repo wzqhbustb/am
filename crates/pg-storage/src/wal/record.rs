@@ -184,6 +184,29 @@ pub struct HeapDeleteRecord {
     pub xmax: TxnId,
 }
 
+/// Payload for a `TxnCommit` record: the transaction whose commit is durable.
+///
+/// Per the Commit hard-order rule (§3 P1-5), this record is fsynced *before*
+/// the in-memory CLOG bit flips to `Committed`, so recovery can rebuild the
+/// CLOG authoritatively from the WAL: a present `TxnCommit` means the XID is
+/// committed regardless of any hint bits on data pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnCommitRecord {
+    /// The transaction that committed.
+    pub xid: TxnId,
+}
+
+/// Payload for a `TxnAbort` record: the transaction whose abort is durable.
+///
+/// ABORTED entries are never garbage-collected (v2.3-2): a missing CLOG entry
+/// after recovery must never be silently treated as committed, so an explicit
+/// `TxnAbort` record anchors the aborted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnAbortRecord {
+    /// The transaction that aborted.
+    pub xid: TxnId,
+}
+
 impl HeapInsertRecord {
     /// Decode a `HeapInsert` payload. Exposed so out-of-crate redo handlers
     /// (`pg-am-heap`) can deserialize without the internal bincode config.
@@ -205,6 +228,24 @@ impl HeapUpdateRecord {
 
 impl HeapDeleteRecord {
     /// Decode a `HeapDelete` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl TxnCommitRecord {
+    /// Decode a `TxnCommit` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl TxnAbortRecord {
+    /// Decode a `TxnAbort` payload (see [`HeapInsertRecord::decode`]).
     pub fn decode(payload: &[u8]) -> Result<Self> {
         Ok(bincode::serde::decode_from_slice(payload, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?
@@ -268,8 +309,19 @@ impl WalRecord {
         Self::new(WalRecordType::CheckpointBegin, Vec::new())
     }
 
-    /// Create a `HeapInsert` record.
-    pub fn heap_insert(page_id: PageId, slot_id: u16, tuple_bytes: Vec<u8>) -> Result<Self> {
+    /// Create a `HeapInsert` record stamped with the inserting `xid`.
+    ///
+    /// `xid` is written to the record header (`txn_id`) so recovery's XID
+    /// high-water scan counts heap mutations, not just Txn commit/abort
+    /// records. Without this, an XID that inserted a tuple but crashed before
+    /// committing could be reused after restart, and the reuser's commit would
+    /// make the orphaned tuple (xmin = reused XID) phantom-visible.
+    pub fn heap_insert(
+        page_id: PageId,
+        slot_id: u16,
+        tuple_bytes: Vec<u8>,
+        xid: TxnId,
+    ) -> Result<Self> {
         let payload = bincode::serde::encode_to_vec(
             HeapInsertRecord {
                 page_id,
@@ -279,15 +331,19 @@ impl WalRecord {
             bincode_config(),
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::HeapInsert, payload))
+        let mut rec = Self::new(WalRecordType::HeapInsert, payload);
+        rec.txn_id = xid;
+        Ok(rec)
     }
 
-    /// Create a `HeapUpdate` record (logical delete-old + insert-new).
+    /// Create a `HeapUpdate` record (logical delete-old + insert-new) stamped
+    /// with the updating `xid` (see [`Self::heap_insert`] for why).
     pub fn heap_update(
         old_tid: Tid,
         new_tid: Tid,
         xmax_old: TxnId,
         new_tuple_bytes: Vec<u8>,
+        xid: TxnId,
     ) -> Result<Self> {
         let payload = bincode::serde::encode_to_vec(
             HeapUpdateRecord {
@@ -299,15 +355,42 @@ impl WalRecord {
             bincode_config(),
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::HeapUpdate, payload))
+        let mut rec = Self::new(WalRecordType::HeapUpdate, payload);
+        rec.txn_id = xid;
+        Ok(rec)
     }
 
-    /// Create a `HeapDelete` record (logical delete stamping `t_xmax`).
-    pub fn heap_delete(tid: Tid, xmax: TxnId) -> Result<Self> {
+    /// Create a `HeapDelete` record (logical delete stamping `t_xmax`) stamped
+    /// with the deleting `xid` (see [`Self::heap_insert`] for why).
+    pub fn heap_delete(tid: Tid, xmax: TxnId, xid: TxnId) -> Result<Self> {
         let payload =
             bincode::serde::encode_to_vec(HeapDeleteRecord { tid, xmax }, bincode_config())
                 .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::HeapDelete, payload))
+        let mut rec = Self::new(WalRecordType::HeapDelete, payload);
+        rec.txn_id = xid;
+        Ok(rec)
+    }
+
+    /// Create a `TxnCommit` record for `xid`.
+    ///
+    /// The record's `txn_id` is stamped with `xid` so recovery's active-xact
+    /// bookkeeping and the redo handler can identify the transaction without
+    /// decoding the payload.
+    pub fn txn_commit(xid: TxnId) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(TxnCommitRecord { xid }, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        let mut rec = Self::new(WalRecordType::TxnCommit, payload);
+        rec.txn_id = xid;
+        Ok(rec)
+    }
+
+    /// Create a `TxnAbort` record for `xid` (see [`Self::txn_commit`]).
+    pub fn txn_abort(xid: TxnId) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(TxnAbortRecord { xid }, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        let mut rec = Self::new(WalRecordType::TxnAbort, payload);
+        rec.txn_id = xid;
+        Ok(rec)
     }
 
     /// Create a `CheckpointEnd` record.
@@ -492,11 +575,12 @@ mod tests {
 
     #[test]
     fn heap_insert_roundtrip() {
-        let mut record = WalRecord::heap_insert(PageId(7), 3, vec![1, 2, 3, 4]).unwrap();
+        let mut record = WalRecord::heap_insert(PageId(7), 3, vec![1, 2, 3, 4], TxnId(42)).unwrap();
         record.lsn = Lsn(64);
         let buf = record.encode().unwrap();
         let (decoded, _) = WalRecord::decode(&buf).unwrap();
         assert_eq!(decoded.record_type, WalRecordType::HeapInsert);
+        assert_eq!(decoded.txn_id, TxnId(42));
         let payload: HeapInsertRecord =
             bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
                 .unwrap()
@@ -516,11 +600,13 @@ mod tests {
             page_id: PageId(7),
             slot_id: 2,
         };
-        let mut record = WalRecord::heap_update(old_tid, new_tid, TxnId(9), vec![5, 6, 7]).unwrap();
+        let mut record =
+            WalRecord::heap_update(old_tid, new_tid, TxnId(9), vec![5, 6, 7], TxnId(9)).unwrap();
         record.lsn = Lsn(72);
         let buf = record.encode().unwrap();
         let (decoded, _) = WalRecord::decode(&buf).unwrap();
         assert_eq!(decoded.record_type, WalRecordType::HeapUpdate);
+        assert_eq!(decoded.txn_id, TxnId(9));
         let payload: HeapUpdateRecord =
             bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
                 .unwrap()
@@ -537,17 +623,42 @@ mod tests {
             page_id: PageId(7),
             slot_id: 4,
         };
-        let mut record = WalRecord::heap_delete(tid, TxnId(11)).unwrap();
+        let mut record = WalRecord::heap_delete(tid, TxnId(11), TxnId(11)).unwrap();
         record.lsn = Lsn(80);
         let buf = record.encode().unwrap();
         let (decoded, _) = WalRecord::decode(&buf).unwrap();
         assert_eq!(decoded.record_type, WalRecordType::HeapDelete);
+        assert_eq!(decoded.txn_id, TxnId(11));
         let payload: HeapDeleteRecord =
             bincode::serde::decode_from_slice(&decoded.payload, bincode_config())
                 .unwrap()
                 .0;
         assert_eq!(payload.tid, tid);
         assert_eq!(payload.xmax, TxnId(11));
+    }
+
+    #[test]
+    fn txn_commit_roundtrip() {
+        let mut record = WalRecord::txn_commit(TxnId(17)).unwrap();
+        record.lsn = Lsn(88);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::TxnCommit);
+        assert_eq!(decoded.txn_id, TxnId(17));
+        let payload = TxnCommitRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.xid, TxnId(17));
+    }
+
+    #[test]
+    fn txn_abort_roundtrip() {
+        let mut record = WalRecord::txn_abort(TxnId(19)).unwrap();
+        record.lsn = Lsn(96);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::TxnAbort);
+        assert_eq!(decoded.txn_id, TxnId(19));
+        let payload = TxnAbortRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.xid, TxnId(19));
     }
 
     #[test]

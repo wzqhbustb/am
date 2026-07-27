@@ -30,7 +30,7 @@ pub enum TxnState {
 }
 
 /// Read/write access to the commit log.
-pub trait ClogAccessor: Send + Sync {
+pub trait ClogAccessor: std::fmt::Debug + Send + Sync {
     /// Return the commit status of `xid`.
     fn get_state(&self, xid: TxnId) -> TxnState;
     /// Record the commit status of `xid`.

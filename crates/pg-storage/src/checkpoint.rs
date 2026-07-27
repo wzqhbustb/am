@@ -24,7 +24,8 @@ use crate::freelist_meta::FreelistMeta;
 use crate::oid::OidCounter;
 use crate::page_allocator::PageAllocator;
 use crate::superblock::Superblock;
-use crate::types::{Lsn, TxnId};
+use crate::txn_id::TxnIdClock;
+use crate::types::Lsn;
 use crate::wal::record::WalRecord;
 use crate::wal::writer::WalWriter;
 
@@ -58,6 +59,17 @@ pub struct CheckpointCoordinator {
     /// [`start_background_checkpointing`](Self::start_background_checkpointing))
     /// is still observed by background checkpoints.
     next_oid_source: Arc<Mutex<OidCounter>>,
+    /// Source of the next transaction ID to allocate, written into the
+    /// superblock on every checkpoint (Stage J). Mirrors `next_oid_source`:
+    /// seeded from the superblock's persisted `next_txn_id`, replaced by the
+    /// `TxnManager`'s clock via [`set_next_txn_id_source`](Self::set_next_txn_id_source),
+    /// and read once per checkpoint. Persisting the live clock (instead of the
+    /// old hardcoded `TxnId::FIRST`) lets recovery reseed the XID clock so
+    /// post-restart transactions never reuse a committed XID.
+    ///
+    /// Shared with the background thread's clone for the same reason as
+    /// `next_oid_source`.
+    next_txn_id_source: Arc<Mutex<TxnIdClock>>,
     shutdown: Arc<AtomicBool>,
     background_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -81,6 +93,7 @@ impl CheckpointCoordinator {
         // checkpoint — including ones fired before the catalog wires its
         // allocator — persists a monotone `next_oid`.
         let next_oid = superblock.lock().next_oid;
+        let next_txn_id = superblock.lock().next_txn_id;
         Self {
             data_dir: data_dir.into(),
             config: config.clone(),
@@ -90,6 +103,7 @@ impl CheckpointCoordinator {
             wal_writer,
             checkpoint_lock: Arc::new(Mutex::new(())),
             next_oid_source: Arc::new(Mutex::new(OidCounter::new(next_oid))),
+            next_txn_id_source: Arc::new(Mutex::new(TxnIdClock::new(next_txn_id))),
             shutdown: Arc::new(AtomicBool::new(false)),
             background_handle: Mutex::new(None),
         }
@@ -111,6 +125,20 @@ impl CheckpointCoordinator {
     /// still takes effect on the next background checkpoint.
     pub fn set_next_oid_source(&self, source: OidCounter) {
         *self.next_oid_source.lock() = source;
+    }
+
+    /// Install the source of `next_txn_id` values persisted by checkpoints
+    /// (Stage J wiring).
+    ///
+    /// `source` is the `TxnManager`'s live [`TxnIdClock`]; each checkpoint
+    /// reads its `current()` and writes it into the superblock's `next_txn_id`,
+    /// so recovery reseeds the clock past every XID that could already be
+    /// referenced by committed data. Mirrors
+    /// [`set_next_oid_source`](Self::set_next_oid_source) — shared with the
+    /// background thread, read once per checkpoint, replaceable between
+    /// checkpoints.
+    pub fn set_next_txn_id_source(&self, source: TxnIdClock) {
+        *self.next_txn_id_source.lock() = source;
     }
 
     /// Start a background thread that triggers checkpoints periodically.
@@ -275,7 +303,7 @@ impl CheckpointCoordinator {
 
         // 5. Capture allocator state for the checkpoint end record.
         let next_page_id = self.page_allocator.lock().next_page_id();
-        let next_txn_id = TxnId::FIRST; // M1 has no transactions.
+        let next_txn_id = self.next_txn_id_source.lock().current();
 
         // 6. Write CheckpointEnd. This marks the point at which the superblock
         //    can be safely updated.
@@ -363,6 +391,10 @@ impl CheckpointCoordinator {
             // background thread starts (e.g. by Catalog::open) is still seen
             // by background checkpoints.
             next_oid_source: Arc::clone(&self.next_oid_source),
+            // Share the next_txn_id source slot for the same reason as
+            // next_oid_source: a source installed after the background thread
+            // starts (by the TxnManager) must still be seen.
+            next_txn_id_source: Arc::clone(&self.next_txn_id_source),
             shutdown: Arc::clone(&self.shutdown),
             background_handle: Mutex::new(None),
         }

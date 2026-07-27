@@ -8,19 +8,28 @@
 //!
 //! It depends only on `pg-storage` for physical types and primitives.
 //!
-//! # M2a scope (Stage I)
+//! # M2a scope (Stage I–J)
 //!
-//! Only the minimal [`Snapshot`] + [`is_visible`] surface needed by heap scan
-//! exists yet. The XID clock, CLOG buffer, and lock manager arrive in Stage J.
-//! Visibility runs against a [`ClogAccessor`]; M2a wires in
-//! [`pg_storage::clog::NoOpClogAccessor`] (every XID reads committed), so abort
-//! invisibility only becomes observable once Stage J swaps in a real accessor.
+//! Stage I added the minimal [`Snapshot`] + [`is_visible`] surface for heap
+//! scan. Stage J adds the [`manager::TxnManager`] (XID allocation + durable
+//! commit/abort), the [`clog_mem::InMemoryClogAccessor`] (a real CLOG that
+//! records aborts), and the [`redo`] handlers that rebuild the CLOG from the
+//! WAL on recovery. The disk-backed CLOG SLRU and lock manager arrive later.
+//! Visibility runs against a [`ClogAccessor`]; wiring in
+//! [`clog_mem::InMemoryClogAccessor`] makes abort invisibility observable.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod clog_mem;
+pub mod manager;
+pub mod redo;
+
+pub use clog_mem::InMemoryClogAccessor;
+pub use manager::{CommitWal, TxnManager};
 pub use pg_storage::clog::{ClogAccessor, TxnState};
 use pg_storage::types::TxnId;
+pub use redo::txn_redo_handlers;
 
 /// An MVCC snapshot: the set of transactions whose effects are visible.
 ///
@@ -42,6 +51,15 @@ pub struct Snapshot {
     pub xip: Vec<TxnId>,
     /// The XID of the transaction that took this snapshot (sees its own writes).
     pub current_xid: TxnId,
+    /// Command counter within the current transaction.
+    ///
+    /// PostgreSQL uses `curcid` to make earlier commands within the same
+    /// transaction visible to later ones while hiding the effects of the
+    /// current command from itself (avoiding the Halloween problem). M2a runs
+    /// one command per auto-commit transaction, so this is `0` throughout;
+    /// it exists now so multi-statement transactions (later stages) need no
+    /// signature change.
+    pub curcid: u32,
 }
 
 impl Snapshot {
@@ -58,6 +76,7 @@ impl Snapshot {
             xmax: TxnId(u64::MAX),
             xip: Vec::new(),
             current_xid: TxnId::INVALID,
+            curcid: 0,
         }
     }
 }
@@ -139,6 +158,7 @@ mod tests {
             xmax: TxnId(10),
             xip: Vec::new(),
             current_xid: TxnId::INVALID,
+            curcid: 0,
         };
         let clog = NoOpClogAccessor;
         assert!(!is_visible(TxnId(20), TxnId::INVALID, &snap, &clog));

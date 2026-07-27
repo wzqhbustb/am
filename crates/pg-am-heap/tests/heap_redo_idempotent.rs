@@ -54,7 +54,7 @@ fn heap_insert_redo_is_idempotent() {
     };
 
     let tuple = encode_row(7, "idempotent");
-    let mut record = WalRecord::heap_insert(page_id, 0, tuple.clone()).unwrap();
+    let mut record = WalRecord::heap_insert(page_id, 0, tuple.clone(), TxnId(100)).unwrap();
     record.lsn = Lsn(1_000);
 
     let clog = NoOpClogAccessor;
@@ -101,7 +101,7 @@ fn fpi_then_heap_record_idempotent() {
     fpi.lsn = Lsn(100);
 
     let tuple = encode_row(42, "after-fpi");
-    let mut insert = WalRecord::heap_insert(page_id, 0, tuple.clone()).unwrap();
+    let mut insert = WalRecord::heap_insert(page_id, 0, tuple.clone(), TxnId(100)).unwrap();
     insert.lsn = Lsn(200);
 
     let data_file =
@@ -159,7 +159,7 @@ fn heap_update_same_page_redo_is_idempotent() {
 
     // Seed the page with the original version at slot 0 (lsn 1000).
     let original = encode_row(1, "original");
-    let mut insert = WalRecord::heap_insert(page_id, 0, original.clone()).unwrap();
+    let mut insert = WalRecord::heap_insert(page_id, 0, original.clone(), TxnId(100)).unwrap();
     insert.lsn = Lsn(1_000);
 
     // Same-page update: stamp slot 0 deleted + append the new version at slot 1.
@@ -172,7 +172,8 @@ fn heap_update_same_page_redo_is_idempotent() {
         page_id,
         slot_id: 1,
     };
-    let mut update = WalRecord::heap_update(old_tid, new_tid, TxnId(100), updated.clone()).unwrap();
+    let mut update =
+        WalRecord::heap_update(old_tid, new_tid, TxnId(100), updated.clone(), TxnId(100)).unwrap();
     update.lsn = Lsn(2_000);
 
     let clog = NoOpClogAccessor;
@@ -231,7 +232,7 @@ fn heap_update_cross_page_redo_is_idempotent() {
 
     // Seed the old version at old_page slot 0.
     let original = encode_row(1, "original");
-    let mut insert = WalRecord::heap_insert(old_page, 0, original.clone()).unwrap();
+    let mut insert = WalRecord::heap_insert(old_page, 0, original.clone(), TxnId(100)).unwrap();
     insert.lsn = Lsn(1_000);
 
     // Cross-page update: old_page slot 0 stamped, new version at new_page slot 0.
@@ -244,7 +245,8 @@ fn heap_update_cross_page_redo_is_idempotent() {
         page_id: new_page,
         slot_id: 0,
     };
-    let mut update = WalRecord::heap_update(old_tid, new_tid, TxnId(100), updated.clone()).unwrap();
+    let mut update =
+        WalRecord::heap_update(old_tid, new_tid, TxnId(100), updated.clone(), TxnId(100)).unwrap();
     update.lsn = Lsn(2_000);
 
     let clog = NoOpClogAccessor;

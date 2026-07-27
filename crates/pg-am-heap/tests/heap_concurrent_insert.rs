@@ -8,6 +8,7 @@ use pg_am_heap::access_method::{AccessMethod, InsertContext, RelationDesc, ScanC
 use pg_am_heap::tuple::{encode_tuple, ColumnType, Datum, TupleHeader};
 use pg_am_heap::HeapAM;
 
+use pg_storage::clog::NoOpClogAccessor;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::types::{Oid, PageId, Tid, TxnId};
@@ -112,6 +113,7 @@ fn concurrent_insert_unique_tids() {
                 columns: &COLUMNS,
             },
             snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
         })
         .unwrap();
     assert_eq!(rows.len(), total, "scan did not see every inserted row");

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::buffer_pool::BufferPool;
 use crate::checkpoint::CheckpointCoordinator;
-use crate::clog::NoOpClogAccessor;
+use crate::clog::{ClogAccessor, NoOpClogAccessor};
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
@@ -25,7 +25,8 @@ use crate::recovery::{
     PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler, RedoRegistry,
 };
 use crate::superblock::Superblock;
-use crate::types::Lsn;
+use crate::txn_id::TxnIdClock;
+use crate::types::{Lsn, TxnId};
 use crate::wal::reader::WalReader;
 use crate::wal::record::WalRecordType;
 use crate::wal::writer::WalWriter;
@@ -40,6 +41,17 @@ pub struct StorageEngine {
     wal_writer: Arc<WalWriter>,
     buffer_pool: Arc<BufferPool>,
     checkpoint: CheckpointCoordinator,
+    /// XID clock seeded from `superblock.next_txn_id`, shared with the
+    /// checkpoint coordinator (which persists its `current()`) and handed to
+    /// the `pg-txn` `TxnManager` via [`Self::txn_id_clock`]. Advancing it past
+    /// every persisted XID on recovery guarantees restarted transactions never
+    /// reuse a committed XID.
+    txn_id_clock: TxnIdClock,
+    /// CLOG used by recovery redo handlers to rebuild transaction state. The
+    /// engine holds it so the same instance the caller injected is visible for
+    /// post-recovery queries. Defaults to `NoOpClogAccessor` when the caller
+    /// opens without one (M1 / heap-only paths).
+    clog: Arc<dyn ClogAccessor>,
 }
 
 impl StorageEngine {
@@ -66,24 +78,53 @@ impl StorageEngine {
         config: &StorageConfig,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
     ) -> Result<Self> {
+        Self::open_with_redo_and_clog(
+            data_dir,
+            config,
+            extra_redo_handlers,
+            Arc::new(NoOpClogAccessor),
+        )
+    }
+
+    /// Open or create a storage engine, injecting extra redo handlers and a
+    /// CLOG (Stage J).
+    ///
+    /// The `clog` is used by transaction redo handlers during WAL replay to
+    /// rebuild committed/aborted state, and is retained on the engine so the
+    /// same instance backs post-recovery visibility checks. `pg-storage` never
+    /// constructs a real CLOG itself (that lives in `pg-txn`); callers running
+    /// transactions pass `pg_txn::InMemoryClogAccessor` here. Callers with no
+    /// transactions use [`Self::open_with_redo_handlers`], which supplies a
+    /// [`NoOpClogAccessor`].
+    pub fn open_with_redo_and_clog(
+        data_dir: impl AsRef<Path>,
+        config: &StorageConfig,
+        extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        clog: Arc<dyn ClogAccessor>,
+    ) -> Result<Self> {
         config.validate()?;
         let data_dir = data_dir.as_ref().to_path_buf();
         ensure_data_dir(&data_dir)?;
 
         let sb_path = Superblock::path(&data_dir);
         if sb_path.exists() {
-            Self::recover_with_redo_handlers(data_dir, config, extra_redo_handlers)
+            Self::recover_with_redo_handlers(data_dir, config, extra_redo_handlers, clog)
         } else {
-            Self::create_new(data_dir, config)
+            Self::create_new(data_dir, config, clog)
         }
     }
 
     /// Create a brand-new database.
-    fn create_new(data_dir: PathBuf, config: &StorageConfig) -> Result<Self> {
+    fn create_new(
+        data_dir: PathBuf,
+        config: &StorageConfig,
+        clog: Arc<dyn ClogAccessor>,
+    ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "creating new storage engine");
 
         let sb_path = Superblock::path(&data_dir);
         let superblock = Superblock::create(&sb_path, config.page_size() as u32)?;
+        let next_txn_id = superblock.next_txn_id;
         let superblock = Arc::new(Mutex::new(superblock));
 
         let wal_writer = Arc::new(WalWriter::open(&data_dir, config)?);
@@ -111,6 +152,11 @@ impl StorageEngine {
             Arc::clone(&wal_writer),
         );
 
+        // Seed the XID clock from the (fresh) superblock and share it with the
+        // checkpoint coordinator so checkpoints persist the live value.
+        let txn_id_clock = TxnIdClock::new(next_txn_id);
+        checkpoint.set_next_txn_id_source(txn_id_clock.clone());
+
         Ok(Self {
             data_dir,
             config: config.clone(),
@@ -119,6 +165,8 @@ impl StorageEngine {
             wal_writer,
             buffer_pool,
             checkpoint,
+            txn_id_clock,
+            clog,
         })
     }
 
@@ -130,7 +178,7 @@ impl StorageEngine {
     /// must use [`Self::open_with_redo_handlers`] with the heap handlers
     /// injected, or replay will fail on the unregistered record types.
     pub fn recover(data_dir: PathBuf, config: &StorageConfig) -> Result<Self> {
-        Self::recover_with_redo_handlers(data_dir, config, Vec::new())
+        Self::recover_with_redo_handlers(data_dir, config, Vec::new(), Arc::new(NoOpClogAccessor))
     }
 
     /// Recover, injecting `extra_redo_handlers` into the redo registry.
@@ -144,12 +192,14 @@ impl StorageEngine {
         data_dir: PathBuf,
         config: &StorageConfig,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        clog: Arc<dyn ClogAccessor>,
     ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "recovering storage engine");
 
         let sb_path = Superblock::path(&data_dir);
         let superblock = Superblock::read(&sb_path)?;
         let checkpoint_lsn = superblock.checkpoint_lsn;
+        let next_txn_id = superblock.next_txn_id;
         info!(%checkpoint_lsn, "loaded superblock");
 
         // 2. Open the WAL writer once. WalWriter::open_with_scan_start scans
@@ -228,13 +278,14 @@ impl StorageEngine {
             warn!("checkpoint_lsn is invalid; replaying WAL from the beginning");
             Lsn::FIRST
         };
-        Self::replay_wal(
+        let replayed_max_txn_id = Self::replay_wal(
             data_dir.clone(),
             config,
             replay_start,
             &page_allocator,
             &buffer_pool,
             extra_redo_handlers,
+            clog.as_ref(),
         )?;
         page_allocator.lock().mark_recovery_complete();
 
@@ -260,6 +311,35 @@ impl StorageEngine {
             Arc::clone(&wal_writer),
         );
 
+        // Seed the XID clock and share it with the checkpoint coordinator so
+        // checkpoints persist the live value. The catalog/txn layer may later
+        // replace the source via `set_next_txn_id_source` once it wires its
+        // own allocator.
+        //
+        // The seed is the maximum of two lower bounds:
+        //   * `next_txn_id` from the superblock — the value persisted at the
+        //     last checkpoint;
+        //   * `replayed_max_txn_id + 1` — one past the highest XID stamped on
+        //     any replayed WAL record.
+        //
+        // The WAL bound is essential: transactions committed *after* the last
+        // checkpoint advanced no superblock value, so seeding from the
+        // superblock alone would hand a fresh transaction an XID that a
+        // replayed `TxnCommit` already marked committed in the CLOG — the new
+        // transaction's tuples would be instantly visible (XID reuse). Taking
+        // the WAL high-water mark restores PG's rule of advancing `nextXid`
+        // past every XID observed during redo.
+        let recovered_next_txn_id = if replayed_max_txn_id != TxnId::INVALID {
+            // saturating_add: a record carrying u64::MAX must not wrap the
+            // clock back to 0 — that would silently restart XID reuse, the
+            // exact failure this seeding exists to prevent.
+            std::cmp::max(next_txn_id, TxnId(replayed_max_txn_id.0.saturating_add(1)))
+        } else {
+            next_txn_id
+        };
+        let txn_id_clock = TxnIdClock::new(recovered_next_txn_id);
+        checkpoint.set_next_txn_id_source(txn_id_clock.clone());
+
         info!("recovery complete");
         Ok(Self {
             data_dir,
@@ -269,9 +349,21 @@ impl StorageEngine {
             wal_writer,
             buffer_pool,
             checkpoint,
+            txn_id_clock,
+            clog,
         })
     }
 
+    /// Replay WAL from `checkpoint_lsn` and return the highest `txn_id`
+    /// stamped on any replayed record.
+    ///
+    /// The returned XID is the recovery high-water mark: every record that a
+    /// transaction wrote carries its XID (`WalRecord::txn_id`), so the largest
+    /// one seen bounds all XIDs that were ever handed out before the crash.
+    /// The caller advances the [`TxnIdClock`] past it so post-recovery
+    /// transactions never reuse a committed/aborted XID — the equivalent of
+    /// PG advancing `nextXid` during redo. Returns [`TxnId::INVALID`] if no
+    /// record carried an XID (e.g. a pure-DDL or empty WAL).
     fn replay_wal(
         data_dir: PathBuf,
         config: &StorageConfig,
@@ -279,7 +371,8 @@ impl StorageEngine {
         page_allocator: &Arc<Mutex<PageAllocator>>,
         buffer_pool: &BufferPool,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
-    ) -> Result<()> {
+        clog: &dyn ClogAccessor,
+    ) -> Result<TxnId> {
         let mut reader = WalReader::open_at(
             data_dir.join("wal"),
             config.wal_segment_size,
@@ -312,21 +405,24 @@ impl StorageEngine {
             registry.register(handler);
         }
 
-        let clog = NoOpClogAccessor;
         let mut att = ActiveXactTable::new();
         let mut dpt = DirtyPageTable::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(buffer_pool),
             page_allocator,
-            clog: &clog,
+            clog,
             att: &mut att,
             dpt: &mut dpt,
         };
         let mut records_replayed = 0usize;
+        let mut max_txn_id = TxnId::INVALID;
 
         loop {
             match reader.next_record() {
                 Ok(Some(record)) => {
+                    if record.txn_id > max_txn_id {
+                        max_txn_id = record.txn_id;
+                    }
                     registry.apply(&record, &mut ctx)?;
                     records_replayed += 1;
                 }
@@ -348,7 +444,7 @@ impl StorageEngine {
         }
 
         info!(records_replayed, "WAL replay complete");
-        Ok(())
+        Ok(max_txn_id)
     }
 
     /// Return the data directory.
@@ -384,6 +480,20 @@ impl StorageEngine {
     /// Return a reference to the checkpoint coordinator.
     pub fn checkpoint(&self) -> &CheckpointCoordinator {
         &self.checkpoint
+    }
+
+    /// Return a clone of the transaction-id clock.
+    ///
+    /// The clock is seeded from the superblock's `next_txn_id` at open and
+    /// shared (via `Arc`) with the checkpoint coordinator, which persists the
+    /// live value on each checkpoint. The txn layer allocates XIDs from it.
+    pub fn txn_id_clock(&self) -> TxnIdClock {
+        self.txn_id_clock.clone()
+    }
+
+    /// Return the commit-log accessor injected at open.
+    pub fn clog(&self) -> &Arc<dyn ClogAccessor> {
+        &self.clog
     }
 
     /// Return the `next_oid` currently recorded in the superblock.
@@ -831,11 +941,9 @@ mod tests {
         // Exactly one FullPageImage record in the WAL (nothing before the
         // reopen could have produced one: new pages skip FPI, checkpoints do
         // not write them).
-        let mut reader = crate::wal::reader::WalReader::open(
-            tmp.path().join("wal"),
-            config.wal_segment_size,
-        )
-        .unwrap();
+        let mut reader =
+            crate::wal::reader::WalReader::open(tmp.path().join("wal"), config.wal_segment_size)
+                .unwrap();
         let mut fpi_count = 0;
         while let Some(record) = reader.next_record().unwrap() {
             if record.record_type == crate::wal::record::WalRecordType::FullPageImage {
@@ -952,7 +1060,8 @@ mod tests {
         // it durable and abandon the engine (simulate crash).
         {
             let engine = StorageEngine::open(tmp.path(), &config).unwrap();
-            let record = WalRecord::heap_insert(PageId(1), 0, vec![1, 2, 3, 4]).unwrap();
+            let record =
+                WalRecord::heap_insert(PageId(1), 0, vec![1, 2, 3, 4], TxnId(100)).unwrap();
             engine.wal_writer().append(record).unwrap();
             engine.wal_writer().flush().unwrap();
             std::mem::forget(engine);

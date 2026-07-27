@@ -1053,8 +1053,12 @@ mod tests {
         );
 
         // 2. Set checkpoint_lsn above everything written so far so that the
-        //    next pin_mut on the victim appends an FPI.
-        pool.set_checkpoint_lsn(wal.synced_lsn());
+        //    next pin_mut on the victim appends an FPI. `alloc_page` is now
+        //    append-only (fsync deferred), so `synced_lsn` may still be 0 here;
+        //    we use `current_lsn` (end-of-WAL, sync-independent) as the
+        //    boundary. The FPI appended in step 3 lands past this boundary, so
+        //    the `synced_lsn() < fpi_lsn` guard in step 3 stays meaningful.
+        pool.set_checkpoint_lsn(wal.current_lsn());
 
         // 3. pin_mut reloads the victim (evicting `other`, whose flush brings
         //    synced_lsn up to date) and appends its FPI without flushing. The

@@ -480,6 +480,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
@@ -535,6 +536,7 @@ dependencies = [
  "parking_lot",
  "pg-storage",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 

@@ -118,9 +118,18 @@ impl WalSegmentManager {
 
     /// Close the current segment and open the next one.
     ///
-    /// The old file is closed and a new segment file is created and
-    /// preallocated to [`segment_size`](Self::segment_size).
+    /// The old segment is **fsynced before the switch**: once the new file
+    /// exists, the writer only ever fsyncs the current file, so without this
+    /// the old segment's tail records (written since the last group-commit
+    /// fsync) would never be made durable — yet `synced_lsn` would advance
+    /// past them on the next flush. Rotation is rare (once per segment), so
+    /// the fsync cost is fully amortized.
+    ///
+    /// The new segment file is created and preallocated to
+    /// [`segment_size`](Self::segment_size).
     pub fn rotate(&mut self) -> Result<&mut File> {
+        self.current_file.sync_all().map_err(StorageError::Io)?;
+
         let next_id = self.current_segment_id + 1;
         let file = Self::open_segment_file(&self.wal_dir, next_id, self.segment_size)?;
         // The new segment file has been fsynced; fsync the directory so the
