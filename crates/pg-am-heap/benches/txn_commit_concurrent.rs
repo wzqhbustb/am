@@ -32,7 +32,6 @@ fn rel(first_page: PageId) -> RelationDesc<'static> {
     RelationDesc {
         rel_oid: REL_OID,
         first_page,
-        page_count: 64,
         columns: &COLUMNS,
     }
 }

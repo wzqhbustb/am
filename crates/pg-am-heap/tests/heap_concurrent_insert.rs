@@ -72,12 +72,11 @@ fn concurrent_insert_unique_tids() {
                     slot_id: 0,
                 };
                 heap.insert(InsertContext {
-                    // page_count is only used to seed the page list on first
-                    // touch; create_heap already seeded it, so this is ignored.
+                    // create_heap already seeded the chain-head page; the AM
+                    // tracks/extends the chain from here.
                     rel: RelationDesc {
                         rel_oid: REL_OID,
                         first_page,
-                        page_count: 1,
                         columns: &COLUMNS,
                     },
                     snapshot: &snap,
@@ -100,16 +99,15 @@ fn concurrent_insert_unique_tids() {
     all.dedup();
     assert_eq!(all.len(), total, "duplicate TIDs: slot collision detected");
 
-    // Every inserted row must be scannable. page_count is unknown after the
-    // inserts spilled onto new pages, but the AM tracks them internally, so the
-    // scan sees all of them regardless of the descriptor's page_count.
+    // Every inserted row must be scannable. The inserts spilled onto new
+    // pages, but the AM tracks the extended chain internally, so the scan
+    // sees all of them from the chain head alone.
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
             rel: RelationDesc {
                 rel_oid: REL_OID,
                 first_page,
-                page_count: 1,
                 columns: &COLUMNS,
             },
             snapshot: &scan_snap,

@@ -18,11 +18,11 @@ use std::collections::BTreeMap;
 use pg_am_heap::tuple::{decode_tuple, Datum};
 use pg_am_heap::SlottedPage;
 use pg_storage::engine::StorageEngine;
-use pg_storage::types::{Oid, PAGE_SIZE};
+use pg_storage::types::{Oid, PageId, PAGE_SIZE};
 
 use crate::bootstrap;
 use crate::oid::OidAllocator;
-use crate::system_tables::{SystemTableDef, PG_AM, PG_ATTRIBUTE, PG_CLASS, PG_TYPE};
+use crate::system_tables::{SystemTableDef, PG_AM, PG_ATTRIBUTE, PG_CLASS, PG_RELPAGES, PG_TYPE};
 use crate::{CatalogError, Result, TableOid, TypeOid};
 
 /// A row of `pg_class`: one relation.
@@ -81,6 +81,20 @@ pub struct AmRow {
     pub name: String,
 }
 
+/// A row of `pg_rust_relpages` (Stage K): the engine-private page-chain
+/// directory entry of one heap relation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelpagesRow {
+    /// The relation this entry describes.
+    pub rel_oid: TableOid,
+    /// Head of the relation's on-disk page chain.
+    pub first_page: PageId,
+    /// Tail of the relation's on-disk page chain.
+    pub last_page: PageId,
+    /// Number of pages in the chain (`>= 1`).
+    pub page_count: u64,
+}
+
 /// The in-memory system catalog.
 ///
 /// Construct with [`Catalog::open`]; all queries are read-only lookups into
@@ -91,6 +105,7 @@ pub struct Catalog {
     attributes: BTreeMap<TableOid, Vec<AttributeRow>>,
     types: Vec<TypeRow>,
     access_methods: Vec<AmRow>,
+    relpages: Vec<RelpagesRow>,
     oid_allocator: OidAllocator,
     bootstrapped: bool,
 }
@@ -114,10 +129,19 @@ impl Catalog {
     /// happen to decode as `Dead` silently hides every row, and a torn
     /// tuple region fails decode outright. After read-back, the snapshot is
     /// therefore validated against the fixed bootstrap content
-    /// ([`Catalog::validate_content`]); any failure triggers one
-    /// [`bootstrap::force_rebootstrap`] + retry. A hard error is returned
-    /// only if the catalog still does not read back cleanly after the
-    /// rewrite.
+    /// ([`Catalog::validate_content`]).
+    ///
+    /// A validation failure splits two ways (Stage K):
+    ///
+    /// - **Bootstrap-only catalog** (no user tables): the content is fixed
+    ///   and known, so one [`bootstrap::force_rebootstrap`] + retry repairs
+    ///   it for free.
+    /// - **User DDL present**: a full rewrite would wipe every user row in
+    ///   `pg_class` / `pg_attribute` / `pg_rust_relpages`, orphaning every
+    ///   user table. That is strictly worse than refusing to open, so a
+    ///   decodable user row turns the failure into a hard error that
+    ///   preserves the data directory for manual recovery (M2b replaces this
+    ///   with catalog WAL replay).
     pub fn open(engine: &StorageEngine) -> Result<Self> {
         let bootstrapped = bootstrap::bootstrap_if_needed(engine)?;
 
@@ -127,6 +151,14 @@ impl Catalog {
                 Ok(catalog)
             }
             Err(first_err) => {
+                if user_ddl_present(engine) {
+                    return Err(CatalogError::Corrupted(format!(
+                        "catalog corruption ({first_err}); user DDL rows exist, \
+                         so force_rebootstrap would orphan every user table — \
+                         refusing to open to preserve the data directory \
+                         (M2b replaces this with catalog WAL replay)"
+                    )));
+                }
                 tracing::warn!(
                     error = %first_err,
                     "catalog content failed validation; rewriting bootstrap content and retrying"
@@ -146,6 +178,7 @@ impl Catalog {
         let attributes = read_attributes(engine)?;
         let types = read_types(engine)?;
         let access_methods = read_access_methods(engine)?;
+        let relpages = read_relpages(engine)?;
 
         validate_content(&relations, &attributes, &types, &access_methods)?;
 
@@ -181,6 +214,7 @@ impl Catalog {
             attributes,
             types,
             access_methods,
+            relpages,
             oid_allocator,
             bootstrapped: false,
         })
@@ -223,6 +257,17 @@ impl Catalog {
     /// All access methods (`pg_am` rows).
     pub fn access_methods(&self) -> &[AmRow] {
         &self.access_methods
+    }
+
+    /// All page-chain directory entries (`pg_rust_relpages` rows, Stage K).
+    /// Empty until DDL creates user tables.
+    pub fn relpages(&self) -> &[RelpagesRow] {
+        &self.relpages
+    }
+
+    /// Look up the page-chain directory entry of a relation.
+    pub fn relpages_of(&self, rel_oid: TableOid) -> Option<RelpagesRow> {
+        self.relpages.iter().find(|r| r.rel_oid == rel_oid).cloned()
     }
 
     /// The OID allocator, shared with the checkpoint coordinator.
@@ -345,6 +390,54 @@ fn text_col(row: &[Option<Datum>], idx: usize, table: &str, col: &str) -> Result
     }
 }
 
+/// Tolerantly scan `pg_class` / `pg_attribute` / `pg_rust_relpages` for any
+/// decodable row owned by a user relation (OID ≥ `FIRST_USER`).
+///
+/// Used by `Catalog::open`'s self-heal gate (see the `open` docs): a full
+/// rebootstrap is only allowed when the catalog is provably bootstrap-only.
+/// Slots that fail to decode are skipped with a warning — the corruption is
+/// what brought us here — while every *readable* row still counts, so a
+/// single undamaged system page is enough to detect existing user tables.
+pub(crate) fn user_ddl_present(engine: &StorageEngine) -> bool {
+    for def in [PG_CLASS, PG_ATTRIBUTE, PG_RELPAGES] {
+        let guard = match engine.buffer_pool().pin(def.first_page) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        if SlottedPage::header(page).pd_upper == 0 {
+            continue;
+        }
+        let columns = def.column_types();
+        for slot in 0..SlottedPage::slot_count(page) as u16 {
+            let Ok(Some(bytes)) = SlottedPage::tuple(page, slot) else {
+                continue;
+            };
+            match decode_tuple(bytes, &columns) {
+                Ok((_header, values)) => {
+                    // All three tables carry the owner OID as the first Int8
+                    // column (pg_class.oid / pg_attribute.attrelid /
+                    // pg_rust_relpages.rel_oid).
+                    if let Some(Some(Datum::Int8(v))) = values.first() {
+                        if *v >= Oid::FIRST_USER.0 as i64 {
+                            return true;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        table = def.name,
+                        slot,
+                        "user_ddl_present: skipping undecodable row"
+                    );
+                }
+            }
+        }
+    }
+    false
+}
+
 fn read_relations(engine: &StorageEngine) -> Result<Vec<RelationRow>> {
     read_tuples(engine, &PG_CLASS)?
         .iter()
@@ -429,10 +522,47 @@ fn read_access_methods(engine: &StorageEngine) -> Result<Vec<AmRow>> {
         .collect()
 }
 
+fn read_relpages(engine: &StorageEngine) -> Result<Vec<RelpagesRow>> {
+    read_tuples(engine, &PG_RELPAGES)?
+        .iter()
+        .map(|row| {
+            Ok(RelpagesRow {
+                rel_oid: TableOid::new(oid_of(
+                    int8_col(row, 0, "pg_rust_relpages", "rel_oid")?,
+                    "pg_rust_relpages",
+                    "rel_oid",
+                )?),
+                first_page: page_id_of(
+                    int8_col(row, 1, "pg_rust_relpages", "first_page")?,
+                    "first_page",
+                )?,
+                last_page: page_id_of(
+                    int8_col(row, 2, "pg_rust_relpages", "last_page")?,
+                    "last_page",
+                )?,
+                page_count: u64::try_from(int8_col(row, 3, "pg_rust_relpages", "page_count")?)
+                    .map_err(|_| {
+                        CatalogError::Corrupted(
+                            "pg_rust_relpages.page_count: negative page count".to_string(),
+                        )
+                    })?,
+            })
+        })
+        .collect()
+}
+
 /// Widen an `Int8` catalog value to an [`Oid`]. Negative values are
 /// corruption — OIDs are unsigned.
 fn oid_of(v: i64, table: &str, col: &str) -> Result<Oid> {
     u64::try_from(v)
         .map(Oid)
         .map_err(|_| CatalogError::Corrupted(format!("{table}.{col}: negative OID value {v}")))
+}
+
+/// Widen an `Int8` `pg_rust_relpages` value to a [`PageId`]. Negative values
+/// are corruption — page ids are unsigned.
+fn page_id_of(v: i64, col: &str) -> Result<PageId> {
+    u64::try_from(v).map(PageId).map_err(|_| {
+        CatalogError::Corrupted(format!("pg_rust_relpages.{col}: negative page id {v}"))
+    })
 }

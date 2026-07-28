@@ -117,7 +117,6 @@ fn insert_loop_bench(c: &mut Criterion, name: &str, h: &Harness) {
                     rel: RelationDesc {
                         rel_oid: REL_OID,
                         first_page: h.first_page,
-                        page_count: 1,
                         columns: &COLUMNS,
                     },
                     snapshot: &snap,
@@ -175,7 +174,6 @@ fn bench_txn_insert_commit(c: &mut Criterion) {
                     rel: RelationDesc {
                         rel_oid: REL_OID,
                         first_page: h.first_page,
-                        page_count: 1,
                         columns: &COLUMNS,
                     },
                     snapshot: &snap,

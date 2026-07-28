@@ -1,10 +1,11 @@
 //! Catalog bootstrap (coding-plan Stage H; tech-selection §5.2).
 //!
-//! On an empty data directory, [`bootstrap_if_needed`] writes the five system
+//! On an empty data directory, [`bootstrap_if_needed`] writes the six system
 //! tables directly as heap tuples at their fixed first pages
 //! ([`crate::system_tables`]). `pg_class` is self-describing: it contains a
 //! row for every system table, including itself, with `relnatts` matching the
-//! hardcoded schema.
+//! hardcoded schema. `pg_rust_relpages` (Stage K) gets no bootstrap rows —
+//! its rows are written by DDL — only an initialized empty page.
 //!
 //! # Write path
 //!
@@ -17,13 +18,13 @@
 //! # Idempotency and half-state detection
 //!
 //! Because catalog writes are not WAL-logged, a crash can leave a half-state:
-//! pages 1..=5 allocated (their `PageAlloc` WAL records are durable) but
+//! pages 1..=6 allocated (their `PageAlloc` WAL records are durable) but
 //! never initialized — or, when a background checkpoint flushes a strict
 //! subset of the bootstrap pages mid-write, only some of them initialized.
-//! The detection rule therefore checks **all five** system pages: each must
-//! be a valid slotted page written by `SlottedPage::init`
+//! The detection rule therefore checks **all six** system pages: each must
+//! be a valid slotted page written by `SlottedPage::init_with_special`
 //! (`pd_pagesize_version == PAGE_FORMAT_VERSION`, `pd_lower >= 32`, and not
-//! all zeros). If any is invalid, pages 1..=5 are (re)initialized and the
+//! all zeros). If any is invalid, pages 1..=6 are (re)initialized and the
 //! full bootstrap content is rewritten — an overwrite, so it is idempotent.
 //! If all are valid, bootstrap is skipped entirely (second `open` does not
 //! re-bootstrap).
@@ -40,6 +41,7 @@
 //! `t_trace_id` is all zeros (no agent runtime in M2a), `t_cid` is 0, and
 //! `t_ctid` points at the tuple itself.
 
+use pg_am_heap::slotted_page::HEAP_SPECIAL_SIZE;
 use pg_am_heap::tuple::{
     encode_tuple, Datum, TupleHeader, HEAP_ONLY_TUPLE, HEAP_XMAX_INVALID, HEAP_XMIN_COMMITTED,
 };
@@ -63,6 +65,13 @@ pub const BOOTSTRAP_XID: TxnId = TxnId(1);
 ///
 /// Returns `Ok(true)` if bootstrap content was written, `Ok(false)` if a
 /// valid catalog was already present.
+///
+/// Header-level damage (a system page that is not even a well-formed slotted
+/// page) triggers a full rewrite — but only for a bootstrap-only catalog.
+/// When user DDL is present the rewrite would orphan every user table, so
+/// this fails loudly instead, matching [`crate::catalog::Catalog::open`]'s
+/// self-heal gate (Stage K review P1-2: this path runs *before* that gate
+/// and must apply the same policy).
 pub fn bootstrap_if_needed(engine: &StorageEngine) -> Result<bool> {
     // Allocate first: on a fresh directory the system pages do not exist
     // yet, and the validity check pins them.
@@ -70,6 +79,16 @@ pub fn bootstrap_if_needed(engine: &StorageEngine) -> Result<bool> {
 
     if system_pages_are_valid(engine)? {
         return Ok(false);
+    }
+
+    if crate::catalog::user_ddl_present(engine) {
+        return Err(crate::CatalogError::Corrupted(
+            "system catalog page header is corrupt and user DDL rows exist; \
+             force_rebootstrap would orphan every user table — refusing to \
+             open to preserve the data directory (M2b replaces this with \
+             catalog WAL replay)"
+                .to_string(),
+        ));
     }
 
     write_all_system_tables(engine)
@@ -99,7 +118,7 @@ pub fn force_rebootstrap(engine: &StorageEngine) -> Result<bool> {
     write_all_system_tables(engine)
 }
 
-/// Initialize all five system pages, write the full bootstrap content, and
+/// Initialize all six system pages, write the full bootstrap content, and
 /// checkpoint it to disk.
 fn write_all_system_tables(engine: &StorageEngine) -> Result<bool> {
     ensure_system_pages_allocated(engine)?;
@@ -112,9 +131,10 @@ fn write_all_system_tables(engine: &StorageEngine) -> Result<bool> {
 
 /// The half-state detection rule from the module docs: **every** system
 /// table's first page must be a valid slotted page written by
-/// `SlottedPage::init`.
+/// `SlottedPage::init_with_special`. The rule is header-only and therefore
+/// insensitive to the special-space size.
 ///
-/// All five pages are checked, not just `pg_class`: a background checkpoint
+/// All six pages are checked, not just `pg_class`: a background checkpoint
 /// can flush a strict subset of the bootstrap pages (`flush_frame` does not
 /// consult pin counts). With a page-1-only check, a crash after such a
 /// partial flush would leave `pg_class` valid but `pg_attribute` / `pg_type`
@@ -146,12 +166,12 @@ fn page_is_valid_slotted(
         && !page.iter().all(|&b| b == 0))
 }
 
-/// Allocate pages 1..=5 if the page allocator has not handed them out yet.
+/// Allocate pages 1..=6 if the page allocator has not handed them out yet.
 ///
 /// A fresh directory starts at `next_page_id = 1`, so this allocates all
-/// five system pages. A half-state directory (pages allocated by a crashed
+/// six system pages. A half-state directory (pages allocated by a crashed
 /// bootstrap, replayed from WAL during recovery) already has
-/// `next_page_id > 5` and this is a no-op; a partially allocated directory
+/// `next_page_id > 6` and this is a no-op; a partially allocated directory
 /// gets only the missing pages.
 fn ensure_system_pages_allocated(engine: &StorageEngine) -> Result<()> {
     loop {
@@ -161,20 +181,26 @@ fn ensure_system_pages_allocated(engine: &StorageEngine) -> Result<()> {
         }
         // `new_page` goes through the page allocator (sequential IDs from
         // `next_page_id` when the freelist is empty) and returns the page
-        // pinned zero-filled; `SlottedPage::init` runs later in
+        // pinned zero-filled; `SlottedPage::init_with_special` runs later in
         // `write_system_table`.
         drop(engine.buffer_pool().new_page()?);
     }
 }
 
 /// Initialize `def`'s first page and write all of its bootstrap rows.
+///
+/// The page is initialized with [`HEAP_SPECIAL_SIZE`] bytes of special space
+/// (Stage K wave 2), exactly like a user heap page: every relation — system
+/// catalogs included — is then chain-extensible, and the heap AM can write
+/// catalog rows itself (its chain walk requires the 16-byte special
+/// geometry and would fail on a `special = 0` page).
 fn write_system_table(engine: &StorageEngine, def: &SystemTableDef) -> Result<()> {
     let mut guard = engine.buffer_pool().pin_mut(def.first_page)?;
     let page: &mut [u8; PAGE_SIZE] = guard
         .page_mut()
         .try_into()
         .expect("buffer pool pages are PAGE_SIZE bytes");
-    SlottedPage::init(page);
+    SlottedPage::init_with_special(page, HEAP_SPECIAL_SIZE);
 
     let columns = def.column_types();
     for (slot, row) in bootstrap_rows(def).iter().enumerate() {
@@ -199,7 +225,8 @@ fn write_system_table(engine: &StorageEngine, def: &SystemTableDef) -> Result<()
 ///
 /// `pg_class` is self-describing: it gets a row for every system table,
 /// including itself. `pg_index` gets no rows in M2a (§5.1: indexes arrive in
-/// M2b); its page is initialized empty.
+/// M2b) and `pg_rust_relpages` gets none until DDL writes them (Stage K);
+/// both pages are initialized empty.
 fn bootstrap_rows(def: &SystemTableDef) -> Vec<Vec<Option<Datum>>> {
     match def.oid {
         crate::system_tables::PG_CLASS_OID => SYSTEM_TABLES
@@ -253,7 +280,8 @@ fn bootstrap_rows(def: &SystemTableDef) -> Vec<Vec<Option<Datum>>> {
                 Some(Datum::Text("btree".to_string())),
             ],
         ],
-        // pg_index (and any future table): schema only, no bootstrap rows.
+        // pg_index / pg_rust_relpages (and any future table): schema only, no
+        // bootstrap rows.
         _ => Vec::new(),
     }
 }
@@ -266,15 +294,16 @@ mod tests {
 
     #[test]
     fn bootstrap_row_counts() {
-        assert_eq!(bootstrap_rows(&crate::system_tables::PG_CLASS).len(), 5);
-        // 6 + 7 + 3 + 2 + 5 columns across the five system tables.
+        assert_eq!(bootstrap_rows(&crate::system_tables::PG_CLASS).len(), 6);
+        // 6 + 7 + 3 + 2 + 5 + 4 columns across the six system tables.
         assert_eq!(
             bootstrap_rows(&crate::system_tables::PG_ATTRIBUTE).len(),
-            6 + 7 + 3 + 2 + 5
+            6 + 7 + 3 + 2 + 5 + 4
         );
         assert_eq!(bootstrap_rows(&crate::system_tables::PG_TYPE).len(), 6);
         assert_eq!(bootstrap_rows(&crate::system_tables::PG_AM).len(), 2);
         assert!(bootstrap_rows(&crate::system_tables::PG_INDEX).is_empty());
+        assert!(bootstrap_rows(&crate::system_tables::PG_RELPAGES).is_empty());
     }
 
     #[test]
@@ -287,7 +316,7 @@ mod tests {
         // Second call on the same engine: the catalog is already valid.
         assert!(!bootstrap_if_needed(&engine).unwrap());
 
-        // Pages 1..=5 were allocated, in order.
-        assert_eq!(engine.page_allocator().lock().next_page_id(), PageId(6));
+        // Pages 1..=6 were allocated, in order.
+        assert_eq!(engine.page_allocator().lock().next_page_id(), PageId(7));
     }
 }

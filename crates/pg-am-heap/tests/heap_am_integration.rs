@@ -50,11 +50,12 @@ fn encode_row(xid: u64, id: i32, name: &str) -> Vec<u8> {
     .unwrap()
 }
 
-fn rel(first_page: PageId, page_count: u64) -> RelationDesc<'static> {
+/// A relation descriptor for the test heap. `first_page` is the chain head;
+/// the AM rebuilds the rest of the page list by walking the on-disk chain.
+fn rel(first_page: PageId) -> RelationDesc<'static> {
     RelationDesc {
         rel_oid: REL_OID,
         first_page,
-        page_count,
         columns: &COLUMNS,
     }
 }
@@ -80,7 +81,7 @@ fn insert_scan_roundtrip() {
             slot_id: 0,
         };
         heap.insert(InsertContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &snap,
             tuple: &tuple,
             out_tid: Some(&mut tid),
@@ -93,7 +94,7 @@ fn insert_scan_roundtrip() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -125,7 +126,7 @@ fn update_then_delete_visibility() {
         slot_id: 0,
     };
     heap.insert(InsertContext {
-        rel: rel(first_page, 1),
+        rel: rel(first_page),
         snapshot: &snap,
         tuple: &tuple,
         out_tid: Some(&mut tid),
@@ -139,7 +140,8 @@ fn update_then_delete_visibility() {
         slot_id: 0,
     };
     heap.update(UpdateContext {
-        rel: rel(first_page, 1),
+        clog: &NoOpClogAccessor,
+        rel: rel(first_page),
         snapshot: &snap,
         old_tid: tid,
         new_tuple: &new_tuple,
@@ -151,7 +153,7 @@ fn update_then_delete_visibility() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -162,7 +164,8 @@ fn update_then_delete_visibility() {
 
     // Delete the new version: nothing visible.
     heap.delete(DeleteContext {
-        rel: rel(first_page, 1),
+        clog: &NoOpClogAccessor,
+        rel: rel(first_page),
         snapshot: &snap,
         tid: new_tid,
     })
@@ -170,7 +173,7 @@ fn update_then_delete_visibility() {
 
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -198,7 +201,7 @@ fn heap_crash_recovery_after_update() {
             slot_id: 0,
         };
         heap.insert(InsertContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &snap,
             tuple: &tuple,
             out_tid: Some(&mut tid),
@@ -211,7 +214,8 @@ fn heap_crash_recovery_after_update() {
             slot_id: 0,
         };
         heap.update(UpdateContext {
-            rel: rel(first_page, 1),
+            clog: &NoOpClogAccessor,
+            rel: rel(first_page),
             snapshot: &snap,
             old_tid: tid,
             new_tuple: &new_tuple,
@@ -233,7 +237,7 @@ fn heap_crash_recovery_after_update() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -261,7 +265,7 @@ fn heap_crash_recovery() {
         for i in 0..8 {
             let tuple = encode_row(100, i, &format!("v-{i}"));
             heap.insert(InsertContext {
-                rel: rel(first_page, 1),
+                rel: rel(first_page),
                 snapshot: &snap,
                 tuple: &tuple,
                 out_tid: None,
@@ -283,7 +287,7 @@ fn heap_crash_recovery() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -323,7 +327,7 @@ fn heap_cross_page_update_crash_recovery() {
             slot_id: 0,
         };
         heap.insert(InsertContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &snap,
             tuple: &target,
             out_tid: Some(&mut tid),
@@ -334,7 +338,7 @@ fn heap_cross_page_update_crash_recovery() {
         // Filler row (large) fills most of the first page.
         let filler = encode_row(100, 2, &big);
         heap.insert(InsertContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &snap,
             tuple: &filler,
             out_tid: None,
@@ -349,7 +353,8 @@ fn heap_cross_page_update_crash_recovery() {
             slot_id: 0,
         };
         heap.update(UpdateContext {
-            rel: rel(first_page, 1),
+            clog: &NoOpClogAccessor,
+            rel: rel(first_page),
             snapshot: &snap,
             old_tid: tid,
             new_tuple: &new_tuple,
@@ -366,7 +371,7 @@ fn heap_cross_page_update_crash_recovery() {
         let scan_snap = Snapshot::everything();
         let rows = heap
             .scan(ScanContext {
-                rel: rel(first_page, 2),
+                rel: rel(first_page),
                 snapshot: &scan_snap,
                 clog: &NoOpClogAccessor,
             })
@@ -394,7 +399,7 @@ fn heap_cross_page_update_crash_recovery() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 2),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -433,7 +438,7 @@ fn rejected_delete_leaves_no_poison_wal_record() {
         // One live row at slot 0.
         let tuple = encode_row(100, 1, "keep-me");
         heap.insert(InsertContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &snap,
             tuple: &tuple,
             out_tid: None,
@@ -446,7 +451,8 @@ fn rejected_delete_leaves_no_poison_wal_record() {
             slot_id: 999,
         };
         let err = heap.delete(DeleteContext {
-            rel: rel(first_page, 1),
+            clog: &NoOpClogAccessor,
+            rel: rel(first_page),
             snapshot: &snap,
             tid: bad_tid,
         });
@@ -467,7 +473,7 @@ fn rejected_delete_leaves_no_poison_wal_record() {
     let scan_snap = Snapshot::everything();
     let rows = heap
         .scan(ScanContext {
-            rel: rel(first_page, 1),
+            rel: rel(first_page),
             snapshot: &scan_snap,
             clog: &NoOpClogAccessor,
         })
@@ -496,13 +502,11 @@ fn scan_dead_tuples_is_relation_scoped() {
     let rel_a = RelationDesc {
         rel_oid: REL_A,
         first_page: page_a,
-        page_count: 1,
         columns: &COLUMNS,
     };
     let rel_b = RelationDesc {
         rel_oid: REL_B,
         first_page: page_b,
-        page_count: 1,
         columns: &COLUMNS,
     };
     let snap = writer_snapshot(100);
@@ -530,6 +534,7 @@ fn scan_dead_tuples_is_relation_scoped() {
         })
         .unwrap();
         heap.delete(DeleteContext {
+            clog: &NoOpClogAccessor,
             rel,
             snapshot: &snap,
             tid,
@@ -565,5 +570,264 @@ fn scan_dead_tuples_is_relation_scoped() {
     assert!(
         !dead_in_b.contains(&dead_a),
         "A's dead tuple must not leak into B"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage K: page chain, AM-internal t_xmin stamping, cross-page crash recovery.
+// ---------------------------------------------------------------------------
+
+use pg_am_heap::slotted_page::SlottedPage;
+use pg_storage::clog::ClogAccessor;
+use pg_storage::clog::TxnState;
+use pg_txn::InMemoryClogAccessor;
+
+/// Encode a `(Int4, Text)` row whose text is `pad` bytes long, so a
+/// predictable number of rows fills a page (~14 rows of ~580 B per 8 KiB
+/// page with 16 B special space).
+fn encode_padded_row(xid: u64, id: i32, pad: usize) -> Vec<u8> {
+    encode_row(xid, id, &"p".repeat(pad))
+}
+
+/// Insert one row, returning its TID.
+fn insert_one(heap: &HeapAM, first_page: PageId, snap: &Snapshot, tuple: &[u8]) -> Tid {
+    let mut tid = Tid {
+        page_id: PageId(0),
+        slot_id: 0,
+    };
+    heap.insert(InsertContext {
+        rel: rel(first_page),
+        snapshot: snap,
+        tuple,
+        out_tid: Some(&mut tid),
+    })
+    .unwrap();
+    tid
+}
+
+fn scan_all(heap: &HeapAM, first_page: PageId) -> Vec<(Tid, Vec<Option<Datum>>)> {
+    heap.scan(ScanContext {
+        rel: rel(first_page),
+        snapshot: &Snapshot::everything(),
+        clog: &NoOpClogAccessor,
+    })
+    .unwrap()
+}
+
+/// Stage K: a relation spanning 3+ pages supports the full CRUD surface, and
+/// the page directory is the on-disk chain (TIDs span multiple pages).
+#[test]
+fn multi_page_relation_crud() {
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+
+    let first_page = heap.create_heap(REL_OID).unwrap();
+    let snap = writer_snapshot(100);
+
+    // 120 rows of ~580 B: about 14 per page, so 9+ pages.
+    let n = 120;
+    let mut tids = Vec::new();
+    for i in 0..n {
+        let tuple = encode_padded_row(100, i, 500);
+        tids.push(insert_one(&heap, first_page, &snap, &tuple));
+    }
+    let page_count = {
+        let mut pages: Vec<PageId> = tids.iter().map(|t| t.page_id).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages.len()
+    };
+    assert!(
+        page_count >= 3,
+        "expected the relation to span 3+ pages, got {page_count}"
+    );
+
+    // Scan sees every row.
+    let rows = scan_all(&heap, first_page);
+    assert_eq!(rows.len(), n as usize);
+
+    // Update a row on the first page to a value that cannot fit there: the
+    // new version must land on another (chain-reachable) page.
+    let big = encode_row(100, 0, &"x".repeat(5000));
+    let mut new_tid = Tid {
+        page_id: PageId(0),
+        slot_id: 0,
+    };
+    heap.update(UpdateContext {
+        clog: &NoOpClogAccessor,
+        rel: rel(first_page),
+        snapshot: &snap,
+        old_tid: tids[0],
+        new_tuple: &big,
+        out_tid: Some(&mut new_tid),
+    })
+    .unwrap();
+    assert_eq!(tids[0].page_id, first_page);
+    assert_ne!(new_tid.page_id, first_page, "cross-page update expected");
+
+    // Delete a row on the tail page.
+    heap.delete(DeleteContext {
+        clog: &NoOpClogAccessor,
+        rel: rel(first_page),
+        snapshot: &snap,
+        tid: tids[n as usize - 1],
+    })
+    .unwrap();
+
+    // Final state: 120 - 1 (deleted) visible; the update replaced the old
+    // version with the new one without changing the visible count.
+    let rows = scan_all(&heap, first_page);
+    assert_eq!(rows.len(), (n - 1) as usize);
+    let updated = rows
+        .iter()
+        .find(|(_, v)| v[0] == Some(Datum::Int4(0)))
+        .expect("updated row must be visible");
+    assert_eq!(updated.0, new_tid);
+    assert_eq!(updated.1[1], Some(Datum::Text("x".repeat(5000))));
+}
+
+/// Stage K (closes Stage I P1-2): inserts spilling across pages survive a
+/// kill -9. After redo, `seed_from_chain` must rebuild the page directory by
+/// walking the on-disk chain — the links were made durable by the post-image
+/// FPI each chain extension logged.
+#[test]
+fn multi_page_crash_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+
+    let first_page = {
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        let heap = HeapAM::new(
+            Arc::clone(engine.buffer_pool()),
+            Arc::clone(engine.wal_writer()),
+        );
+        let first_page = heap.create_heap(REL_OID).unwrap();
+        let snap = writer_snapshot(100);
+        for i in 0..120 {
+            let tuple = encode_padded_row(100, i, 500);
+            insert_one(&heap, first_page, &snap, &tuple);
+        }
+        engine.wal_writer().flush().unwrap();
+        std::mem::forget(engine); // simulate kill -9: no checkpoint, no shutdown
+        first_page
+    };
+
+    let engine =
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+
+    // The fresh HeapAM has an empty page cache: the scan below only sees all
+    // 120 rows if seed_from_chain rebuilt the directory from the on-disk
+    // chain restored by redo.
+    let rows = scan_all(&heap, first_page);
+    assert_eq!(
+        rows.len(),
+        120,
+        "every cross-page row must survive the crash"
+    );
+    let mut pages: Vec<PageId> = rows.iter().map(|(t, _)| t.page_id).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    assert!(
+        pages.len() >= 3,
+        "recovered rows must span 3+ chain pages, got {}",
+        pages.len()
+    );
+    // Content integrity, not just counts.
+    for (_tid, values) in &rows {
+        let id = match values[0] {
+            Some(Datum::Int4(v)) => v,
+            ref other => panic!("unexpected id datum: {other:?}"),
+        };
+        assert_eq!(values[1], Some(Datum::Text("p".repeat(500))), "row {id}");
+    }
+}
+
+/// Stage K acceptance (`test_am_stamps_xmin_matches_current_xid`, coding-plan
+/// line 429): the AM overwrites the caller-encoded `t_xmin` with
+/// `snapshot.current_xid`, so visibility is judged by `CLOG[current_xid]`,
+/// not by whatever XID the caller baked into the tuple bytes.
+#[test]
+fn test_am_stamps_xmin_matches_current_xid() {
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+    let first_page = heap.create_heap(REL_OID).unwrap();
+
+    // The writer is xid 5 (committed); the caller wrongly encoded t_xmin = 99
+    // (no CLOG entry — reads as InProgress, hence never visible).
+    let clog = InMemoryClogAccessor::new();
+    clog.set_state(TxnId(5), TxnState::Committed);
+    let snap = writer_snapshot(5);
+
+    let bad_tuple = encode_row(99, 1, "stamped-by-am");
+    let tid = insert_one(&heap, first_page, &snap, &bad_tuple);
+
+    // The bytes on the page carry t_xmin = 5, not the caller's 99.
+    {
+        let guard = engine.buffer_pool().pin(tid.page_id).unwrap();
+        let page: &[u8; pg_storage::types::PAGE_SIZE] = guard.page().try_into().unwrap();
+        let bytes = SlottedPage::tuple(page, tid.slot_id).unwrap().unwrap();
+        let header = TupleHeader::read_from(bytes).unwrap();
+        assert_eq!(header.t_xmin, TxnId(5), "AM must overwrite caller t_xmin");
+    }
+
+    // Scan with the real CLOG: visible because CLOG[5] is committed. Had the
+    // AM kept t_xmin = 99, the row would read as InProgress → invisible.
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &Snapshot::everything(),
+            clog: &clog,
+        })
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "scan must judge visibility by CLOG[current_xid]"
+    );
+    assert_eq!(rows[0].1[1], Some(Datum::Text("stamped-by-am".to_string())));
+
+    // Update stamps too: the new version carries t_xmin = 5 even though the
+    // caller again encoded 99.
+    let bad_new = encode_row(99, 1, "updated-and-stamped");
+    let mut new_tid = Tid {
+        page_id: PageId(0),
+        slot_id: 0,
+    };
+    heap.update(UpdateContext {
+        clog: &NoOpClogAccessor,
+        rel: rel(first_page),
+        snapshot: &snap,
+        old_tid: rows[0].0,
+        new_tuple: &bad_new,
+        out_tid: Some(&mut new_tid),
+    })
+    .unwrap();
+
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &Snapshot::everything(),
+            clog: &clog,
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, new_tid);
+    assert_eq!(
+        rows[0].1[1],
+        Some(Datum::Text("updated-and-stamped".to_string()))
     );
 }

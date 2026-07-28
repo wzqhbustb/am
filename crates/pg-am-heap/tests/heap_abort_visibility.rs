@@ -48,7 +48,6 @@ fn rel(first_page: PageId) -> RelationDesc<'static> {
     RelationDesc {
         rel_oid: REL_OID,
         first_page,
-        page_count: 1,
         columns: &COLUMNS,
     }
 }
@@ -233,6 +232,7 @@ fn scan_dead_tuples_collects_aborted_inserts_and_committed_deletes() {
     let mut snap_c = Snapshot::everything();
     snap_c.current_xid = xid_c;
     heap.delete(DeleteContext {
+        clog: clog.as_ref(),
         rel: rel(first_page),
         snapshot: &snap_c,
         tid: tid_b,
@@ -297,6 +297,7 @@ fn aborted_deleter_tuple_is_not_dead() {
     let mut snap_c = Snapshot::everything();
     snap_c.current_xid = xid_c;
     heap.delete(DeleteContext {
+        clog: clog.as_ref(),
         rel: rel(first_page),
         snapshot: &snap_c,
         tid: tid_b,
@@ -323,6 +324,221 @@ fn aborted_deleter_tuple_is_not_dead() {
         })
         .unwrap();
     assert_eq!(rows.len(), 1, "row survives the aborted delete");
+
+    engine.shutdown();
+}
+
+/// Regression for the LP-flags-only liveness check (Stage K review P1-2):
+/// a logically deleted tuple keeps its LP `Normal`, so a second delete or an
+/// update used to overwrite the existing `t_xmax` — and if the overwriter
+/// aborted, the aborted stamp erased the committed one and the row came
+/// back to life. Liveness now reads the tuple header (`t_xmax == INVALID`
+/// required), so both operations must fail with `TupleNotFound`, and the
+/// original committed delete must stay effective.
+#[test]
+fn delete_of_deleted_and_update_of_deleted_are_rejected() {
+    use pg_am_heap::access_method::{DeleteContext, UpdatableAM, UpdateContext};
+    use pg_am_heap::HeapError;
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+
+    let clog = Arc::new(InMemoryClogAccessor::new());
+    let wal: Arc<dyn CommitWal> = Arc::clone(engine.wal_writer()) as Arc<dyn CommitWal>;
+    let mgr = TxnManager::new(
+        engine.txn_id_clock(),
+        wal,
+        Arc::clone(&clog) as Arc<dyn ClogAccessor>,
+    );
+
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+    let first_page = heap.create_heap(REL_OID).unwrap();
+
+    // Insert and commit a row, then delete it (committed).
+    let xid_b = mgr.begin_txn();
+    let tid = insert_as(&heap, first_page, xid_b, 1, "doomed");
+    mgr.commit_txn(xid_b).unwrap();
+
+    let xid_d1 = mgr.begin_txn();
+    let mut snap_d1 = Snapshot::everything();
+    snap_d1.current_xid = xid_d1;
+    heap.delete(DeleteContext {
+        clog: clog.as_ref(),
+        rel: rel(first_page),
+        snapshot: &snap_d1,
+        tid,
+    })
+    .unwrap();
+    mgr.commit_txn(xid_d1).unwrap();
+
+    // Second delete of the same row must be rejected (previously this
+    // overwrote t_xmax; if this deleter aborted, the row resurrected).
+    let xid_d2 = mgr.begin_txn();
+    let mut snap_d2 = Snapshot::everything();
+    snap_d2.current_xid = xid_d2;
+    let err = heap
+        .delete(DeleteContext {
+            clog: clog.as_ref(),
+            rel: rel(first_page),
+            snapshot: &snap_d2,
+            tid,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, HeapError::TupleNotFound(_)),
+        "delete of an already-deleted tuple must fail, got {err:?}"
+    );
+    mgr.abort_txn(xid_d2).unwrap();
+
+    // Update of the deleted row must also be rejected.
+    let xid_u = mgr.begin_txn();
+    let mut snap_u = Snapshot::everything();
+    snap_u.current_xid = xid_u;
+    let err = heap
+        .update(UpdateContext {
+            clog: clog.as_ref(),
+            rel: rel(first_page),
+            snapshot: &snap_u,
+            old_tid: tid,
+            new_tuple: &encode_row(xid_u, 2, "zombie"),
+            out_tid: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, HeapError::TupleNotFound(_)),
+        "update of an already-deleted tuple must fail, got {err:?}"
+    );
+    mgr.abort_txn(xid_u).unwrap();
+
+    // The original committed delete still holds: the row stays invisible.
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &Snapshot::everything(),
+            clog: clog.as_ref(),
+        })
+        .unwrap();
+    assert!(rows.is_empty(), "deleted row must stay deleted: {rows:?}");
+
+    engine.shutdown();
+}
+
+/// Regression for the stranded-row bug (Stage K review P1-1): a tuple whose
+/// deleter ABORTED must be deletable/updatable again — the liveness check
+/// consults the CLOG, so an aborted stamp does not count as a delete.
+/// Previously such a tuple stayed visible yet was permanently unmodifiable
+/// and uncollectable.
+#[test]
+fn aborted_deleter_tuple_can_be_deleted_again() {
+    use pg_am_heap::access_method::{DeleteContext, UpdatableAM, UpdateContext};
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+
+    let clog = Arc::new(InMemoryClogAccessor::new());
+    let wal: Arc<dyn CommitWal> = Arc::clone(engine.wal_writer()) as Arc<dyn CommitWal>;
+    let mgr = TxnManager::new(
+        engine.txn_id_clock(),
+        wal,
+        Arc::clone(&clog) as Arc<dyn ClogAccessor>,
+    );
+
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+    let first_page = heap.create_heap(REL_OID).unwrap();
+
+    // Insert + commit a row, then delete it as xid_c and ABORT the delete:
+    // the stamp remains but the delete never took effect.
+    let xid_b = mgr.begin_txn();
+    let tid = insert_as(&heap, first_page, xid_b, 1, "revisable");
+    mgr.commit_txn(xid_b).unwrap();
+
+    let xid_c = mgr.begin_txn();
+    let mut snap_c = Snapshot::everything();
+    snap_c.current_xid = xid_c;
+    heap.delete(DeleteContext {
+        rel: rel(first_page),
+        snapshot: &snap_c,
+        tid,
+        clog: clog.as_ref(),
+    })
+    .unwrap();
+    mgr.abort_txn(xid_c).unwrap();
+
+    // A second delete (xid_d, committed) must SUCCEED: the aborted stamp
+    // does not block it.
+    let xid_d = mgr.begin_txn();
+    let mut snap_d = Snapshot::everything();
+    snap_d.current_xid = xid_d;
+    heap.delete(DeleteContext {
+        rel: rel(first_page),
+        snapshot: &snap_d,
+        tid,
+        clog: clog.as_ref(),
+    })
+    .expect("delete after an aborted deleter must be allowed");
+    mgr.commit_txn(xid_d).unwrap();
+
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &Snapshot::everything(),
+            clog: clog.as_ref(),
+        })
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "row must be deleted by the committed retry"
+    );
+
+    // Same for update: another row, aborted delete, then a committed update
+    // must succeed and the new version becomes visible.
+    let xid_b2 = mgr.begin_txn();
+    let tid2 = insert_as(&heap, first_page, xid_b2, 2, "updatable");
+    mgr.commit_txn(xid_b2).unwrap();
+
+    let xid_c2 = mgr.begin_txn();
+    let mut snap_c2 = Snapshot::everything();
+    snap_c2.current_xid = xid_c2;
+    heap.delete(DeleteContext {
+        rel: rel(first_page),
+        snapshot: &snap_c2,
+        tid: tid2,
+        clog: clog.as_ref(),
+    })
+    .unwrap();
+    mgr.abort_txn(xid_c2).unwrap();
+
+    let xid_u = mgr.begin_txn();
+    let mut snap_u = Snapshot::everything();
+    snap_u.current_xid = xid_u;
+    heap.update(UpdateContext {
+        rel: rel(first_page),
+        snapshot: &snap_u,
+        old_tid: tid2,
+        new_tuple: &encode_row(xid_u, 3, "updated"),
+        out_tid: None,
+        clog: clog.as_ref(),
+    })
+    .expect("update after an aborted deleter must be allowed");
+    mgr.commit_txn(xid_u).unwrap();
+
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &Snapshot::everything(),
+            clog: clog.as_ref(),
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1[0], Some(Datum::Int4(3)));
 
     engine.shutdown();
 }

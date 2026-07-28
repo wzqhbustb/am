@@ -1,7 +1,8 @@
 //! pg_rust catalog layer — Phase 1 M2.
 //!
 //! This crate implements the system catalog and relation abstraction:
-//! - System tables (`pg_class`, `pg_attribute`, `pg_type`, `pg_am`, `pg_index`)
+//! - System tables (`pg_class`, `pg_attribute`, `pg_type`, `pg_am`, `pg_index`,
+//!   `pg_rust_relpages`)
 //! - Hardcoded bootstrap for empty data directories
 //! - `AccessMethod` / `UpdatableAM` trait definitions
 //! - `TableOid` / `TypeOid` newtype aliases
@@ -24,7 +25,7 @@ pub mod system_tables;
 use pg_storage::types::Oid;
 use serde::{Deserialize, Serialize};
 
-pub use catalog::{AmRow, AttributeRow, Catalog, RelationRow, TypeRow};
+pub use catalog::{AmRow, AttributeRow, Catalog, RelationRow, RelpagesRow, TypeRow};
 pub use oid::OidAllocator;
 
 /// Result type used by catalog and access method operations.

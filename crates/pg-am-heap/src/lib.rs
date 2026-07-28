@@ -29,6 +29,6 @@ pub use error::{HeapError, Result};
 pub use heap_am::HeapAM;
 pub use line_pointer::{LinePointer, LpFlags};
 pub use redo::{heap_redo_handlers, HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
-pub use slotted_page::SlottedPage;
+pub use slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 pub use toast::ToastPointer;
 pub use tuple::{ColumnType, Datum, TupleHeader};

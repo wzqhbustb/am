@@ -1,18 +1,26 @@
 //! System table schemas and physical layout (tech-selection §5.1).
 //!
-//! Five system tables exist in M2: `pg_class`, `pg_attribute`, `pg_type`,
-//! `pg_am`, and `pg_index` (the last is initialized but holds no rows until
-//! M2b). Their column definitions are hardcoded here — this is the "hardcoded
-//! bootstrap" choice of §5.2, replacing PostgreSQL's initdb SQL scripts.
+//! Six system tables exist in M2: `pg_class`, `pg_attribute`, `pg_type`,
+//! `pg_am`, `pg_index` (the last is initialized but holds no rows until
+//! M2b), and `pg_rust_relpages` (Stage K). Their column definitions are
+//! hardcoded here — this is the "hardcoded bootstrap" choice of §5.2,
+//! replacing PostgreSQL's initdb SQL scripts.
+//!
+//! `pg_rust_relpages` is **engine-private** (hence the `pg_rust_` prefix and
+//! an OID outside the PostgreSQL-conventional range): it is the
+//! relation → page-chain directory recording each heap relation's first/last
+//! page and page count, so `pg_class` keeps its PostgreSQL-compatible shape.
+//! Rows are written by DDL (`create_table`, Stage K engine waves), not by
+//! bootstrap; the bootstrap only initializes its (empty) first page.
 //!
 //! # Physical layout (M2a simplification)
 //!
 //! With a single data file, every system table gets a **fixed first page**:
 //! `pg_class` = page 1, `pg_attribute` = page 2, `pg_type` = page 3,
-//! `pg_am` = page 4, `pg_index` = page 5. The bootstrap content of each table
-//! fits in one page. Multi-page extension and a general relation→page mapping
-//! (recorded in `pg_class` itself) are Stage I work; until then these
-//! constants are the mapping.
+//! `pg_am` = page 4, `pg_index` = page 5, `pg_rust_relpages` = page 6. The
+//! bootstrap content of each table fits in one page. User relations are
+//! located through `pg_rust_relpages` plus the on-disk page chain (Stage K);
+//! these constants are the mapping for system tables only.
 
 use pg_am_heap::ColumnType;
 use pg_storage::types::{Oid, PageId};
@@ -30,6 +38,9 @@ pub const PG_TYPE_OID: TableOid = TableOid(Oid(1247));
 pub const PG_AM_OID: TableOid = TableOid(Oid(2601));
 /// `pg_index` OID (PostgreSQL conventional value).
 pub const PG_INDEX_OID: TableOid = TableOid(Oid(2610));
+/// `pg_rust_relpages` OID (engine-private directory table, Stage K; outside
+/// the PostgreSQL-conventional system OID range).
+pub const PG_RELPAGES_OID: TableOid = TableOid(Oid(9021));
 
 /// `pg_am` OID of the heap access method (PostgreSQL conventional value).
 pub const HEAP_AM_OID: Oid = Oid(2);
@@ -262,6 +273,42 @@ const PG_INDEX_COLUMNS: &[SysColumn] = &[
     },
 ];
 
+// pg_rust_relpages (Stage K): the engine-private relation → page-chain
+// directory. One row per heap relation, maintained by DDL (create_table /
+// drop_table and heap extension in later Stage K waves); bootstrap leaves it
+// empty. It deliberately lives outside pg_class so the PG-compatible catalog
+// shape is untouched (see the module-level note).
+const PG_RELPAGES_COLUMNS: &[SysColumn] = &[
+    SysColumn {
+        name: "rel_oid",
+        type_oid: INT8_OID,
+        column_type: ColumnType::Int8,
+        len: 8,
+        not_null: true,
+    },
+    SysColumn {
+        name: "first_page",
+        type_oid: INT8_OID,
+        column_type: ColumnType::Int8,
+        len: 8,
+        not_null: true,
+    },
+    SysColumn {
+        name: "last_page",
+        type_oid: INT8_OID,
+        column_type: ColumnType::Int8,
+        len: 8,
+        not_null: true,
+    },
+    SysColumn {
+        name: "page_count",
+        type_oid: INT8_OID,
+        column_type: ColumnType::Int8,
+        len: 8,
+        not_null: true,
+    },
+];
+
 /// `pg_class` definition: every relation (table, index, TOAST table).
 pub const PG_CLASS: SystemTableDef = SystemTableDef {
     oid: PG_CLASS_OID,
@@ -296,10 +343,11 @@ pub const PG_AM: SystemTableDef = SystemTableDef {
 
 /// `pg_index` definition: index metadata (empty until M2b).
 ///
-/// `Catalog::open` intentionally does **not** read this table (M2a reads the
-/// four content-bearing tables only — reading an always-empty page would be
-/// wasted I/O). M2b index code is responsible for writing and reading
-/// `pg_index` rows directly through the buffer pool.
+/// `Catalog::open` intentionally does **not** read this table (it reads the
+/// four PG-conventional content-bearing tables plus `pg_rust_relpages` —
+/// reading an always-empty `pg_index` page would be wasted I/O). M2b index
+/// code is responsible for writing and reading `pg_index` rows directly
+/// through the buffer pool.
 pub const PG_INDEX: SystemTableDef = SystemTableDef {
     oid: PG_INDEX_OID,
     name: "pg_index",
@@ -307,11 +355,30 @@ pub const PG_INDEX: SystemTableDef = SystemTableDef {
     columns: PG_INDEX_COLUMNS,
 };
 
-/// All system tables, in fixed-page order (pages 1..=5).
-pub const SYSTEM_TABLES: [SystemTableDef; 5] = [PG_CLASS, PG_ATTRIBUTE, PG_TYPE, PG_AM, PG_INDEX];
+/// `pg_rust_relpages` definition: engine-private relation → page-chain
+/// directory (Stage K; empty until DDL writes rows).
+///
+/// Unlike `pg_index`, `Catalog::open` **does** read this table: the heap AM's
+/// page-directory rebuild and later Stage K engine waves consult it.
+pub const PG_RELPAGES: SystemTableDef = SystemTableDef {
+    oid: PG_RELPAGES_OID,
+    name: "pg_rust_relpages",
+    first_page: PageId(6),
+    columns: PG_RELPAGES_COLUMNS,
+};
+
+/// All system tables, in fixed-page order (pages 1..=6).
+pub const SYSTEM_TABLES: [SystemTableDef; 6] = [
+    PG_CLASS,
+    PG_ATTRIBUTE,
+    PG_TYPE,
+    PG_AM,
+    PG_INDEX,
+    PG_RELPAGES,
+];
 
 /// The highest page ID reserved for system table bootstrap content.
-pub const LAST_SYSTEM_PAGE: PageId = PageId(5);
+pub const LAST_SYSTEM_PAGE: PageId = PageId(6);
 
 /// All built-in type OIDs referenced by system table columns are defined in
 /// [`crate::builtin_types`]; this helper keeps that invariant checked in
@@ -337,7 +404,7 @@ mod tests {
         for (i, def) in SYSTEM_TABLES.iter().enumerate() {
             assert_eq!(def.first_page, PageId(i as u64 + 1));
         }
-        assert_eq!(SYSTEM_TABLES[4].first_page, LAST_SYSTEM_PAGE);
+        assert_eq!(SYSTEM_TABLES[5].first_page, LAST_SYSTEM_PAGE);
     }
 
     #[test]
@@ -347,6 +414,16 @@ mod tests {
         assert_eq!(PG_TYPE.oid.raw(), Oid(1247));
         assert_eq!(PG_AM.oid.raw(), Oid(2601));
         assert_eq!(PG_INDEX.oid.raw(), Oid(2610));
+        // pg_rust_relpages is engine-private: a fixed OID outside the
+        // PostgreSQL-conventional range, distinct from every system table.
+        assert_eq!(PG_RELPAGES.oid.raw(), Oid(9021));
+        assert!(
+            SYSTEM_TABLES
+                .iter()
+                .filter(|t| t.oid == PG_RELPAGES.oid)
+                .count()
+                == 1
+        );
     }
 
     #[test]
@@ -381,6 +458,7 @@ mod tests {
         assert_eq!(PG_TYPE.columns.len(), 3);
         assert_eq!(PG_AM.columns.len(), 2);
         assert_eq!(PG_INDEX.columns.len(), 5);
+        assert_eq!(PG_RELPAGES.columns.len(), 4);
         // Type OIDs actually used by the system columns.
         for oid in [INT8_OID, TEXT_OID, INT4_OID] {
             assert!(referenced_type_oids().contains(&oid));

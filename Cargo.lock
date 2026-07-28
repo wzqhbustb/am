@@ -502,13 +502,17 @@ dependencies = [
 name = "pg-engine"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "parking_lot",
  "pg-am-btree",
  "pg-am-heap",
  "pg-catalog",
  "pg-storage",
  "pg-txn",
  "serde",
+ "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

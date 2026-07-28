@@ -17,5 +17,23 @@ pg-am-btree = { path = "../pg-am-btree" }
 # error types
 thiserror = "2"
 
+# logging / tracing (warnings on skipped half-created catalog entries and
+# best-effort abort failures)
+tracing = "0.1"
+
+# poisoning-free Mutex/RwLock (registry, ddl_lock, commit barrier)
+parking_lot = "0.12"
+
 # serialization
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# integration tests drive a real engine on a temp data dir
+tempfile = "3"
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "m2a_100_threads"
+harness = false

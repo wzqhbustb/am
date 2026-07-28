@@ -10,3 +10,17 @@
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
+
+pub mod clog_snapshot;
+pub mod engine;
+pub mod error;
+
+pub use clog_snapshot::TrackingClog;
+
+pub use engine::{ColumnDef, Engine, EngineConfig, Predicate, TableEntry, Value};
+pub use error::{EngineError, Result};
+
+// API surface re-exports: callers of the programmatic API (tech-selection
+// §21) should not need to name the lower crates for the basic types.
+pub use pg_am_heap::tuple::{ColumnType, Datum};
+pub use pg_storage::types::{Oid, PageId, Tid};

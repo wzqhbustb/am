@@ -20,16 +20,16 @@ use crate::Result;
 
 /// Physical + schema description of a relation, resolved by the caller.
 ///
-/// M2a has no general relation→page map, so `first_page` plus a page count
-/// tracked by the caller locates the heap. `columns` drives tuple decode.
+/// `first_page` is the head of the relation's on-disk page chain (Stage K):
+/// the AM rebuilds its in-memory page list by walking the chain from here
+/// (see [`crate::heap_am`]), so no page count is needed or trusted.
+/// `columns` drives tuple decode.
 #[derive(Debug, Clone, Copy)]
 pub struct RelationDesc<'a> {
     /// The relation's OID (identity / logging).
     pub rel_oid: Oid,
-    /// The relation's first heap page in the shared data file.
+    /// The relation's first heap page in the shared data file (chain head).
     pub first_page: PageId,
-    /// Number of pages the relation currently occupies (`>= 1`).
-    pub page_count: u64,
     /// Column schema, in `attnum` order, for tuple encode/decode.
     pub columns: &'a [ColumnType],
 }
@@ -71,6 +71,12 @@ pub struct UpdateContext<'a> {
     pub new_tuple: &'a [u8],
     /// Filled with the new version's TID on success.
     pub out_tid: Option<&'a mut Tid>,
+    /// Commit-status oracle used by the liveness check: a tuple whose
+    /// `t_xmax` is set is only dead if the deleter COMMITTED. An aborted
+    /// deleter means the delete never took effect, so the tuple may be
+    /// updated again (without this, such a tuple would be visible yet
+    /// permanently unmodifiable).
+    pub clog: &'a dyn ClogAccessor,
 }
 
 /// Inputs to [`AccessMethod::delete`].
@@ -81,6 +87,9 @@ pub struct DeleteContext<'a> {
     pub snapshot: &'a Snapshot,
     /// TID of the row to delete.
     pub tid: Tid,
+    /// Commit-status oracle for the liveness check (see
+    /// [`UpdateContext::clog`]).
+    pub clog: &'a dyn ClogAccessor,
 }
 
 /// Inputs to [`AccessMethod::build`] (M2a placeholder).

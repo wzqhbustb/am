@@ -8,15 +8,29 @@
 //! │ LinePointer array  (grows down from offset 32)      │
 //! │ ─── free space: pd_lower .. pd_upper ───            │
 //! │ Tuple data         (grows up toward the LP array)   │
-//! │ Special space      (heap: none, special_size = 0)   │
+//! │ Special space      (all relations: 16 B page chain) │
 //! └─────────────────────────────────────────────────────┘
 //! ```
 //!
+//! # Special space and the heap page chain (Stage K)
+//!
+//! Every heap-AM relation — user tables **and** the system catalogs — is
+//! initialized with [`HEAP_SPECIAL_SIZE`] bytes of special space
+//! ([`SlottedPage::init_with_special`]). The special space holds the forward
+//! pointer of the relation's page chain:
+//!
+//! | Relative offset | Field                              |
+//! |-----------------|------------------------------------|
+//! | `pd_special+0..8`  | next page id (LE u64; 0 = no next page) |
+//! | `pd_special+8..16` | reserved, always zero                 |
+//!
 //! # Invariants
 //!
-//! - `PAGE_HEADER_SIZE <= pd_lower <= pd_upper <= pd_special == PAGE_SIZE`.
+//! - `PAGE_HEADER_SIZE <= pd_lower <= pd_upper <= pd_special <= PAGE_SIZE`.
 //!   `pd_lower` and `pd_upper` are the authoritative header fields maintained
-//!   by every mutation here; [`debug_assert_invariants`] checks them.
+//!   by every mutation here; [`debug_assert_invariants`] checks them. The
+//!   special space is not tuple space: `pd_upper <= pd_special` already keeps
+//!   tuple regions out of it.
 //! - The LP array only ever grows (TID stability, §二 "关键约束"): deletion
 //!   marks the LP [`LpFlags::Unused`], and `add_tuple` recycles `Unused`
 //!   slots before appending a new LP.
@@ -28,10 +42,19 @@
 //! reorganization in a later milestone).
 
 use pg_storage::page::{PageHeader, PAGE_HEADER_SIZE};
-use pg_storage::types::PAGE_SIZE;
+use pg_storage::types::{PageId, PAGE_SIZE};
 
 use crate::error::{HeapError, Result};
 use crate::line_pointer::{LinePointer, LpFlags, LINE_POINTER_SIZE};
+
+/// Special-space size of every heap-AM page in bytes (Stage K page chain).
+///
+/// Layout: `[pd_special, pd_special+8)` = next page id (LE u64, 0 = none);
+/// `[pd_special+8, pd_special+16)` = reserved, always zero. All relations —
+/// user tables and system catalogs alike — use this geometry, so the chain
+/// machinery applies uniformly (system catalogs are single-page in practice,
+/// their next pointer stays 0).
+pub const HEAP_SPECIAL_SIZE: usize = 16;
 
 /// Slotted-page operations on a raw heap page.
 ///
@@ -40,15 +63,30 @@ use crate::line_pointer::{LinePointer, LpFlags, LINE_POINTER_SIZE};
 pub struct SlottedPage;
 
 impl SlottedPage {
-    /// Initialize a fresh heap page: 32-byte header, `pd_lower = 32`,
-    /// `pd_upper = pd_special = PAGE_SIZE` (heap pages have no special
-    /// space, §二).
+    /// Initialize a fresh page with no special space: 32-byte header,
+    /// `pd_lower = 32`, `pd_upper = pd_special = PAGE_SIZE`.
+    ///
+    /// Convenience wrapper for tests/benchmarks that do not exercise the page
+    /// chain. **All production relations (user tables and system catalogs)
+    /// use [`SlottedPage::init_with_special`] with [`HEAP_SPECIAL_SIZE`]** —
+    /// this wrapper has no production callers left.
     pub fn init(page: &mut [u8; PAGE_SIZE]) {
+        Self::init_with_special(page, 0);
+    }
+
+    /// Initialize a fresh page with `special_size` bytes of special space:
+    /// `pd_special = PAGE_SIZE - special_size`, `pd_upper = pd_special`,
+    /// `pd_lower = 32` (§二).
+    pub fn init_with_special(page: &mut [u8; PAGE_SIZE], special_size: usize) {
+        debug_assert!(special_size <= PAGE_SIZE - PAGE_HEADER_SIZE);
         // Zero the whole page, not just the header: a recycled buffer-pool
         // frame still holds the previous tenant's bytes, and the LP array /
         // tuple region must start clean.
         page.fill(0);
         PageHeader::init_page(page);
+        let pd_special = (PAGE_SIZE - special_size) as u16;
+        page[16..18].copy_from_slice(&pd_special.to_le_bytes()); // pd_upper
+        page[18..20].copy_from_slice(&pd_special.to_le_bytes()); // pd_special
         if cfg!(debug_assertions) {
             debug_assert_invariants(page);
         }
@@ -57,13 +95,20 @@ impl SlottedPage {
     /// Initialize the page only if it has never been initialized.
     ///
     /// A validly initialized heap page always has `pd_upper >= PAGE_HEADER_SIZE`
-    /// (it starts at `PAGE_SIZE` and only shrinks toward `pd_lower`), so
+    /// (it starts at `pd_special` and only shrinks toward `pd_lower`), so
     /// `pd_upper == 0` uniquely identifies a fresh, all-zero page — for example
     /// one materialized by extending the data file with zeros during recovery,
     /// before any `HeapInsert` redo has run against it.
     pub fn init_if_fresh(page: &mut [u8; PAGE_SIZE]) {
+        Self::init_if_fresh_with_special(page, 0);
+    }
+
+    /// [`SlottedPage::init_if_fresh`] with an explicit special-space size.
+    /// Heap pages (user relations and their redo path) pass
+    /// [`HEAP_SPECIAL_SIZE`].
+    pub fn init_if_fresh_with_special(page: &mut [u8; PAGE_SIZE], special_size: usize) {
         if Self::header(page).pd_upper == 0 {
-            Self::init(page);
+            Self::init_with_special(page, special_size);
         }
     }
 
@@ -87,6 +132,46 @@ impl SlottedPage {
     pub fn free_space(page: &[u8; PAGE_SIZE]) -> usize {
         let header = Self::header(page);
         header.pd_upper.saturating_sub(header.pd_lower) as usize
+    }
+
+    /// Write the page-chain forward pointer into the special space
+    /// (`None` clears it to 0, Stage K). The reserved trailing 8 bytes are
+    /// left untouched (they are zeroed by [`SlottedPage::init_with_special`]).
+    ///
+    /// Debug-asserts that the page was initialized with exactly
+    /// [`HEAP_SPECIAL_SIZE`] bytes of special space — writing a chain pointer
+    /// onto a special-less page would corrupt tuple data. (All production
+    /// pages carry the 16B geometry, so this cannot fire in practice; it
+    /// guards against misuse on hand-rolled test pages.)
+    pub fn set_next_page(page: &mut [u8; PAGE_SIZE], next: Option<PageId>) {
+        let header = Self::header(page);
+        debug_assert_eq!(
+            header.pd_special as usize,
+            PAGE_SIZE - HEAP_SPECIAL_SIZE,
+            "set_next_page requires a heap page with HEAP_SPECIAL_SIZE special space"
+        );
+        let off = header.pd_special as usize;
+        let raw = next.map(|p| p.0).unwrap_or(0);
+        page[off..off + 8].copy_from_slice(&raw.to_le_bytes());
+    }
+
+    /// Read the page-chain forward pointer from the special space; `Ok(None)`
+    /// means "no next page" (Stage K).
+    ///
+    /// Returns [`HeapError::Corrupted`] if the header geometry is inconsistent
+    /// or the page does not carry exactly [`HEAP_SPECIAL_SIZE`] bytes of
+    /// special space — corrupted page bytes must never cause a panic.
+    pub fn next_page(page: &[u8; PAGE_SIZE]) -> Result<Option<PageId>> {
+        let header = Self::checked_header(page)?;
+        if header.pd_special as usize != PAGE_SIZE - HEAP_SPECIAL_SIZE {
+            return Err(HeapError::Corrupted(format!(
+                "page chain pointer requires special_size {HEAP_SPECIAL_SIZE}, page has pd_special={}",
+                header.pd_special
+            )));
+        }
+        let off = header.pd_special as usize;
+        let raw = u64::from_le_bytes(page[off..off + 8].try_into().unwrap());
+        Ok(if raw == 0 { None } else { Some(PageId(raw)) })
     }
 
     /// Read the line pointer at `slot`. Returns [`HeapError::InvalidSlot`]
@@ -137,7 +222,12 @@ impl SlottedPage {
     /// Tuple bytes are placed at `pd_upper - len`.
     pub fn add_tuple(page: &mut [u8; PAGE_SIZE], bytes: &[u8]) -> Result<u16> {
         let len = bytes.len();
-        let max_tuple = PAGE_SIZE - PAGE_HEADER_SIZE - LINE_POINTER_SIZE;
+        let header = Self::checked_header(page)?;
+        // The largest tuple that can ever fit: special space is reserved for
+        // the page chain, not tuple data. Saturating: a degenerate (but
+        // geometry-valid) header with pd_special == PAGE_HEADER_SIZE yields 0.
+        let max_tuple =
+            (header.pd_special as usize).saturating_sub(PAGE_HEADER_SIZE + LINE_POINTER_SIZE);
         if len == 0 {
             return Err(HeapError::InvalidArgument(
                 "cannot insert an empty tuple".to_string(),
@@ -147,7 +237,6 @@ impl SlottedPage {
             return Err(HeapError::TupleTooLarge(len));
         }
 
-        let header = Self::checked_header(page)?;
         let slot_count = (header.pd_lower as usize - PAGE_HEADER_SIZE) / LINE_POINTER_SIZE;
 
         // Find a recyclable Unused slot (first-fit). Reads the LP array
@@ -404,5 +493,70 @@ mod tests {
             SlottedPage::add_tuple(&mut page, &[]),
             Err(HeapError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn init_with_special_reserves_special_space() {
+        let mut page = [0u8; PAGE_SIZE];
+        SlottedPage::init_with_special(&mut page, HEAP_SPECIAL_SIZE);
+        let header = SlottedPage::header(&page);
+        assert_eq!(header.pd_lower, PAGE_HEADER_SIZE as u16);
+        assert_eq!(header.pd_special as usize, PAGE_SIZE - HEAP_SPECIAL_SIZE);
+        assert_eq!(header.pd_upper, header.pd_special);
+        assert_eq!(SlottedPage::slot_count(&page), 0);
+        assert_eq!(
+            SlottedPage::free_space(&page),
+            PAGE_SIZE - HEAP_SPECIAL_SIZE - PAGE_HEADER_SIZE
+        );
+        debug_assert_invariants(&page);
+    }
+
+    #[test]
+    fn next_page_round_trip() {
+        let mut page = [0u8; PAGE_SIZE];
+        SlottedPage::init_with_special(&mut page, HEAP_SPECIAL_SIZE);
+        // A freshly initialized page has no successor.
+        assert_eq!(SlottedPage::next_page(&page).unwrap(), None);
+
+        SlottedPage::set_next_page(&mut page, Some(PageId(42)));
+        assert_eq!(SlottedPage::next_page(&page).unwrap(), Some(PageId(42)));
+
+        SlottedPage::set_next_page(&mut page, None);
+        assert_eq!(SlottedPage::next_page(&page).unwrap(), None);
+
+        // The reserved trailing 8 bytes stay zero.
+        let off = PAGE_SIZE - HEAP_SPECIAL_SIZE;
+        assert!(page[off + 8..off + 16].iter().all(|&b| b == 0));
+        debug_assert_invariants(&page);
+    }
+
+    #[test]
+    fn next_page_rejects_special_less_page() {
+        // A catalog-style page (special_size = 0) has no chain pointer;
+        // reading one must be an error, not a read of tuple bytes.
+        let page = fresh_page();
+        assert!(matches!(
+            SlottedPage::next_page(&page),
+            Err(HeapError::Corrupted(_))
+        ));
+    }
+
+    #[test]
+    fn special_space_shrinks_tuple_capacity() {
+        let mut page = [0u8; PAGE_SIZE];
+        SlottedPage::init_with_special(&mut page, HEAP_SPECIAL_SIZE);
+        let bytes = vec![0x5Au8; 100];
+        let mut n = 0usize;
+        while SlottedPage::free_space(&page) >= 100 + LINE_POINTER_SIZE {
+            SlottedPage::add_tuple(&mut page, &bytes).unwrap();
+            n += 1;
+        }
+        debug_assert_invariants(&page);
+        // The special space is not usable for tuples.
+        assert_eq!(n, (PAGE_SIZE - HEAP_SPECIAL_SIZE - PAGE_HEADER_SIZE) / 104);
+        // And the chain pointer survives a full page.
+        SlottedPage::set_next_page(&mut page, Some(PageId(7)));
+        assert_eq!(SlottedPage::next_page(&page).unwrap(), Some(PageId(7)));
+        debug_assert_invariants(&page);
     }
 }

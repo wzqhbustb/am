@@ -20,11 +20,23 @@
 //!
 //! Freshly allocated heap pages may be materialized as all-zero bytes when the
 //! data file is extended during replay (the `PageAlloc` record, which has a
-//! lower LSN, runs first). [`SlottedPage::init_if_fresh`] initializes such a
-//! page before the first tuple is placed.
+//! lower LSN, runs first). [`SlottedPage::init_if_fresh_with_special`]
+//! initializes such a page — with the Stage K [`HEAP_SPECIAL_SIZE`] special
+//! space, so a recovered page is indistinguishable from one initialized on the
+//! forward path — before the first tuple is placed.
+//!
+//! # Page-chain recovery (Stage K)
+//!
+//! The handlers never walk or repair the relation page chain: they locate
+//! pages directly by `record.page_id`. Chain links do not need redo support
+//! here because the forward path logs a post-image `FullPageImage` of the old
+//! tail page when it links a new page (see [`crate::heap_am`] "Durability of
+//! chain links"); the storage engine's default `FullPageImageRedoHandler`
+//! restores those links unconditionally during the same replay, so the chain
+//! `HeapAM::seed_from_chain` walks after open is complete.
 
 use crate::error::HeapError;
-use crate::slotted_page::SlottedPage;
+use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 use crate::tuple::{TupleHeader, HEAP_UPDATED, TUPLE_HEADER_SIZE};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::error::{Result, StorageError};
@@ -64,7 +76,7 @@ impl RedoHandler for HeapInsertHandler {
         if page_pd_lsn(page) >= record.lsn {
             return Ok(());
         }
-        SlottedPage::init_if_fresh(page);
+        SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
         let slot = SlottedPage::add_tuple(page, &rec.tuple_bytes).map_err(heap_to_storage)?;
         // Slot divergence means the page on disk is inconsistent with the
         // WAL stream (e.g. torn base page). Hard-fail rather than silently
@@ -104,7 +116,7 @@ impl RedoHandler for HeapUpdateHandler {
             let page: &mut [u8; PAGE_SIZE] =
                 guard.page_mut().try_into().expect("frame is PAGE_SIZE");
             if page_pd_lsn(page) < record.lsn {
-                SlottedPage::init_if_fresh(page);
+                SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
                 stamp_deleted(page, rec.old_tid, rec.xmax_old, true).map_err(heap_to_storage)?;
                 let slot =
                     SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
@@ -129,7 +141,7 @@ impl RedoHandler for HeapUpdateHandler {
             let page: &mut [u8; PAGE_SIZE] =
                 guard.page_mut().try_into().expect("frame is PAGE_SIZE");
             if page_pd_lsn(page) < record.lsn {
-                SlottedPage::init_if_fresh(page);
+                SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
                 stamp_deleted(page, rec.old_tid, rec.xmax_old, true).map_err(heap_to_storage)?;
                 stamp_pd_lsn(page, record.lsn);
             }
@@ -141,7 +153,7 @@ impl RedoHandler for HeapUpdateHandler {
             let page: &mut [u8; PAGE_SIZE] =
                 guard.page_mut().try_into().expect("frame is PAGE_SIZE");
             if page_pd_lsn(page) < record.lsn {
-                SlottedPage::init_if_fresh(page);
+                SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
                 let slot =
                     SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
                 if slot != rec.new_tid.slot_id {
