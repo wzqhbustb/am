@@ -1,30 +1,49 @@
 //! The assembled engine and its programmatic API (coding-plan Stage K;
-//! tech-selection §21 "M2a API").
+//! tech-selection §21 "M2a API"; CLOG assembly updated for M2b Stage L).
 //!
-//! [`Engine`] wires the M2a components together at open time, in this order:
+//! [`Engine`] wires the components together at open time, in this order:
 //!
-//! 1. `StorageEngine::open_with_redo_and_clog` — storage recovery with the
+//! 1. `ClogBuffer::open` — the M2b disk-backed SLRU commit log
+//!    (`pg_txn::ClogBuffer`, tech-selection §6.3), rooted at
+//!    `{data_dir}/clog/`. It is opened **before** storage so WAL replay can
+//!    record terminal states into it (the redo handlers' `set_state` calls
+//!    are idempotent, so replaying a commit the CLOG already flushed is a
+//!    no-op).
+//! 2. `StorageEngine::open_with_redo_and_clog` — storage recovery with the
 //!    heap AM's and the txn layer's redo handlers injected
-//!    (`heap_redo_handlers` + `txn_redo_handlers`) and a shared
-//!    [`TrackingClog`] (a recording wrapper over `InMemoryClogAccessor`)
-//!    that both recovery and post-recovery visibility checks read.
+//!    (`heap_redo_handlers` + `txn_redo_handlers`) and the shared
+//!    `ClogBuffer` as the `ClogAccessor` that both recovery and
+//!    post-recovery visibility checks read.
 //!    `checkpoint.set_next_txn_id_source` is already done by `pg-storage`
 //!    itself (see `StorageEngine::create_new` / `recover_with_redo_handlers`).
-//! 2. The checkpoint-time **CLOG snapshot** is loaded into the CLOG (see the
-//!    [`crate::clog_snapshot`] module: recovery replay alone cannot rebuild
-//!    commit records from before the redo point).
-//! 3. `Catalog::open` — bootstrap (if needed) + read-back of the system
+//! 3. `storage.checkpoint().set_clog_flush(clog)` — installs the
+//!    checkpoint-time CLOG flush hook (tech-selection §6.4, v2.3-21): every
+//!    checkpoint writes back and fsyncs the dirty CLOG frames between
+//!    `CheckpointBegin` and `CheckpointEnd`. That flush is the **only**
+//!    CLOG fsync anywhere; commit/abort durability comes from the
+//!    `TxnCommit`/`TxnAbort` WAL records until a checkpoint lands the bits.
+//! 4. `Catalog::open` — bootstrap (if needed) + read-back of the system
 //!    tables; owns the `OidAllocator` wired into checkpoints. The catalog is
 //!    opened **once per Engine** and kept: re-opening after DDL would reset
 //!    the OID allocator and reopen the crash-rollback window the startup
 //!    correction in `Catalog::open` exists to close.
-//! 4. `HeapAM::new` over the shared buffer pool / WAL writer.
-//! 5. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
+//! 5. `HeapAM::new` over the shared buffer pool / WAL writer.
+//! 6. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
 //!    `Arc<dyn CommitWal>`, and the same CLOG.
-//! 6. The in-memory **table registry** (`RwLock<HashMap<String, TableEntry>>`)
+//! 7. The in-memory **table registry** (`RwLock<HashMap<String, TableEntry>>`)
 //!    is rebuilt from the catalog: `pg_class` rows (last version per OID
 //!    wins, `relkind = 'd'` marks a drop) joined with `pg_attribute` and
 //!    `pg_rust_relpages`.
+//!
+//! # M2a → M2b: the CLOG snapshot bridge is gone
+//!
+//! M2a kept commit state in memory and bridged the "commit → checkpoint →
+//! crash" gap with a checkpoint-time dump of `{data_dir}/clog-snapshot.bin`
+//! (the deleted `clog_snapshot` module). The disk CLOG closes that gap
+//! natively: checkpointed bits are on disk, and bits newer than the last
+//! checkpoint are rebuilt by WAL replay from the redo point. A leftover
+//! `clog-snapshot.bin` / `clog-snapshot.tmp` in an old data directory is
+//! **ignored** — open never reads it and the engine never writes one.
 //!
 //! # DDL crash atomicity (M2a limitation)
 //!
@@ -76,12 +95,12 @@ use pg_catalog::system_tables::{
     SystemTableDef, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_RELPAGES, RELKIND_TABLE,
 };
 use pg_catalog::{Catalog, RelationRow, TypeOid};
+use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
-use pg_txn::{txn_redo_handlers, ClogAccessor, CommitWal, Snapshot, TxnManager};
+use pg_txn::{txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, Snapshot, TxnManager};
 
-use crate::clog_snapshot::{load_clog_snapshot, write_clog_snapshot, TrackingClog};
 use crate::error::{EngineError, Result};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
@@ -93,16 +112,33 @@ use crate::error::{EngineError, Result};
 /// corruption.
 const RELKIND_DROPPED: &str = "d";
 
-/// Engine-level configuration (M2a).
+/// Default [`EngineConfig::clog_buffer_frames`] (tech-selection §6.3,
+/// v2.3-25): 8 frames = a 128K-XID window, covering 100 concurrent
+/// transactions with headroom.
+pub const DEFAULT_CLOG_BUFFER_FRAMES: usize = 8;
+
+/// Engine-level configuration.
 ///
-/// A thin wrapper over [`StorageConfig`]: M2a adds no engine-specific knobs
-/// yet, but wrapping keeps [`Engine::open`]'s signature stable when later
-/// milestones add their own (e.g. M2b's `clog_buffer_frames`, v2.3-25)
-/// without breaking callers.
+/// A thin wrapper over [`StorageConfig`] plus the M2b CLOG cache size;
+/// wrapping keeps [`Engine::open`]'s signature stable when later milestones
+/// add their own knobs without breaking callers.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Storage-layer configuration (buffer pool, WAL, checkpoints).
     pub storage: StorageConfig,
+    /// Number of clock-sweep frames in the disk CLOG's SLRU cache
+    /// (`pg_txn::ClogBuffer`; M2b Stage L, tech-selection §6.3, v2.3-25).
+    ///
+    /// Frame-count rationale (§6.3): the default of 8 frames is a
+    /// 128K-XID window, which covers 100 concurrent transactions with
+    /// headroom; production TP (≥1K TPS × 60s transaction lifetimes plus
+    /// cold lookbacks) should use 64 (1M XIDs); OLAP with hour-long scans
+    /// should use 256 (4M XIDs) to avoid hot/cold thrash.
+    ///
+    /// Validation is delegated to [`ClogBuffer::open`], which panics on a
+    /// value outside [4, 1024] — an invalid configuration must fail loudly
+    /// at startup, not degrade at runtime.
+    pub clog_buffer_frames: usize,
 }
 
 impl EngineConfig {
@@ -110,6 +146,7 @@ impl EngineConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             storage: StorageConfig::new(data_dir),
+            clog_buffer_frames: DEFAULT_CLOG_BUFFER_FRAMES,
         }
     }
 }
@@ -154,9 +191,9 @@ pub struct TableEntry {
     pub columns: Vec<ColumnDef>,
 }
 
-/// The assembled M2a engine: storage + catalog + heap AM + txn manager +
-/// in-memory table registry. Assembly order is documented at the module
-/// level.
+/// The assembled engine: storage + catalog + heap AM + txn manager + disk
+/// CLOG + in-memory table registry. Assembly order is documented at the
+/// module level.
 ///
 /// All operations take `&self`; every field is internally synchronized, so a
 /// single `Engine` (typically behind an `Arc`) is shared across threads.
@@ -165,32 +202,52 @@ pub struct Engine {
     catalog: Catalog,
     heap: HeapAM,
     txn: TxnManager,
-    clog: Arc<TrackingClog>,
+    clog: Arc<ClogBuffer>,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
-    /// Commit/checkpoint barrier (fixes the dump→truncate window): every
-    /// auto-commit statement holds a read guard for its whole lifetime, and
-    /// [`Engine::checkpoint`] holds the write guard across the CLOG snapshot
-    /// dump *and* the storage checkpoint. A commit that is durable before the
-    /// checkpoint's `begin_lsn` has therefore finished `clog.set_state`
-    /// before the dump reads it (so it is in the snapshot); any commit that
-    /// starts after the dump is assigned an LSN past `begin_lsn` (so WAL
-    /// replay rebuilds it). Without the barrier a commit could append before
-    /// `begin_lsn` but set its CLOG state after the dump — present in
-    /// neither snapshot nor replay, i.e. invisible after restart.
+    /// Commit/checkpoint barrier: every auto-commit statement holds a read
+    /// guard for its whole lifetime (commit/abort included), and
+    /// [`Engine::checkpoint`] holds the write guard across the **entire**
+    /// storage checkpoint — from `begin_lsn` capture through the CLOG flush
+    /// to WAL recycling.
+    ///
+    /// This is still load-bearing with the disk CLOG. The window it closes
+    /// is the M2a "neither snapshot nor replay" window, now against the
+    /// checkpoint's CLOG flush: a commit whose `TxnCommit` WAL record landed
+    /// before the checkpoint's `begin_lsn` (so recovery will never replay
+    /// it) but whose `clog.set_state` ran after the checkpoint's
+    /// `flush_dirty` would be present in NEITHER the fsynced CLOG NOR the
+    /// replay — committed, yet reading `InProgress` (invisible) after
+    /// restart. With the barrier, a commit durable before `begin_lsn` has
+    /// finished `set_state` before the flush runs (its bit is fsynced), and
+    /// any commit starting after the barrier is assigned an LSN past
+    /// `begin_lsn` (so replay rebuilds it). The commit's WAL fsync and the
+    /// CLOG flush are otherwise independent: `set_state` only touches an
+    /// in-memory frame, and `flush_dirty` takes the same buffer-wide lock,
+    /// so there is no data race — the barrier exists purely for this
+    /// durability ordering. (Serializing concurrent `Engine::checkpoint`
+    /// calls is redundant with the coordinator's internal checkpoint lock.)
     commit_barrier: RwLock<()>,
 }
 
 impl Engine {
-    /// Open (or create) a database at `data_dir`, assembling all M2a layers.
+    /// Open (or create) a database at `data_dir`, assembling all layers.
     ///
     /// See the module docs for the assembly order and the redo-handler /
     /// CLOG wiring.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.clog_buffer_frames` is outside [4, 1024]
+    /// (validation lives in [`ClogBuffer::open`], tech-selection §6.3).
     pub fn open(data_dir: &Path, config: EngineConfig) -> Result<Self> {
-        let clog = Arc::new(TrackingClog::new());
+        // 1. Disk CLOG first: WAL replay during storage recovery records
+        //    terminal states into it (idempotently).
+        let clog = Arc::new(ClogBuffer::open(data_dir, config.clog_buffer_frames)?);
+        // 2. Storage recovery with the heap + txn redo handlers and the CLOG.
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
         let storage = StorageEngine::open_with_redo_and_clog(
@@ -199,18 +256,25 @@ impl Engine {
             redo_handlers,
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
         )?;
+        // 3. Checkpoint-time CLOG flush hook (§6.4, v2.3-21). The engine
+        //    never starts background checkpointing, so this cannot race a
+        //    checkpoint already in flight.
+        storage
+            .checkpoint()
+            .set_clog_flush(Arc::clone(&clog) as Arc<dyn ClogFlush>);
 
-        // Recovery replay rebuilt the CLOG for everything after the last
-        // checkpoint; the checkpoint-time snapshot (see `clog_snapshot`)
-        // restores everything before it. Loading goes through `set_state`,
-        // so the tracker absorbs the snapshot into its full-history dump.
-        for (xid, state) in load_clog_snapshot(data_dir)? {
-            clog.set_state(xid, state);
-        }
+        // 3b. M2a → M2b migration: load any leftover `clog-snapshot.bin`
+        //     (the M2a bridge for pre-checkpoint commit states, written by
+        //     directories last opened before the disk CLOG existed) into the
+        //     disk CLOG. Replay already covered the post-checkpoint WAL
+        //     suffix; this covers the pre-checkpoint M2a-era states.
+        //     Missing file = no-op; corrupt file = hard error (never silent).
+        crate::clog_snapshot_migrate::migrate_legacy_clog_snapshot(data_dir, &clog)?;
 
-        // One catalog per engine (module docs: OID-allocator monotonicity).
+        // 4. One catalog per engine (module docs: OID-allocator monotonicity).
         let catalog = Catalog::open(&storage)?;
 
+        // 5./6. Heap AM and transaction manager over the shared components.
         let heap = HeapAM::new(
             Arc::clone(storage.buffer_pool()),
             Arc::clone(storage.wal_writer()),
@@ -222,6 +286,7 @@ impl Engine {
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
         );
 
+        // 7. Table registry from the catalog.
         let registry = Self::build_registry(&catalog)?;
 
         Ok(Self {
@@ -302,24 +367,24 @@ impl Engine {
         Ok(registry)
     }
 
-    /// Flush all dirty pages and persist the superblock (XID clock, OID
-    /// counter, checkpoint LSN).
+    /// Flush all dirty pages, fsync the disk CLOG's dirty frames, persist
+    /// the superblock (XID clock, OID counter, checkpoint LSN), and recycle
+    /// WAL segments before the redo point.
     ///
-    /// First dumps the CLOG snapshot (`clog_snapshot` module: recovery
-    /// replays only from the checkpoint redo point, so without the snapshot
-    /// every commit record before it would be lost), **then** triggers the
-    /// storage checkpoint that may truncate the WAL prefix. This is the only
-    /// supported checkpoint path in M2a — background checkpointing is never
-    /// started, precisely because it would bypass the dump.
+    /// The CLOG flush runs **inside** the storage checkpoint — between
+    /// `CheckpointBegin` and `CheckpointEnd`, via the `ClogFlush` hook
+    /// installed at open (tech-selection §6.4, v2.3-21) — so there is no
+    /// separate engine-level dump step: this is a pure
+    /// `trigger_checkpoint` plus the commit-barrier semantics below. This
+    /// is the only supported checkpoint path; background checkpointing is
+    /// never started.
     pub fn checkpoint(&self) -> Result<()> {
-        // Take the commit barrier across BOTH the dump and the storage
-        // checkpoint (see the field docs): in-flight commits must finish
-        // `clog.set_state` before the dump, and new commits must land past
-        // the checkpoint's begin_lsn. The write guard also serializes
-        // concurrent `Engine::checkpoint` calls (they would otherwise race
-        // on the shared `clog-snapshot.tmp` scratch file).
+        // Take the commit barrier across the whole storage checkpoint (see
+        // the field docs): commits durable before begin_lsn must have
+        // finished `clog.set_state` before the checkpoint's CLOG flush, and
+        // commits starting after must land past begin_lsn so replay
+        // rebuilds them.
         let _barrier = self.commit_barrier.write();
-        write_clog_snapshot(self.storage.data_dir(), &self.clog.terminal_entries())?;
         self.storage.trigger_checkpoint()?;
         Ok(())
     }
@@ -607,7 +672,7 @@ impl Engine {
         // Read-side of the commit/checkpoint barrier (see the field docs):
         // statements run concurrently with each other, but `Engine::checkpoint`
         // waits for every in-flight statement to finish commit/abort before
-        // dumping the CLOG snapshot.
+        // its CLOG flush and redo-point advance.
         let _barrier = self.commit_barrier.read();
         let xid = self.txn.begin_txn();
         let mut snap = Snapshot::everything();
@@ -753,12 +818,23 @@ impl Engine {
 
     /// The transaction manager (testing / advanced use, e.g. driving an
     /// explicit abort through the engine's own CLOG).
+    ///
+    /// **Caveat — the commit barrier does NOT cover this back door** (Stage L
+    /// review): `commit_txn` / `abort_txn` called directly here can race
+    /// [`Engine::checkpoint`], and a commit whose WAL append lands before the
+    /// checkpoint's `begin_lsn` while its `set_state` lands after the
+    /// checkpoint's CLOG `flush_dirty` is present in neither the fsynced CLOG
+    /// nor the replay — the row reads `InProgress` after a restart. Only the
+    /// engine's auto-commit path (`insert` / `update` / `delete` / DDL)
+    /// takes the barrier read guard. Using this handle for commits
+    /// concurrent with `Engine::checkpoint` is undefined behavior; M2c will
+    /// sink the barrier into `TxnManager` itself.
     pub fn txn_manager(&self) -> &TxnManager {
         &self.txn
     }
 
-    /// The engine's CLOG (testing / advanced use).
-    pub fn clog(&self) -> &Arc<TrackingClog> {
+    /// The engine's disk CLOG (testing / advanced use).
+    pub fn clog(&self) -> &Arc<ClogBuffer> {
         &self.clog
     }
 }

@@ -315,13 +315,13 @@ fn duplicate_create_and_missing_drop_errors() {
     engine.shutdown();
 }
 
-/// Regression guard for the M2a in-memory-CLOG x checkpoint gap: recovery
-/// replays only from the checkpoint redo point, so a commit recorded before
-/// the checkpoint is never replayed and its CLOG entry would read
-/// `InProgress` (invisible). The engine's checkpoint-time CLOG snapshot
-/// (`pg_engine::clog_snapshot`) must restore it — for committed AND aborted
-/// transactions alike, including ones driven through the `txn_manager`
-/// back door.
+/// Regression guard for the CLOG x checkpoint gap, now closed natively by
+/// the M2b disk CLOG (Stage L): recovery replays only from the checkpoint
+/// redo point, so a commit recorded before the checkpoint is never
+/// replayed. With the disk CLOG the checkpoint's `ClogFlush` hook has
+/// already fsynced those bits to the segment files, so the committed AND
+/// aborted states survive — including ones driven through the
+/// `txn_manager` back door. No `clog-snapshot.bin` is involved anymore.
 #[test]
 fn clog_survives_checkpoint_and_crash() {
     let tmp = TempDir::new().unwrap();
@@ -334,7 +334,7 @@ fn clog_survives_checkpoint_and_crash() {
             .unwrap();
 
         // An aborted row via the engine's own TxnManager (the back door);
-        // TrackingClog must record its terminal state too.
+        // its terminal state lands in the same disk CLOG.
         let entry = engine.describe_table("t").unwrap();
         let col_types = [ColumnType::Int4, ColumnType::Text];
         let xid = engine.txn_manager().begin_txn();
@@ -383,7 +383,7 @@ fn clog_survives_checkpoint_and_crash() {
         assert_eq!(
             rows.len(),
             1,
-            "committed row lost across checkpoint+crash (CLOG snapshot missing)"
+            "committed row lost across checkpoint+crash (disk CLOG flush missing)"
         );
         assert_eq!(rows[0].1[0], Some(Datum::Int4(1)));
 
@@ -402,7 +402,7 @@ fn clog_survives_checkpoint_and_crash() {
         assert_eq!(
             rows.len(),
             2,
-            "second-generation CLOG snapshot must cover both sessions"
+            "disk CLOG must carry both sessions' terminal states across checkpoints"
         );
         let map = rows_by_id(&rows);
         assert_eq!(map.get(&1).unwrap(), "committed-before-checkpoint");
@@ -509,13 +509,14 @@ fn concurrent_inserts_have_unique_tids_and_exact_count() {
 }
 
 /// Regression for the checkpoint × in-flight commit race (Stage K review
-/// P0-1): a commit whose WAL append landed before the checkpoint's
-/// begin_lsn but whose `clog.set_state` ran after the snapshot dump used to
-/// be present in NEITHER the snapshot NOR the replay — the row was
-/// committed, yet invisible after restart. The commit barrier (statements
-/// hold a read guard, `Engine::checkpoint` the write guard) closes the
-/// window; this test hammers it and checks visibility after a reopen,
-/// which is where the window actually bites.
+/// P0-1, re-justified for the M2b disk CLOG): a commit whose WAL append
+/// landed before the checkpoint's begin_lsn but whose `clog.set_state` ran
+/// after the checkpoint's CLOG flush would be present in NEITHER the
+/// fsynced CLOG NOR the replay — the row was committed, yet invisible after
+/// restart. The commit barrier (statements hold a read guard,
+/// `Engine::checkpoint` the write guard across the whole checkpoint)
+/// closes the window; this test hammers it and checks visibility after a
+/// reopen, which is where the window actually bites.
 #[test]
 fn commits_concurrent_with_checkpoint_all_survive_restart() {
     const COMMITTERS: usize = 8;
@@ -552,7 +553,7 @@ fn commits_concurrent_with_checkpoint_all_survive_restart() {
     assert_eq!(
         engine.scan("t", None).unwrap().len(),
         COMMITTERS * OPS_PER,
-        "a commit fell into the dump→truncate window"
+        "a commit fell into the begin_lsn→CLOG-flush window"
     );
     engine.shutdown();
 }
@@ -603,6 +604,260 @@ fn reused_page_recovers_as_fresh_after_crash() {
             other => panic!("unexpected id column: {other:?}"),
         };
         assert!(id >= 1000, "previous tenant A's row leaked into B: id={id}");
+    }
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// M2b Stage L: disk-backed CLOG end to end
+// ---------------------------------------------------------------------------
+
+/// Drive one explicit transaction through the engine's own TxnManager +
+/// HeapAM (the back door), inserting `row(id, name)` into table `entry`'s
+/// relation, then commit or abort. Returns the transaction's XID.
+fn drive_explicit_txn(engine: &Engine, table: &str, id: i32, name: &str, commit: bool) -> TxnId {
+    let entry = engine.describe_table(table).unwrap();
+    let col_types = [ColumnType::Int4, ColumnType::Text];
+    let xid = engine.txn_manager().begin_txn();
+    let mut snap = Snapshot::everything();
+    snap.current_xid = xid;
+    let tuple = encode_tuple(
+        TupleHeader::new(
+            TxnId::INVALID,
+            TxnId::INVALID,
+            0,
+            [0; 16],
+            Tid {
+                page_id: PageId::INVALID,
+                slot_id: 0,
+            },
+            0,
+        ),
+        &col_types,
+        &row(id, name),
+    )
+    .unwrap();
+    engine
+        .heap()
+        .insert(InsertContext {
+            rel: RelationDesc {
+                rel_oid: entry.oid,
+                first_page: entry.first_page,
+                columns: &col_types,
+            },
+            snapshot: &snap,
+            tuple: &tuple,
+            out_tid: None,
+        })
+        .unwrap();
+    if commit {
+        engine.txn_manager().commit_txn(xid).unwrap();
+    } else {
+        engine.txn_manager().abort_txn(xid).unwrap();
+    }
+    xid
+}
+
+/// Stage L acceptance: the engine's CLOG is the disk SLRU. After a
+/// checkpoint, the terminal states must be physically present in the CLOG
+/// segment file — verified by a raw positioned read of
+/// `{data_dir}/clog/clog-00000000.log` that bypasses the `ClogBuffer`
+/// entirely — and must survive a crash (`mem::forget`) + reopen.
+#[test]
+fn test_disk_clog_end_to_end() {
+    use pg_txn::clog_file::{byte_offset_of_xid, get_nibble, txn_state_from_nibble};
+
+    let tmp = TempDir::new().unwrap();
+
+    let (committed_xid, aborted_xid) = {
+        let engine = open(tmp.path());
+        engine.create_table("t", &schema()).unwrap();
+        let committed_xid = drive_explicit_txn(&engine, "t", 1, "committed", true);
+        let aborted_xid = drive_explicit_txn(&engine, "t", 2, "aborted", false);
+
+        // The checkpoint's ClogFlush hook (CheckpointBegin..End) is the only
+        // fsync of the CLOG: after it returns, both nibbles are durable.
+        engine.checkpoint().unwrap();
+        // Crash AFTER the checkpoint: no shutdown, no Drop.
+        std::mem::forget(engine);
+        (committed_xid, aborted_xid)
+    };
+
+    // Raw pread of the segment file, no CLOG involved: the nibbles landed.
+    let segment = tmp.path().join("clog").join("clog-00000000.log");
+    let read_state = |xid: TxnId| {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::open(&segment).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, byte_offset_of_xid(xid))
+            .unwrap();
+        txn_state_from_nibble(get_nibble(byte[0], xid))
+    };
+    assert_eq!(
+        read_state(committed_xid),
+        TxnState::Committed,
+        "committed xid {committed_xid} not fsynced into the CLOG segment"
+    );
+    assert_eq!(
+        read_state(aborted_xid),
+        TxnState::Aborted,
+        "aborted xid {aborted_xid} not fsynced into the CLOG segment"
+    );
+    assert!(
+        !tmp.path().join("clog-snapshot.bin").exists(),
+        "the M2a CLOG snapshot bridge must be gone"
+    );
+
+    // Reopen on a cold ClogBuffer: the states come from disk alone (the WAL
+    // prefix with the commit/abort records is behind the redo point).
+    let engine = open(tmp.path());
+    assert_eq!(engine.clog().get_state(committed_xid), TxnState::Committed);
+    assert_eq!(engine.clog().get_state(aborted_xid), TxnState::Aborted);
+    let rows = engine.scan("t", None).unwrap();
+    assert_eq!(rows.len(), 1, "aborted row visible after reopen: {rows:?}");
+    assert_eq!(rows[0].1[0], Some(Datum::Int4(1)));
+    engine.shutdown();
+}
+
+/// Stage L acceptance: the exact gap the M2a `clog-snapshot.bin` bridge
+/// existed for. Commits roll the WAL past segment 0, a checkpoint advances
+/// the redo point AND physically recycles the segment holding the commit
+/// records, then a crash + reopen must still see every committed row —
+/// served by the disk CLOG alone. No `clog-snapshot.bin` is ever written.
+#[test]
+fn test_clog_survives_wal_recycle() {
+    const ROWS: i32 = 200;
+
+    let tmp = TempDir::new().unwrap();
+    let mut config = EngineConfig::new(tmp.path());
+    // Small WAL segments so the checkpoint actually recycles the segment
+    // holding the commit records (the default 16 MiB segment would keep
+    // everything in segment 0 and make the recycling assertion vacuous).
+    // 16 KiB is the floor here: a full-page image is ~8 KiB + header, and a
+    // record must fit inside one segment.
+    config.storage.wal_segment_size = 16384;
+
+    {
+        let engine = Engine::open(tmp.path(), config.clone()).unwrap();
+        engine.create_table("t", &schema()).unwrap();
+        for i in 0..ROWS {
+            engine.insert("t", &row(i, "durable")).unwrap();
+        }
+        engine.checkpoint().unwrap();
+        // Segment 0 — which held every commit record — must be gone, or the
+        // test exercises nothing.
+        assert!(
+            !tmp.path().join("wal").join("wal-00000001.log").exists(),
+            "WAL segment 0 was not recycled; test is vacuous"
+        );
+        // Crash AFTER the checkpoint + recycle.
+        std::mem::forget(engine);
+    }
+
+    {
+        let engine = Engine::open(tmp.path(), config).unwrap();
+        assert!(
+            !tmp.path().join("clog-snapshot.bin").exists(),
+            "the M2a CLOG snapshot bridge must be gone"
+        );
+        // Recovery replays only from the redo point, where none of the 200
+        // commit records exist anymore; visibility comes from the fsynced
+        // CLOG nibbles.
+        let rows = engine.scan("t", None).unwrap();
+        assert_eq!(
+            rows.len(),
+            ROWS as usize,
+            "committed rows lost after checkpoint recycled their WAL segment"
+        );
+        let map = rows_by_id(&rows);
+        for i in 0..ROWS {
+            assert_eq!(map.get(&i).unwrap(), "durable");
+        }
+        engine.shutdown();
+    }
+}
+
+/// M2a → M2b upgrade path: a directory last written by the M2a engine may
+/// hold a `clog-snapshot.bin` bridge file with pre-checkpoint commit states
+/// that exist nowhere else (the WAL prefix was recycled). Stage L replaced
+/// the bridge with the disk CLOG; opening such a directory must migrate the
+/// snapshot into the disk CLOG instead of silently ignoring it (which would
+/// lose those states — and violate the on-disk compatibility promise).
+#[test]
+fn m2a_clog_snapshot_is_migrated_into_disk_clog() {
+    let tmp = TempDir::new().unwrap();
+
+    // Build a normal database with one committed row (so visibility of the
+    // migrated state is checkable end to end), then hand-craft an M2a-era
+    // clog-snapshot.bin holding the commit state of the row's XID.
+    let xid;
+    {
+        let engine = open(tmp.path());
+        engine.create_table("t", &schema()).unwrap();
+        xid = {
+            // Use the txn backdoor to learn the XID of an insert.
+            let x = engine.txn_manager().begin_txn();
+            engine.insert("t", &row(1, "legacy")).unwrap();
+            engine.txn_manager().commit_txn(x).unwrap();
+            x
+        };
+        engine.shutdown();
+
+        // Write the legacy file in the exact M2a format (magic, version,
+        // count, entries, fnv1a).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x5047_5255_5354_434Cu64.to_le_bytes()); // "PGRUSTCL"
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes()); // two entries
+        buf.extend_from_slice(&xid.0.to_le_bytes());
+        buf.push(1u8); // Committed
+        buf.extend_from_slice(&999u64.to_le_bytes());
+        buf.push(2u8); // Aborted (state-only entry)
+        let checksum = {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in &buf {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash
+        };
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        std::fs::write(tmp.path().join("clog-snapshot.bin"), &buf).unwrap();
+    }
+
+    // M2b open: the legacy snapshot must be migrated, not ignored.
+    let engine = open(tmp.path());
+    assert!(
+        !tmp.path().join("clog-snapshot.bin").exists(),
+        "legacy file must be renamed after migration"
+    );
+    assert!(
+        tmp.path().join("clog-snapshot.bin.migrated").exists(),
+        "migrated copy must be kept for audit"
+    );
+    assert_eq!(engine.clog().get_state(xid), pg_txn::TxnState::Committed);
+    assert_eq!(
+        engine.clog().get_state(TxnId(999)),
+        pg_txn::TxnState::Aborted
+    );
+    assert_eq!(engine.scan("t", None).unwrap().len(), 1);
+
+    // The migration must be durable BEFORE any M2b checkpoint runs (the
+    // legacy file was renamed away, and M2a already recycled the WAL prefix
+    // — an un-flushed migration would be unrecoverable after a crash).
+    // Verify the nibbles are on disk right now, without a checkpoint.
+    {
+        use pg_storage::positioned_file::PositionedFile;
+        use pg_txn::clog_file::{byte_offset_of_xid, get_nibble, txn_state_from_nibble};
+        let seg = PositionedFile::open(tmp.path().join("clog").join("clog-00000000.log")).unwrap();
+        let mut byte = [0u8; 1];
+        seg.read_exact_at(&mut byte, byte_offset_of_xid(xid))
+            .unwrap();
+        assert_eq!(
+            txn_state_from_nibble(get_nibble(byte[0], xid)),
+            pg_txn::TxnState::Committed,
+            "migrated state must be fsynced before the legacy file is retired"
+        );
     }
     engine.shutdown();
 }

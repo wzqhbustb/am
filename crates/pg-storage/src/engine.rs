@@ -93,7 +93,8 @@ impl StorageEngine {
     /// rebuild committed/aborted state, and is retained on the engine so the
     /// same instance backs post-recovery visibility checks. `pg-storage` never
     /// constructs a real CLOG itself (that lives in `pg-txn`); callers running
-    /// transactions pass `pg_txn::InMemoryClogAccessor` here. Callers with no
+    /// transactions pass `pg_txn::ClogBuffer` (M2b disk-backed) or, in M2a
+    /// configurations, `pg_txn::InMemoryClogAccessor` here. Callers with no
     /// transactions use [`Self::open_with_redo_handlers`], which supplies a
     /// [`NoOpClogAccessor`].
     pub fn open_with_redo_and_clog(

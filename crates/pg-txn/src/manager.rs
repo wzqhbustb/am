@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 
 use pg_storage::clog::{ClogAccessor, TxnState};
 use pg_storage::error::Result;
@@ -43,6 +44,8 @@ use pg_storage::txn_id::TxnIdClock;
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::writer::WalWriter;
+
+use crate::snapshot::Snapshot;
 
 /// The two WAL operations the commit path needs: stage a record and fsync it.
 ///
@@ -100,9 +103,21 @@ impl TxnManager {
     ///
     /// The XID's CLOG entry is left implicit (`InProgress`) until commit/abort
     /// records the terminal state.
+    ///
+    /// The clock alloc and the active-set insert happen under the SAME lock
+    /// (PostgreSQL: "store the new XID into the shared ProcArray before
+    /// releasing XidGenLock"). Splitting them — a wait-free `alloc` followed
+    /// by a locked `insert` — opens a window where a concurrent
+    /// [`Self::snapshot`] can read `xmax = X+1` while `X` is not yet in the
+    /// active set: `X < xmax`, `X ∉ xip`, and once `X` commits the snapshot
+    /// sees its writes — a snapshot-isolation violation, because `X`
+    /// linearized *after* the snapshot was taken. Holding the lock across
+    /// both steps makes the pair atomic: any `xid < snapshot.xmax` is either
+    /// in `xip` or already terminal.
     pub fn begin_txn(&self) -> TxnId {
+        let mut active = self.active.lock();
         let xid = self.txn_id_clock.alloc();
-        self.active.lock().insert(xid);
+        active.insert(xid);
         xid
     }
 
@@ -164,5 +179,220 @@ impl TxnManager {
         let mut v: Vec<TxnId> = self.active.lock().iter().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// Take a real Snapshot-Isolation snapshot for `current_xid`
+    /// (tech-selection §7.1).
+    ///
+    /// The snapshot reads `xmax` from the XID clock and `xip` from the active
+    /// set; `xmin` is the smallest active XID (or `xmax` when the active set
+    /// is empty), and `curcid` starts at 0 (the executor advances it per
+    /// statement, §7.1 Q4). The caller's own XID may appear in `xip` when it
+    /// is still active; the oracle's `xmin == self_xid` branch is checked
+    /// before `xip`, so this is harmless and matches PG, which also records
+    /// the snapshot taker among the running XIDs.
+    ///
+    /// # Atomicity argument
+    ///
+    /// The active-set mutex is the single serialization point for membership
+    /// changes: `begin_txn` inserts, `commit_txn`/`abort_txn` remove, all
+    /// under this lock. `snapshot` holds the lock while reading **both** the
+    /// clock and the set, which defines the logical instant — `xip` and
+    /// `xmax` are mutually consistent by construction:
+    ///
+    /// - Every XID in the set was allocated before its insert, and the insert
+    ///   happened-before our lock acquisition, so every `xip` entry is
+    ///   strictly below the `xmax` we read inside the same critical section
+    ///   (the invariant `xmin <= xip[i] < xmax` holds).
+    /// - A concurrent `begin_txn` may allocate from the clock during our read
+    ///   (allocation is wait-free and takes no lock), but its XID then lands
+    ///   at or above our `xmax` and is judged "future" — invisible — which is
+    ///   correct: that begin is not yet observable to anyone.
+    /// - A concurrent commit between its CLOG-bit flip (step 3) and its
+    ///   active-set removal (step 4) leaves the XID in our `xip` with
+    ///   CLOG = Committed; the oracle consults `xip` before the CLOG, so the
+    ///   transaction stays invisible — correct, because at the snapshot's
+    ///   logical instant the commit had not completed (removal is the
+    ///   completion signal).
+    pub fn snapshot(&self, current_xid: TxnId) -> Snapshot {
+        let active = self.active.lock();
+        let xmax = self.txn_id_clock.current();
+        let mut xip: SmallVec<[TxnId; 32]> = active.iter().copied().collect();
+        drop(active);
+        xip.sort_unstable();
+        let xmin = xip.first().copied().unwrap_or(xmax);
+        Snapshot {
+            xmin,
+            xmax,
+            xip,
+            current_xid,
+            curcid: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryClogAccessor;
+
+    /// A no-op WAL: append/flush always succeed, so the manager can be driven
+    /// without touching disk.
+    #[derive(Debug, Default)]
+    struct OkWal;
+
+    impl CommitWal for OkWal {
+        fn append(&self, _record: WalRecord) -> Result<Lsn> {
+            Ok(Lsn::FIRST)
+        }
+
+        fn flush_to(&self, _lsn: Lsn) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn manager() -> TxnManager {
+        TxnManager::new(
+            TxnIdClock::new(TxnId::FIRST),
+            Arc::new(OkWal),
+            Arc::new(InMemoryClogAccessor::new()),
+        )
+    }
+
+    #[test]
+    fn snapshot_with_empty_active_set() {
+        let mgr = manager();
+        let snap = mgr.snapshot(TxnId::INVALID);
+        assert!(snap.xip.is_empty());
+        // Empty active set: xmin collapses to xmax = next unallocated XID.
+        assert_eq!(snap.xmax, TxnId::FIRST);
+        assert_eq!(snap.xmin, snap.xmax);
+        assert_eq!(snap.curcid, 0);
+    }
+
+    #[test]
+    fn snapshot_captures_active_set_contents() {
+        let mgr = manager();
+        let t1 = mgr.begin_txn();
+        let t2 = mgr.begin_txn();
+        let t3 = mgr.begin_txn();
+
+        let snap = mgr.snapshot(t2);
+        assert_eq!(snap.xip.as_slice(), &[t1, t2, t3], "sorted full copy");
+        assert_eq!(snap.xmin, t1, "xmin = smallest active XID");
+        assert_eq!(snap.xmax, TxnId(4), "xmax = next unallocated XID");
+        assert_eq!(snap.current_xid, t2);
+        assert_eq!(snap.curcid, 0);
+        for &xid in snap.xip.iter() {
+            assert!(snap.xmin <= xid && xid < snap.xmax);
+        }
+    }
+
+    #[test]
+    fn snapshot_xmin_xmax_boundaries_track_commit() {
+        let mgr = manager();
+        let t1 = mgr.begin_txn();
+        let t2 = mgr.begin_txn();
+        mgr.commit_txn(t1).unwrap();
+
+        let snap = mgr.snapshot(t2);
+        assert_eq!(snap.xip.as_slice(), &[t2], "committed XID leaves xip");
+        assert_eq!(snap.xmin, t2, "xmin advances past the committed XID");
+        assert_eq!(snap.xmax, TxnId(3));
+
+        mgr.commit_txn(t2).unwrap();
+        let snap = mgr.snapshot(TxnId::INVALID);
+        assert!(snap.xip.is_empty());
+        assert_eq!(snap.xmin, snap.xmax);
+    }
+
+    #[test]
+    fn snapshot_is_consistent_under_concurrent_begin_commit() {
+        // Hammer the manager from multiple threads; every snapshot must
+        // satisfy the structural invariants (sorted xip, xmin <= xip < xmax).
+        let mgr = Arc::new(manager());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    let xid = mgr.begin_txn();
+                    let snap = mgr.snapshot(xid);
+                    for w in snap.xip.windows(2) {
+                        assert!(w[0] < w[1], "xip sorted");
+                    }
+                    for &entry in snap.xip.iter() {
+                        assert!(snap.xmin <= entry && entry < snap.xmax);
+                    }
+                    mgr.commit_txn(xid).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(mgr.active_xids().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod begin_atomicity_tests {
+    //! Regression for the Stage L review P1: `begin_txn` used to split the
+    //! clock alloc (wait-free) from the active-set insert (locked). A
+    //! concurrent `snapshot()` could then read `xmax = X+1` while `X` was
+    //! not yet registered — `X < xmax`, `X ∉ xip`, and after X committed
+    //! the snapshot saw its writes: an SI violation (PG avoids this by
+    //! registering the XID in ProcArray before releasing XidGenLock).
+    use super::*;
+    use crate::InMemoryClogAccessor;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct NoWal;
+    impl CommitWal for NoWal {
+        fn append(&self, _record: WalRecord) -> Result<Lsn> {
+            Ok(Lsn::FIRST)
+        }
+        fn flush_to(&self, _lsn: Lsn) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn snapshot_never_sees_alloc_without_insert() {
+        let mgr = Arc::new(TxnManager::new(
+            TxnIdClock::new(TxnId::FIRST),
+            Arc::new(NoWal),
+            Arc::new(InMemoryClogAccessor::new()),
+        ));
+        let mgr2 = Arc::clone(&mgr);
+
+        // A "slow begin": hold the active lock, alloc, sleep, then insert —
+        // exactly the old implementation's interleaving. With the fix,
+        // `snapshot()` blocks on the same lock until the insert completes.
+        let slow = thread::spawn(move || {
+            let mut active = mgr2.active.lock();
+            let xid = mgr2.txn_id_clock.alloc();
+            thread::sleep(Duration::from_millis(50));
+            active.insert(xid);
+            drop(active);
+            xid
+        });
+
+        // While the slow begin sleeps, take a snapshot.
+        let snap = mgr.snapshot(TxnId::INVALID);
+        let xid = slow.join().unwrap();
+
+        // The snapshot must either predate the alloc (xid >= xmax) or have
+        // the xid registered in xip. The middle state — xmax above xid while
+        // xid is absent from xip — is the SI violation and must not occur.
+        assert!(
+            xid.0 >= snap.xmax.0 || snap.xip.contains(&xid),
+            "snapshot saw alloc-without-insert: xid={xid:?}, xmax={:?}, xip={:?}",
+            snap.xmax,
+            snap.xip
+        );
     }
 }

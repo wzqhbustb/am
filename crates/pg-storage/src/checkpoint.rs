@@ -70,6 +70,18 @@ pub struct CheckpointCoordinator {
     /// Shared with the background thread's clone for the same reason as
     /// `next_oid_source`.
     next_txn_id_source: Arc<Mutex<TxnIdClock>>,
+    /// Flush hook for the disk CLOG (M2b Stage L), invoked between
+    /// `CheckpointBegin` and `CheckpointEnd` — the single authoritative CLOG
+    /// flush point (tech-selection §6.4, v2.3-21). `None` until the engine
+    /// layer (pg-engine) installs its `ClogBuffer` via
+    /// [`set_clog_flush`](Self::set_clog_flush); M1/M2a configurations (no
+    /// disk CLOG) leave it unset and checkpoints skip the CLOG flush
+    /// entirely.
+    ///
+    /// Wrapped in `Arc<Mutex<Option<..>>>` and shared with the background
+    /// thread's clone for the same reason as `next_oid_source`: the engine
+    /// may install the hook after background checkpointing has started.
+    clog_flush: Arc<Mutex<Option<Arc<dyn crate::clog::ClogFlush>>>>,
     shutdown: Arc<AtomicBool>,
     background_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -104,6 +116,7 @@ impl CheckpointCoordinator {
             checkpoint_lock: Arc::new(Mutex::new(())),
             next_oid_source: Arc::new(Mutex::new(OidCounter::new(next_oid))),
             next_txn_id_source: Arc::new(Mutex::new(TxnIdClock::new(next_txn_id))),
+            clog_flush: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             background_handle: Mutex::new(None),
         }
@@ -139,6 +152,24 @@ impl CheckpointCoordinator {
     /// checkpoints.
     pub fn set_next_txn_id_source(&self, source: TxnIdClock) {
         *self.next_txn_id_source.lock() = source;
+    }
+
+    /// Install the disk CLOG's flush hook (M2b Stage L wiring).
+    ///
+    /// Each [`trigger_checkpoint`](Self::trigger_checkpoint) calls
+    /// [`ClogFlush::flush_dirty`](crate::clog::ClogFlush::flush_dirty) after
+    /// emitting `CheckpointBegin` and before emitting `CheckpointEnd` — the
+    /// single authoritative CLOG flush point (tech-selection §6.4, v2.3-21).
+    /// Until a hook is installed the step is skipped, which keeps M1/M2a
+    /// configurations (no disk CLOG) working unchanged.
+    ///
+    /// The slot is shared (via `Arc`) with the background checkpoint thread's
+    /// clone, so installing the hook *after*
+    /// [`start_background_checkpointing`](Self::start_background_checkpointing)
+    /// still takes effect on the next background checkpoint — same pattern as
+    /// [`set_next_oid_source`](Self::set_next_oid_source).
+    pub fn set_clog_flush(&self, source: Arc<dyn crate::clog::ClogFlush>) {
+        *self.clog_flush.lock() = Some(source);
     }
 
     /// Start a background thread that triggers checkpoints periodically.
@@ -299,6 +330,24 @@ impl CheckpointCoordinator {
         }
         debug!(%flushed, "flushed dirty pages");
 
+        // 4b. Flush the disk CLOG's dirty frames (writeback + fsync) — the
+        //     single authoritative CLOG flush point (tech-selection §6.4,
+        //     v2.3-21): after CheckpointBegin is emitted, before
+        //     CheckpointEnd. Nowhere else flushes the CLOG; bits not yet
+        //     fsynced at a crash are rebuilt from TxnCommit/TxnAbort WAL
+        //     records by redo. Skipped when no hook is installed (M1/M2a).
+        //     As with page flushes, a failure aborts the checkpoint so the
+        //     superblock never advances past work that did not complete.
+        let clog_flush = self.clog_flush.lock().clone();
+        if let Some(clog_flush) = clog_flush {
+            clog_flush.flush_dirty().map_err(|e| {
+                StorageError::CheckpointFailed(format!(
+                    "failed to flush CLOG during checkpoint: {e}"
+                ))
+            })?;
+            debug!("flushed dirty CLOG frames");
+        }
+
         // -- Phase 3: CheckpointEnd and superblock update ---------------------
 
         // 5. Capture allocator state for the checkpoint end record.
@@ -395,6 +444,10 @@ impl CheckpointCoordinator {
             // next_oid_source: a source installed after the background thread
             // starts (by the TxnManager) must still be seen.
             next_txn_id_source: Arc::clone(&self.next_txn_id_source),
+            // Share the CLOG flush hook slot for the same reason: a hook
+            // installed after the background thread starts must still be
+            // invoked by background checkpoints.
+            clog_flush: Arc::clone(&self.clog_flush),
             shutdown: Arc::clone(&self.shutdown),
             background_handle: Mutex::new(None),
         }
@@ -856,5 +909,55 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let appended = appender.join().unwrap();
         assert!(appended > 0, "appender thread made no progress");
+    }
+
+    /// M2b Stage L: an installed `ClogFlush` hook is invoked once per
+    /// checkpoint (between CheckpointBegin and CheckpointEnd), and a hook
+    /// failure aborts the checkpoint like any other flush failure.
+    #[test]
+    fn checkpoint_invokes_clog_flush_hook() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct MockFlush {
+            calls: AtomicUsize,
+            fail: AtomicBool,
+        }
+        impl crate::clog::ClogFlush for MockFlush {
+            fn flush_dirty(&self) -> Result<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail.load(Ordering::Relaxed) {
+                    return Err(StorageError::CheckpointFailed("boom".to_string()));
+                }
+                Ok(())
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool,
+            page_allocator,
+            wal_writer,
+        );
+
+        let hook = Arc::new(MockFlush {
+            calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+        });
+        coordinator.set_clog_flush(hook.clone());
+
+        coordinator.trigger_checkpoint().unwrap();
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 1);
+
+        // A failing hook aborts the checkpoint (same discipline as a failed
+        // page flush) instead of silently advancing the superblock.
+        hook.fail.store(true, Ordering::Relaxed);
+        assert!(coordinator.trigger_checkpoint().is_err());
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 2);
     }
 }

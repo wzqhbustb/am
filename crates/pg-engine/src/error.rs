@@ -53,10 +53,3 @@ pub enum EngineError {
     #[error("corrupted catalog: {0}")]
     Corrupted(String),
 }
-
-impl EngineError {
-    /// Wrap a raw I/O error as a storage-layer engine error.
-    pub(crate) fn storage_io(e: std::io::Error) -> Self {
-        EngineError::Storage(StorageError::Io(e))
-    }
-}

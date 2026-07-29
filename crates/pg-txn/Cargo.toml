@@ -22,5 +22,18 @@ thiserror = "2"
 # serialization
 serde = { version = "1", features = ["derive"] }
 
+# inline small collections (Snapshot.xip, §16 approved)
+smallvec = "1"
+
 [dev-dependencies]
 tempfile = "3"
+
+# Snapshot.xip construction in integration tests
+smallvec = "1"
+
+# benchmarks
+criterion = "0.5"
+
+[[bench]]
+name = "clog_buffer_hit_rate"
+harness = false

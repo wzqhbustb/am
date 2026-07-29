@@ -10,9 +10,12 @@
 //! - [`NoOpClogAccessor`] (this module): M1 placeholder, every XID reads as
 //!   committed. Wired into recovery from Stage D; formally assembled into
 //!   `Engine::open` in Stage F.
-//! - M2a in-memory accessor and M2b `pg-txn::ClogBuffer` (disk SLRU) come
-//!   later and implement the same trait with zero call-site changes.
+//! - `pg-txn::InMemoryClogAccessor` (M2a) and `pg-txn::ClogBuffer` (M2b
+//!   Stage L disk SLRU) implement the same trait with zero call-site
+//!   changes. `ClogBuffer` additionally implements [`ClogFlush`] so the
+//!   checkpointer can drive its single authoritative flush (§6.4).
 
+use crate::error::Result;
 use crate::types::TxnId;
 
 /// Transaction commit status (4-bit CLOG state, PG-aligned values).
@@ -35,6 +38,26 @@ pub trait ClogAccessor: std::fmt::Debug + Send + Sync {
     fn get_state(&self, xid: TxnId) -> TxnState;
     /// Record the commit status of `xid`.
     fn set_state(&self, xid: TxnId, state: TxnState);
+}
+
+/// Durability hook for a disk-backed commit log (M2b Stage L).
+///
+/// The single authoritative CLOG flush point is the checkpoint: the
+/// [`crate::checkpoint::CheckpointCoordinator`] calls
+/// [`flush_dirty`](ClogFlush::flush_dirty) after emitting `CheckpointBegin`
+/// and before emitting `CheckpointEnd` (tech-selection §6.4, v2.3-21).
+/// Nowhere else flushes the CLOG on its own initiative — the commit path
+/// only updates in-memory bits and relies on the `TxnCommit`/`TxnAbort` WAL
+/// records for durability.
+///
+/// Implemented by `pg-txn::ClogBuffer`; installed via
+/// [`crate::checkpoint::CheckpointCoordinator::set_clog_flush`]. Engines
+/// without a disk CLOG (M1 / M2a in-memory CLOG) never install the hook and
+/// checkpoints skip the CLOG flush entirely.
+pub trait ClogFlush: std::fmt::Debug + Send + Sync {
+    /// Write back every dirty CLOG frame to its segment file and fsync the
+    /// touched segment files, then clear the dirty flags.
+    fn flush_dirty(&self) -> Result<()>;
 }
 
 /// No-op `ClogAccessor` for M1 (no transactions): every XID reads as

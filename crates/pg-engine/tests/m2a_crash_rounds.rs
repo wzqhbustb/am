@@ -23,8 +23,8 @@
 //!   (row count AND content);
 //! - every dropped table is absent from the registry;
 //! - `clog().get_state` reports the recorded terminal states (this exercises
-//!   the checkpoint-time CLOG snapshot whenever the workload included
-//!   checkpoints).
+//!   the disk CLOG's checkpoint-time flush whenever the workload included
+//!   checkpoints — the M2a `clog-snapshot.bin` bridge is gone in M2b).
 //!
 //! # Kill timing
 //!
@@ -281,7 +281,8 @@ fn do_random_op(engine: &Engine, rng: &mut Rng, model: &mut ChildModel, destruct
             engine.delete(&table, tid).unwrap();
         }
         // CHECKPOINT (8%): advances the redo point, may recycle WAL — the
-        // CLOG snapshot path is exercised on the parent's reopen.
+        // disk CLOG's checkpoint flush is what keeps pre-checkpoint terminal
+        // states alive on the parent's reopen.
         9 => engine.checkpoint().unwrap(),
         // CREATE extra table (8%).
         10 => {
@@ -326,7 +327,7 @@ fn do_random_op(engine: &Engine, rng: &mut Rng, model: &mut ChildModel, destruct
 }
 
 /// One committed and one aborted transaction through the engine's own
-/// TxnManager + HeapAM (the back door `TrackingClog` must still record).
+/// TxnManager + HeapAM (the back door lands in the same disk CLOG).
 /// Returns `(xid, final state)` pairs for the expectation file.
 fn drive_back_door_txns(engine: &Engine) -> Vec<(TxnId, TxnState)> {
     let entry = engine.describe_table(BASE_TABLES[0]).unwrap();
@@ -665,8 +666,9 @@ fn verify_round(round: u64, data_dir: &Path) {
     for (xid, state) in &expectation.xids {
         // The terminal state must survive the crash — including the case
         // where a workload checkpoint truncated the WAL prefix holding the
-        // original commit/abort record (the engine's CLOG snapshot path).
-        // A lost entry reads InProgress, so this catches both directions.
+        // original commit/abort record (the disk CLOG's checkpoint flush
+        // path). A lost entry reads InProgress, so this catches both
+        // directions.
         assert_eq!(
             engine.clog().get_state(TxnId(*xid)),
             *state,
