@@ -184,6 +184,98 @@ pub struct HeapDeleteRecord {
     pub xmax: TxnId,
 }
 
+/// Payload for a `BTreeInsert` record: one index entry placed at a slot.
+///
+/// Used for leaf inserts, internal-page downlink inserts, and appends to an
+/// index's meta page (tech-selection §13). `level`/`flags` describe the page
+/// the entry belongs to; redo uses them only when it must initialize a fresh
+/// (all-zero) page before applying the insert, so a page whose initializing
+/// record is lost (e.g. a `PageAlloc` that outlived the page-content records)
+/// still recovers with the correct `btpo_level`/`btpo_flags` (§13.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeInsertRecord {
+    /// The page the entry was inserted into.
+    pub page_id: PageId,
+    /// The slot the entry occupies.
+    pub slot_id: u16,
+    /// `btpo_level` of the page (0 = leaf), for fresh-page redo init.
+    pub level: u8,
+    /// `btpo_flags` of the page (LEAF/ROOT/...), for fresh-page redo init.
+    pub flags: u8,
+    /// The encoded entry bytes: leaf `key ++ tid(10B)`, internal
+    /// `key ++ child_page_id(8B)`, meta `(root_page_id, tree_level)(10B)`.
+    pub tuple_bytes: Vec<u8>,
+}
+
+/// Payload for a `BTreeDelete` record: physical removal of one index entry.
+///
+/// M2b has no page merge; the delete rebuilds the page without the slot, so
+/// redo is the same deterministic transformation applied to the same
+/// pre-image (no separate compaction record is needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeDeleteRecord {
+    /// The page the entry is removed from.
+    pub page_id: PageId,
+    /// The slot being removed.
+    pub slot_id: u16,
+}
+
+/// Payload for a `BTreeSplitPrepare` record (tech-selection §13.3 step 1).
+///
+/// `left_old_next` is an addition to the §13.3 field list: Prepare touches
+/// two pages that may reach disk independently, so redo guards each page by
+/// its own `pd_lsn`. When the left page's post-Prepare image is durable but
+/// the right page's is not, redo must re-initialize the right page and can no
+/// longer read the left page's pre-Prepare `btpo_next` from the left page
+/// itself (it now points at the right page); the value is therefore carried
+/// in the payload. `PageId::INVALID` (0) means "no old right sibling".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeSplitPrepareRecord {
+    /// The overflowing original page.
+    pub left_page: PageId,
+    /// The freshly allocated right sibling.
+    pub new_right_page: PageId,
+    /// `btpo_level` of both pages (0 = leaf).
+    pub level: u8,
+    /// `btpo_next` of `left_page` before the split (0 = none).
+    pub left_old_next: PageId,
+    /// The left page's maximum key before the split (redo validation marker).
+    pub high_key_bytes: Vec<u8>,
+}
+
+/// Payload for a `BTreeSplitCopy` record (tech-selection §13.3 step 2).
+///
+/// Minimal by design (§13.3 P2-9): redo recomputes the moved tuples from the
+/// left page instead of logging them, anchored by `left_page_pre_lsn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeSplitCopyRecord {
+    /// The page being split.
+    pub left_page: PageId,
+    /// The right sibling receiving the upper half.
+    pub right_page: PageId,
+    /// Slots `[copy_start_slot, slot_count)` of the left page move right.
+    pub copy_start_slot: u16,
+    /// Idempotency anchor: redo applies only while
+    /// `left_page.pd_lsn == left_page_pre_lsn` (the Prepare LSN).
+    pub left_page_pre_lsn: Lsn,
+}
+
+/// Payload for a `BTreeSplitCommit` record (tech-selection §13.3 step 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeSplitCommitRecord {
+    /// The page that was split.
+    pub left_page: PageId,
+    /// The right sibling created by the split.
+    pub right_page: PageId,
+    /// The parent page receiving the new downlink (a new root for root splits).
+    pub parent_page: PageId,
+    /// The separator key: the right page's low key, inserted into the parent
+    /// together with `right_page` as the child pointer.
+    pub separator_key: Vec<u8>,
+    /// The slot at which the parent page gains the downlink.
+    pub parent_insert_slot: u16,
+}
+
 /// Payload for a `TxnCommit` record: the transaction whose commit is durable.
 ///
 /// Per the Commit hard-order rule (§3 P1-5), this record is fsynced *before*
@@ -228,6 +320,51 @@ impl HeapUpdateRecord {
 
 impl HeapDeleteRecord {
     /// Decode a `HeapDelete` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeInsertRecord {
+    /// Decode a `BTreeInsert` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeDeleteRecord {
+    /// Decode a `BTreeDelete` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeSplitPrepareRecord {
+    /// Decode a `BTreeSplitPrepare` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeSplitCopyRecord {
+    /// Decode a `BTreeSplitCopy` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeSplitCommitRecord {
+    /// Decode a `BTreeSplitCommit` payload (see [`HeapInsertRecord::decode`]).
     pub fn decode(payload: &[u8]) -> Result<Self> {
         Ok(bincode::serde::decode_from_slice(payload, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?
@@ -369,6 +506,104 @@ impl WalRecord {
         let mut rec = Self::new(WalRecordType::HeapDelete, payload);
         rec.txn_id = xid;
         Ok(rec)
+    }
+
+    /// Create a `BTreeInsert` record (leaf/internal entry or meta-page append).
+    ///
+    /// `level`/`flags` describe the target page so redo can initialize a
+    /// fresh page correctly (see [`BTreeInsertRecord`]). Index entries carry
+    /// no `t_xmin`, so the record's `txn_id` stays `INVALID`.
+    pub fn btree_insert(
+        page_id: PageId,
+        slot_id: u16,
+        level: u8,
+        flags: u8,
+        tuple_bytes: Vec<u8>,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            BTreeInsertRecord {
+                page_id,
+                slot_id,
+                level,
+                flags,
+                tuple_bytes,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeInsert, payload))
+    }
+
+    /// Create a `BTreeDelete` record (physical removal of one index entry).
+    pub fn btree_delete(page_id: PageId, slot_id: u16) -> Result<Self> {
+        let payload =
+            bincode::serde::encode_to_vec(BTreeDeleteRecord { page_id, slot_id }, bincode_config())
+                .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeDelete, payload))
+    }
+
+    /// Create a `BTreeSplitPrepare` record (§13.3 step 1).
+    pub fn btree_split_prepare(
+        left_page: PageId,
+        new_right_page: PageId,
+        level: u8,
+        left_old_next: PageId,
+        high_key_bytes: Vec<u8>,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            BTreeSplitPrepareRecord {
+                left_page,
+                new_right_page,
+                level,
+                left_old_next,
+                high_key_bytes,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeSplitPrepare, payload))
+    }
+
+    /// Create a `BTreeSplitCopy` record (§13.3 step 2, minimal payload).
+    pub fn btree_split_copy(
+        left_page: PageId,
+        right_page: PageId,
+        copy_start_slot: u16,
+        left_page_pre_lsn: Lsn,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            BTreeSplitCopyRecord {
+                left_page,
+                right_page,
+                copy_start_slot,
+                left_page_pre_lsn,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeSplitCopy, payload))
+    }
+
+    /// Create a `BTreeSplitCommit` record (§13.3 step 3).
+    pub fn btree_split_commit(
+        left_page: PageId,
+        right_page: PageId,
+        parent_page: PageId,
+        separator_key: Vec<u8>,
+        parent_insert_slot: u16,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            BTreeSplitCommitRecord {
+                left_page,
+                right_page,
+                parent_page,
+                separator_key,
+                parent_insert_slot,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeSplitCommit, payload))
     }
 
     /// Create a `TxnCommit` record for `xid`.
@@ -659,6 +894,81 @@ mod tests {
         assert_eq!(decoded.txn_id, TxnId(19));
         let payload = TxnAbortRecord::decode(&decoded.payload).unwrap();
         assert_eq!(payload.xid, TxnId(19));
+    }
+
+    #[test]
+    fn btree_insert_roundtrip() {
+        let mut record =
+            WalRecord::btree_insert(PageId(7), 3, 0, 1, vec![1, 2, 3, 4, 9, 9]).unwrap();
+        record.lsn = Lsn(64);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::BTreeInsert);
+        let payload = BTreeInsertRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.page_id, PageId(7));
+        assert_eq!(payload.slot_id, 3);
+        assert_eq!(payload.level, 0);
+        assert_eq!(payload.flags, 1);
+        assert_eq!(payload.tuple_bytes, vec![1, 2, 3, 4, 9, 9]);
+    }
+
+    #[test]
+    fn btree_delete_roundtrip() {
+        let mut record = WalRecord::btree_delete(PageId(7), 5).unwrap();
+        record.lsn = Lsn(72);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::BTreeDelete);
+        let payload = BTreeDeleteRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.page_id, PageId(7));
+        assert_eq!(payload.slot_id, 5);
+    }
+
+    #[test]
+    fn btree_split_prepare_roundtrip() {
+        let mut record =
+            WalRecord::btree_split_prepare(PageId(7), PageId(8), 1, PageId(9), vec![0xAA, 0xBB])
+                .unwrap();
+        record.lsn = Lsn(80);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::BTreeSplitPrepare);
+        let payload = BTreeSplitPrepareRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.left_page, PageId(7));
+        assert_eq!(payload.new_right_page, PageId(8));
+        assert_eq!(payload.level, 1);
+        assert_eq!(payload.left_old_next, PageId(9));
+        assert_eq!(payload.high_key_bytes, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn btree_split_copy_roundtrip() {
+        let mut record = WalRecord::btree_split_copy(PageId(7), PageId(8), 42, Lsn(1_000)).unwrap();
+        record.lsn = Lsn(88);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::BTreeSplitCopy);
+        let payload = BTreeSplitCopyRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.left_page, PageId(7));
+        assert_eq!(payload.right_page, PageId(8));
+        assert_eq!(payload.copy_start_slot, 42);
+        assert_eq!(payload.left_page_pre_lsn, Lsn(1_000));
+    }
+
+    #[test]
+    fn btree_split_commit_roundtrip() {
+        let mut record =
+            WalRecord::btree_split_commit(PageId(7), PageId(8), PageId(9), vec![5, 6], 2).unwrap();
+        record.lsn = Lsn(96);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::BTreeSplitCommit);
+        let payload = BTreeSplitCommitRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.left_page, PageId(7));
+        assert_eq!(payload.right_page, PageId(8));
+        assert_eq!(payload.parent_page, PageId(9));
+        assert_eq!(payload.separator_key, vec![5, 6]);
+        assert_eq!(payload.parent_insert_slot, 2);
     }
 
     #[test]

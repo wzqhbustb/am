@@ -498,7 +498,12 @@ CLOG 铺路。
 - **功能**：`CREATE INDEX`（阻塞式）+ 点查 / 范围扫全通
 - **正确性**：`test_btree_split_crash_after_prepare` / `test_btree_split_crash_after_copy` /
   `test_btree_split_crash_after_commit`，恢复后 B+Tree 结构有效
-- **性能**：单线程 100 万 INSERT + CREATE INDEX ≤ 30s（criterion）
+- **性能**：单线程 100 万 INSERT + CREATE INDEX ≤ 30s（criterion）。
+  **口径（Stage M 收尾修订）**：INSERT 走**单事务批量**（一次 commit、一次 fsync）——
+  公开的 auto-commit API 每行 commit 都 fsync，在该时间预算内物理不可达，bench 源码中
+  已注释披露这一点。实测（Apple Silicon，release）：INSERT 1M 行 13.9s +
+  CREATE INDEX（含 Engine::open 与 bulk load）1.0s ≈ **14.9s**，余量约 50%；
+  bulk load（排序 + 每页一条 post-image FPI）比逐条 insert 快约两个数量级。
 
 **验收命令**：`cargo test -p pg-am-btree --test btree_split_crash && cargo bench -p pg-am-btree --bench create_index`
 

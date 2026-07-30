@@ -462,10 +462,13 @@ dependencies = [
 name = "pg-am-btree"
 version = "0.1.0"
 dependencies = [
- "pg-catalog",
+ "criterion",
+ "pg-am-heap",
+ "pg-engine",
  "pg-storage",
  "pg-txn",
- "serde",
+ "proptest",
+ "tempfile",
  "thiserror",
 ]
 

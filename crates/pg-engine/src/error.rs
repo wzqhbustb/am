@@ -52,4 +52,16 @@ pub enum EngineError {
     /// (e.g. a `pg_class` row with no matching live version).
     #[error("corrupted catalog: {0}")]
     Corrupted(String),
+
+    /// A B+Tree access-method operation failed (bulk load, index lookup).
+    #[error("btree error: {0}")]
+    BTree(#[from] pg_am_btree::BTreeError),
+
+    /// `create_index` named a (table, column) pair that already has an index.
+    #[error("index on {0} already exists")]
+    IndexExists(String),
+
+    /// `index_lookup` named a (table, column) pair with no index.
+    #[error("no index on {0}")]
+    IndexNotFound(String),
 }

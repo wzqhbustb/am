@@ -8,12 +8,35 @@ license.workspace = true
 description = "pg_rust B+Tree access method — latch coupling, split/merge, Blink variant"
 
 [dependencies]
+# pg-storage: page format + physical types, buffer pool, WAL, redo dispatch.
 pg-storage = { path = "../pg-storage" }
+# pg-am-heap: slotted-page primitives reused by B+Tree pages (§13.1), the
+# AccessMethod trait surface, and ColumnType/Datum for index keys.
+pg-am-heap = { path = "../pg-am-heap" }
+# pg-txn: Snapshot appears in the AccessMethod context signatures (the B+Tree
+# itself carries no MVCC state; index entries have no xmin/xmax, §7.3).
 pg-txn = { path = "../pg-txn" }
-pg-catalog = { path = "../pg-catalog" }
 
 # error types
 thiserror = "2"
 
-# serialization
-serde = { version = "1", features = ["derive"] }
+[dev-dependencies]
+# property-based testing
+# Pinned to ~1.4 to avoid proptest 1.5+ -> rand 0.9 -> getrandom 0.3 -> wasip2,
+# which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
+proptest = "~1.4"
+
+# integration tests drive a real StorageEngine on a temp data dir
+tempfile = "3"
+
+# the create_index bench drives the full engine (heap source table +
+# Engine::create_index); dev-dependencies are allowed to cycle back through
+# pg-engine's normal dependency on this crate
+pg-engine = { path = "../pg-engine" }
+
+# benchmarks (pinned like pg-engine's)
+criterion = "0.5"
+
+[[bench]]
+name = "create_index"
+harness = false

@@ -10,8 +10,9 @@
 //!    are idempotent, so replaying a commit the CLOG already flushed is a
 //!    no-op).
 //! 2. `StorageEngine::open_with_redo_and_clog` — storage recovery with the
-//!    heap AM's and the txn layer's redo handlers injected
-//!    (`heap_redo_handlers` + `txn_redo_handlers`) and the shared
+//!    heap AM's, the txn layer's, and the B+Tree AM's redo handlers injected
+//!    (`heap_redo_handlers` + `txn_redo_handlers` + `btree_redo_handlers`,
+//!    the last from Stage M wave 2) and the shared
 //!    `ClogBuffer` as the `ClogAccessor` that both recovery and
 //!    post-recovery visibility checks read.
 //!    `checkpoint.set_next_txn_id_source` is already done by `pg-storage`
@@ -31,9 +32,13 @@
 //! 6. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
 //!    `Arc<dyn CommitWal>`, and the same CLOG.
 //! 7. The in-memory **table registry** (`RwLock<HashMap<String, TableEntry>>`)
-//!    is rebuilt from the catalog: `pg_class` rows (last version per OID
-//!    wins, `relkind = 'd'` marks a drop) joined with `pg_attribute` and
-//!    `pg_rust_relpages`.
+//!    is rebuilt from the catalog: `pg_class` rows with `relkind = 'r'` (last
+//!    version per OID wins, `relkind = 'd'` marks a drop) joined with
+//!    `pg_attribute` and `pg_rust_relpages`. Index relations
+//!    (`relkind = 'i'`, Stage M wave 2) are **not** in the table registry —
+//!    they carry no heap chain and must not be reachable through the DML
+//!    API; they are rebuilt from the `pg_index` heap chain into a separate
+//!    `Vec<IndexEntry>` keyed by (table, column).
 //!
 //! # M2a → M2b: the CLOG snapshot bridge is gone
 //!
@@ -84,6 +89,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use pg_am_btree::{btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM};
 use pg_am_heap::access_method::{
     DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext,
 };
@@ -92,7 +98,8 @@ use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHead
 use pg_am_heap::{heap_redo_handlers, AccessMethod, HeapAM, SlottedPage, UpdatableAM};
 use pg_catalog::builtin_types::{builtin_type, BUILTIN_TYPES};
 use pg_catalog::system_tables::{
-    SystemTableDef, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_RELPAGES, RELKIND_TABLE,
+    SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
+    RELKIND_INDEX, RELKIND_TABLE,
 };
 use pg_catalog::{Catalog, RelationRow, TypeOid};
 use pg_storage::clog::ClogFlush;
@@ -191,6 +198,27 @@ pub struct TableEntry {
     pub columns: Vec<ColumnDef>,
 }
 
+/// One entry of the engine's in-memory index registry (M2b Stage M wave 2).
+///
+/// Mirrors one `pg_index` row plus the index's `pg_rust_relpages` entry
+/// (whose `first_page` is the B+Tree **meta page**) and its single
+/// `pg_attribute` row (whose `attname` mirrors the indexed column, as in
+/// PostgreSQL). Rebuilt at open by scanning the `pg_index` heap chain;
+/// append-only in M2b (no `DROP INDEX`).
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    /// The index relation's OID (`pg_index.indexrelid`).
+    pub index_oid: Oid,
+    /// The indexed table's OID (`pg_index.indrelid`).
+    pub table_oid: Oid,
+    /// The indexed column's name (from the index's `pg_attribute` row).
+    pub column: String,
+    /// The indexed column's codec type (the B+Tree key type).
+    pub key_type: ColumnType,
+    /// The index's meta page (`pg_rust_relpages.first_page` of the index).
+    pub meta_page: PageId,
+}
+
 /// The assembled engine: storage + catalog + heap AM + txn manager + disk
 /// CLOG + in-memory table registry. Assembly order is documented at the
 /// module level.
@@ -205,6 +233,10 @@ pub struct Engine {
     clog: Arc<ClogBuffer>,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
+    /// All live indexes (M2b Stage M wave 2). Rebuilt at open by scanning
+    /// the `pg_index` heap chain; `create_index` appends. Indexes on dropped
+    /// tables linger harmlessly: `index_lookup` resolves the table first.
+    indexes: RwLock<Vec<IndexEntry>>,
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
@@ -247,9 +279,12 @@ impl Engine {
         // 1. Disk CLOG first: WAL replay during storage recovery records
         //    terminal states into it (idempotently).
         let clog = Arc::new(ClogBuffer::open(data_dir, config.clog_buffer_frames)?);
-        // 2. Storage recovery with the heap + txn redo handlers and the CLOG.
+        // 2. Storage recovery with the heap + txn + btree redo handlers and
+        //    the CLOG (Stage M wave 2: btree records — index entries, the
+        //    3-step split protocol, meta records — must replay too).
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
+        redo_handlers.extend(btree_redo_handlers());
         let storage = StorageEngine::open_with_redo_and_clog(
             data_dir,
             &config.storage,
@@ -286,8 +321,10 @@ impl Engine {
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
         );
 
-        // 7. Table registry from the catalog.
+        // 7. Table registry from the catalog, index registry from the
+        //    `pg_index` heap chain.
         let registry = Self::build_registry(&catalog)?;
+        let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref())?;
 
         Ok(Self {
             storage,
@@ -296,6 +333,7 @@ impl Engine {
             txn,
             clog,
             registry: RwLock::new(registry),
+            indexes: RwLock::new(indexes),
             ddl_lock: Mutex::new(()),
             commit_barrier: RwLock::new(()),
         })
@@ -322,6 +360,13 @@ impl Engine {
         for row in live.into_values() {
             let oid = row.oid.raw();
             if oid.0 < Oid::FIRST_USER.0 {
+                continue;
+            }
+            if row.kind != RELKIND_TABLE {
+                // Index relations (`relkind = 'i'`, Stage M wave 2) are NOT
+                // tables: they carry no heap chain and must never be reached
+                // through the DML API. They live in the index registry
+                // (`build_index_registry`), keyed by (table, column).
                 continue;
             }
             let Some(relpages) = catalog.relpages_of(row.oid) else {
@@ -365,6 +410,68 @@ impl Engine {
             }
         }
         Ok(registry)
+    }
+
+    /// Rebuild the index registry by scanning the `pg_index` heap chain
+    /// (the catalog snapshot intentionally does not read `pg_index`, so the
+    /// engine reads it through the heap AM; rows were committed through
+    /// auto-commit, so ordinary visibility applies).
+    ///
+    /// Each row is joined with the catalog snapshot for the index's single
+    /// `pg_attribute` row (attnum = 1, `attname` = indexed column) and its
+    /// `pg_rust_relpages` entry (`first_page` = B+Tree meta page). A
+    /// `pg_index` row missing either is a crash-half-written index build —
+    /// leaked pages, skipped with a warning (same policy as half-created
+    /// tables).
+    fn build_index_registry(
+        catalog: &Catalog,
+        heap: &HeapAM,
+        clog: &dyn ClogAccessor,
+    ) -> Result<Vec<IndexEntry>> {
+        let columns = PG_INDEX.column_types();
+        let rows = heap.scan(ScanContext {
+            rel: RelationDesc {
+                rel_oid: PG_INDEX.oid.raw(),
+                first_page: PG_INDEX.first_page,
+                columns: &columns,
+            },
+            snapshot: &Snapshot::everything(),
+            clog,
+        })?;
+        let mut indexes = Vec::new();
+        for (_tid, values) in rows {
+            let (Some(Datum::Int8(indexrelid)), Some(Datum::Int8(indrelid))) =
+                (&values[0], &values[1])
+            else {
+                return Err(EngineError::Corrupted(
+                    "pg_index row with non-int8 identity columns".to_string(),
+                ));
+            };
+            let index_oid = Oid(*indexrelid as u64);
+            let attrs = catalog.attributes_of(pg_catalog::TableOid(index_oid));
+            let relpages = catalog.relpages_of(pg_catalog::TableOid(index_oid));
+            let (Some(attr), Some(relpages)) = (attrs.first(), relpages) else {
+                tracing::warn!(
+                    index_oid = index_oid.0,
+                    "pg_index row without pg_attribute/pg_rust_relpages; skipping half-built index"
+                );
+                continue;
+            };
+            let ty = builtin_type(attr.type_oid).ok_or_else(|| {
+                EngineError::Corrupted(format!(
+                    "index {index_oid}: unknown type OID {:?}",
+                    attr.type_oid
+                ))
+            })?;
+            indexes.push(IndexEntry {
+                index_oid,
+                table_oid: Oid(*indrelid as u64),
+                column: attr.name.clone(),
+                key_type: ty.column_type,
+                meta_page: relpages.first_page,
+            });
+        }
+        Ok(indexes)
     }
 
     /// Flush all dirty pages, fsync the disk CLOG's dirty frames, persist
@@ -571,15 +678,282 @@ impl Engine {
         Ok(())
     }
 
+    /// Create a B+Tree index on `table(column)` (M2b Stage M wave 2,
+    /// blocking build) and return the index relation's OID.
+    ///
+    /// Steps: scan the table through the heap AM (visible rows only),
+    /// extract and encode the key column (SQL NULLs are **not indexed** —
+    /// an M2b simplification, matching "single-column non-null keys" scope),
+    /// bottom-up bulk-load the tree (one post-image FPI per page, see
+    /// `pg_am_btree::BTreeAM::build_index`), and only then write the catalog
+    /// rows in one auto-commit transaction:
+    ///
+    /// - `pg_class`: `(oid, "{table}_{column}_idx", relkind='i', natts=1,
+    ///   toast=0, relam=BTREE_AM_OID)`;
+    /// - `pg_attribute`: one row for the index (attnum=1, attname = the
+    ///   indexed column's name, atttypid = its type — PostgreSQL's shape);
+    /// - `pg_index`: `(indexrelid=oid, indrelid=table, indnatts=1,
+    ///   indisunique=0, indisprimary=0)`;
+    /// - `pg_rust_relpages`: `(oid, meta_page, meta_page, 1)` — the index's
+    ///   B+Tree meta page location.
+    ///
+    /// Crash atomicity (same "leak, never corruption" policy as the other
+    /// DDL): a crash before the catalog commit leaves only the bulk-loaded
+    /// pages — unreachable, with no catalog rows pointing at them; a crash
+    /// after it leaves a fully built index (every page is FPI-covered and
+    /// the meta record is written last by the loader).
+    ///
+    /// Fails with [`EngineError::IndexExists`] if (table, column) already
+    /// has an index (M2b: one index per column, no `DROP INDEX`).
+    pub fn create_index(&self, table: &str, column: &str) -> Result<Oid> {
+        let _ddl = self.ddl_lock.lock();
+        let entry = self.table_entry(table)?;
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("table {table:?} has no column {column:?}"))
+            })?;
+        let key_type = entry.columns[col_index].col_type;
+        if !is_supported_key_type(key_type) {
+            return Err(EngineError::InvalidArgument(format!(
+                "column {column:?} of type {key_type:?} is not an indexable M2b key type"
+            )));
+        }
+        if self
+            .indexes
+            .read()
+            .iter()
+            .any(|e| e.table_oid == entry.oid && e.column == column)
+        {
+            return Err(EngineError::IndexExists(format!("{table}({column})")));
+        }
+
+        // Catalog-room pre-check BEFORE the expensive scan + bulk load
+        // (~1s and ~20MB of WAL for a large table): the four catalog rows
+        // written at the end must fit their system pages, so fail cheap and
+        // early if they cannot. The rows are encoded exactly as
+        // `create_index_catalog_rows` will encode them.
+        let index_oid = self.catalog.oid_allocator().alloc();
+        self.ensure_index_catalog_room(&entry, column, index_oid)?;
+
+        // Collect (key_bytes, tid) from a full heap scan (M2b: simple scan,
+        // no ordering assumption on the source).
+        let col_types = column_types(&entry);
+        let rows = self.heap.scan(ScanContext {
+            rel: relation_desc(&entry, &col_types),
+            snapshot: &Snapshot::everything(),
+            clog: self.clog.as_ref(),
+        })?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for (tid, values) in rows {
+            // NULL keys are not indexed (see the fn docs).
+            if let Some(datum) = &values[col_index] {
+                entries.push((encode_key(datum)?, tid));
+            }
+        }
+
+        let btree = BTreeAM::new(
+            Arc::clone(self.storage.buffer_pool()),
+            Arc::clone(self.storage.wal_writer()),
+        );
+        let index = btree.build_index(index_oid, key_type, entries)?;
+        let meta_page = index.meta_page();
+
+        // Catalog rows LAST (see the fn docs for the crash-atomicity order).
+        self.auto_commit(|snap| {
+            self.create_index_catalog_rows(snap, &entry, column, index_oid, meta_page)
+        })?;
+        self.indexes.write().push(IndexEntry {
+            index_oid,
+            table_oid: entry.oid,
+            column: column.to_string(),
+            key_type,
+            meta_page,
+        });
+        Ok(index_oid)
+    }
+
+    /// The catalog-writing half of `create_index`, inside transaction `snap`.
+    fn create_index_catalog_rows(
+        &self,
+        snap: &Snapshot,
+        entry: &TableEntry,
+        column: &str,
+        index_oid: Oid,
+        meta_page: PageId,
+    ) -> Result<()> {
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .expect("create_index validated the column");
+        let (type_oid, len) = type_oid_of(entry.columns[col_index].col_type)?;
+
+        let class_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Text(format!("{}_{column}_idx", entry.oid.0))),
+            Some(Datum::Text(RELKIND_INDEX.to_string())),
+            Some(Datum::Int4(1)),
+            Some(Datum::Int8(0)),
+            Some(Datum::Int8(BTREE_AM_OID.0 as i64)),
+        ];
+        self.insert_catalog_row(snap, &PG_CLASS, &class_row)?;
+
+        let attr_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Text(column.to_string())),
+            Some(Datum::Int8(type_oid.raw().0 as i64)),
+            Some(Datum::Int4(len)),
+            Some(Datum::Int4(1)),
+            Some(Datum::Int4(0)),
+            Some(Datum::Int4(1)),
+        ];
+        self.insert_catalog_row(snap, &PG_ATTRIBUTE, &attr_row)?;
+
+        let index_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Int8(entry.oid.0 as i64)),
+            Some(Datum::Int4(1)),
+            // indisunique / indisprimary: M2b builds non-unique indexes only.
+            Some(Datum::Int4(0)),
+            Some(Datum::Int4(0)),
+        ];
+        self.insert_catalog_row(snap, &PG_INDEX, &index_row)?;
+
+        let relpages_row = vec![
+            Some(Datum::Int8(index_oid.0 as i64)),
+            Some(Datum::Int8(meta_page.0 as i64)),
+            Some(Datum::Int8(meta_page.0 as i64)),
+            Some(Datum::Int8(1)),
+        ];
+        self.insert_catalog_row(snap, &PG_RELPAGES, &relpages_row)?;
+        Ok(())
+    }
+
+    /// Pre-check that the four catalog rows `create_index` will write fit
+    /// their system pages, run BEFORE the expensive heap scan + bulk load
+    /// (P3 review): failing here costs nothing, failing after the build
+    /// would waste ~1s and ~20MB of WAL on a large table. The rows are
+    /// encoded exactly as `create_index_catalog_rows` encodes them, so the
+    /// check is authoritative, not an estimate.
+    fn ensure_index_catalog_room(
+        &self,
+        entry: &TableEntry,
+        column: &str,
+        index_oid: Oid,
+    ) -> Result<()> {
+        let col_index = entry
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .expect("create_index validated the column");
+        let (type_oid, len) = type_oid_of(entry.columns[col_index].col_type)?;
+        let rows: [(&SystemTableDef, Vec<Value>); 4] = [
+            (
+                &PG_CLASS,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(format!("{}_{column}_idx", entry.oid.0))),
+                    Some(Datum::Text(RELKIND_INDEX.to_string())),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(BTREE_AM_OID.0 as i64)),
+                ],
+            ),
+            (
+                &PG_ATTRIBUTE,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Text(column.to_string())),
+                    Some(Datum::Int8(type_oid.raw().0 as i64)),
+                    Some(Datum::Int4(len)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(1)),
+                ],
+            ),
+            (
+                &PG_INDEX,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(entry.oid.0 as i64)),
+                    Some(Datum::Int4(1)),
+                    Some(Datum::Int4(0)),
+                    Some(Datum::Int4(0)),
+                ],
+            ),
+            (
+                &PG_RELPAGES,
+                vec![
+                    Some(Datum::Int8(index_oid.0 as i64)),
+                    Some(Datum::Int8(0)), // meta page unknown yet; same 8-byte width
+                    Some(Datum::Int8(0)),
+                    Some(Datum::Int8(1)),
+                ],
+            ),
+        ];
+        for (def, row) in &rows {
+            let columns = def.column_types();
+            let tuple = encode_tuple(tuple_header(), &columns, row)?;
+            self.ensure_catalog_room(def, tuple.len())?;
+        }
+        Ok(())
+    }
+
+    /// Point lookup through the index on `table(column)` (M2b Stage M wave
+    /// 2): resolve the index in the registry, open its B+Tree from the meta
+    /// page, encode `key`, and return the heap TID of the first matching
+    /// entry (or `None`).
+    ///
+    /// Range scans and the SQL entry point are Stage O territory; the native
+    /// `pg_am_btree::BTreeIndex::range_scan` is available through
+    /// [`Engine::btree_index`] until then.
+    pub fn index_lookup(&self, table: &str, column: &str, key: &Datum) -> Result<Option<Tid>> {
+        let index = self.btree_index(table, column)?;
+        let key_bytes = encode_key(key)?;
+        Ok(index.lookup(&key_bytes)?)
+    }
+
+    /// Open the B+Tree handle for the index on `table(column)` (testing /
+    /// advanced use — e.g. native `range_scan` / `validate`).
+    pub fn btree_index(&self, table: &str, column: &str) -> Result<pg_am_btree::BTreeIndex> {
+        let entry = self.table_entry(table)?;
+        let idx = self
+            .indexes
+            .read()
+            .iter()
+            .find(|e| e.table_oid == entry.oid && e.column == column)
+            .cloned()
+            .ok_or_else(|| EngineError::IndexNotFound(format!("{table}({column})")))?;
+        let btree = BTreeAM::new(
+            Arc::clone(self.storage.buffer_pool()),
+            Arc::clone(self.storage.wal_writer()),
+        );
+        Ok(btree.open_index(idx.index_oid, idx.meta_page, idx.key_type)?)
+    }
+
+    /// The live index registry entries (testing / diagnostics).
+    pub fn indexes(&self) -> Vec<IndexEntry> {
+        self.indexes.read().clone()
+    }
+
     /// Insert one row (single auto-commit transaction) and return its TID.
     ///
     /// `values` must match the table's schema in count and types. The
     /// tuple's `t_xmin` is stamped by the AM with the transaction's own XID
     /// (Stage K), so callers cannot mislabel the writer.
+    ///
+    /// Index maintenance (Stage M wave 3): every index registered on the
+    /// table gains a `(key, tid)` entry in the SAME transaction — the heap
+    /// insert runs first (it allocates the TID), then each index is updated
+    /// (NULL keys are skipped, matching `create_index`).
     pub fn insert(&self, table: &str, values: &[Value]) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let tuple = encode_row(&entry, &col_types, values)?;
+        let indexes = self.indexes_of(&entry);
         self.auto_commit(|snap| {
             let mut out_tid = Tid {
                 page_id: PageId::INVALID,
@@ -591,6 +965,11 @@ impl Engine {
                 tuple: &tuple,
                 out_tid: Some(&mut out_tid),
             })?;
+            for (idx, col_index) in &indexes {
+                if let Some(datum) = &values[*col_index] {
+                    self.open_btree(idx)?.insert(&encode_key(datum)?, out_tid)?;
+                }
+            }
             Ok(out_tid)
         })
     }
@@ -628,10 +1007,22 @@ impl Engine {
 
     /// Replace the row at `tid` with `values` (single auto-commit
     /// transaction) and return the new version's TID.
+    ///
+    /// Index maintenance (Stage M wave 3): an update is delete-old +
+    /// insert-new per index — the old key is read back from the heap row
+    /// BEFORE the heap update, then `(old_key, old_tid)` is removed and
+    /// `(new_key, new_tid)` inserted, all in the same transaction. NULL keys
+    /// are skipped on both sides.
     pub fn update(&self, table: &str, tid: Tid, values: &[Value]) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let tuple = encode_row(&entry, &col_types, values)?;
+        let indexes = self.indexes_of(&entry);
+        let old_values = if indexes.is_empty() {
+            Vec::new()
+        } else {
+            self.read_row_by_tid(&entry, &col_types, tid)?
+        };
         self.auto_commit(|snap| {
             let mut out_tid = Tid {
                 page_id: PageId::INVALID,
@@ -645,15 +1036,37 @@ impl Engine {
                 out_tid: Some(&mut out_tid),
                 clog: self.clog.as_ref(),
             })?;
+            for (idx, col_index) in &indexes {
+                let mut index = self.open_btree(idx)?;
+                if let Some(old_datum) = &old_values[*col_index] {
+                    index.delete(&encode_key(old_datum)?, tid)?;
+                }
+                if let Some(new_datum) = &values[*col_index] {
+                    index.insert(&encode_key(new_datum)?, out_tid)?;
+                }
+            }
             Ok(out_tid)
         })
     }
 
     /// Delete the row at `tid` (logical delete: stamps `t_xmax`; single
     /// auto-commit transaction).
+    ///
+    /// Index maintenance (Stage M wave 3): the row's key is read back BEFORE
+    /// the heap delete, and `(key, tid)` is removed from every registered
+    /// index afterwards — heap first because its liveness check is the
+    /// authoritative validation; an index delete afterwards cannot fail on
+    /// a consistent index (its `EntryNotFound` would mean the index and the
+    /// table already disagreed). NULL keys are skipped.
     pub fn delete(&self, table: &str, tid: Tid) -> Result<()> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
+        let indexes = self.indexes_of(&entry);
+        let old_values = if indexes.is_empty() {
+            Vec::new()
+        } else {
+            self.read_row_by_tid(&entry, &col_types, tid)?
+        };
         self.auto_commit(|snap| {
             self.heap.delete(DeleteContext {
                 rel: relation_desc(&entry, &col_types),
@@ -661,8 +1074,59 @@ impl Engine {
                 tid,
                 clog: self.clog.as_ref(),
             })?;
+            for (idx, col_index) in &indexes {
+                if let Some(old_datum) = &old_values[*col_index] {
+                    self.open_btree(idx)?.delete(&encode_key(old_datum)?, tid)?;
+                }
+            }
             Ok(())
         })
+    }
+
+    /// Every index registered on `entry`'s table, joined with the position
+    /// of its indexed column in the table's schema.
+    fn indexes_of(&self, entry: &TableEntry) -> Vec<(IndexEntry, usize)> {
+        self.indexes
+            .read()
+            .iter()
+            .filter(|e| e.table_oid == entry.oid)
+            .filter_map(|e| {
+                entry
+                    .columns
+                    .iter()
+                    .position(|c| c.name == e.column)
+                    .map(|pos| (e.clone(), pos))
+            })
+            .collect()
+    }
+
+    /// Open the B+Tree handle for a registry index entry.
+    fn open_btree(&self, idx: &IndexEntry) -> Result<pg_am_btree::BTreeIndex> {
+        let btree = BTreeAM::new(
+            Arc::clone(self.storage.buffer_pool()),
+            Arc::clone(self.storage.wal_writer()),
+        );
+        Ok(btree.open_index(idx.index_oid, idx.meta_page, idx.key_type)?)
+    }
+
+    /// Read back the decoded values of the row at `tid` directly from its
+    /// heap page (raw read, no visibility filter: DML uses this to recover
+    /// the OLD key of a row the caller already addressed by TID, before the
+    /// heap mutation runs in the same statement).
+    fn read_row_by_tid(
+        &self,
+        entry: &TableEntry,
+        col_types: &[ColumnType],
+        tid: Tid,
+    ) -> Result<Vec<Value>> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let bytes = SlottedPage::tuple(page, tid.slot_id)?.ok_or_else(|| {
+            EngineError::Corrupted(format!("no tuple at {tid} for index key readback"))
+        })?;
+        let (_header, values) = decode_tuple(bytes, col_types)?;
+        debug_assert_eq!(values.len(), entry.columns.len());
+        Ok(values)
     }
 
     /// Run `op` as a single auto-commit transaction (§21: M2a exposes no

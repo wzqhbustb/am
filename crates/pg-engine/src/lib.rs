@@ -29,7 +29,8 @@ pub mod engine;
 pub mod error;
 
 pub use engine::{
-    ColumnDef, Engine, EngineConfig, Predicate, TableEntry, Value, DEFAULT_CLOG_BUFFER_FRAMES,
+    ColumnDef, Engine, EngineConfig, IndexEntry, Predicate, TableEntry, Value,
+    DEFAULT_CLOG_BUFFER_FRAMES,
 };
 pub use error::{EngineError, Result};
 
