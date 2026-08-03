@@ -76,6 +76,18 @@ struct FrameMeta {
     /// authoritative value lives in the page itself; readers that need
     /// correctness (e.g. `flush_frame`) must read `page[0..8]` directly.
     cached_lsn: Lsn,
+    /// ARIES recovery LSN (`rec_lsn`, tech-selection §11.1): the LSN at which
+    /// this page was first dirtied since it was last flushed. [`Lsn::INVALID`]
+    /// iff the frame is clean or the first-dirty LSN is unknown (a freshly
+    /// allocated page whose caller never stamped a WAL LSN). Set by every
+    /// path that transitions the frame from clean to dirty — the FPI branch
+    /// of `pin_mut` (the FPI LSN *is* the cycle's first modification) and
+    /// `PageGuardMut::drop` (the page's `pd_lsn` at drop; see there for the
+    /// approximation argument) — and reset to `INVALID` by `flush_frame`
+    /// atomically with the dirty flag, so the checkpoint's DPT snapshot
+    /// ([`BufferPool::dirty_page_snapshot`]) never pairs a dirty page with a
+    /// stale rec_lsn.
+    first_dirty_lsn: Lsn,
     /// True if the page has an on-disk image that a torn write could corrupt,
     /// so the next modification must be preceded by a `FullPageImage` record.
     /// Set on load-from-disk and after any successful `flush_frame` (a resident
@@ -97,6 +109,7 @@ impl Default for FrameMeta {
             dirty: false,
             reference: false,
             cached_lsn: Lsn::INVALID,
+            first_dirty_lsn: Lsn::INVALID,
             needs_fpi: false,
             evicting: false,
         }
@@ -269,6 +282,21 @@ impl BufferPool {
         let page_lsn = page_pd_lsn(&content_guard[..]);
         let should_write_fpi = needs_fpi && checkpoint_lsn.is_valid() && page_lsn < checkpoint_lsn;
 
+        // Mark the frame dirty NOW, at pin_mut time — not at guard drop.
+        // pin_mut means write intent, and a fuzzy checkpoint that collects
+        // `dirty_page_ids()` while this guard is still held MUST see the
+        // page: its WAL record may already sit before the checkpoint's
+        // begin_lsn while the dirty flag only appears when the guard drops
+        // after the collection — the page would be neither flushed nor in
+        // the DPT snapshot, and its pre-begin record would fall behind the
+        // redo point, silently losing the update on crash. A false positive
+        // (guard dropped unmodified) costs one extra page flush, which is
+        // safe. `first_dirty_lsn` keeps its drop-time semantics: the
+        // modifying record's LSN only exists once the AM has appended it.
+        // (content.write → meta is the sanctioned nesting order, same as
+        // the FPI block below.)
+        self.frames[frame_id.0].meta.lock().dirty = true;
+
         if should_write_fpi {
             let image = content_guard.to_vec();
             let fpi_record = match WalRecord::full_page_image(page_id, image) {
@@ -296,6 +324,14 @@ impl BufferPool {
             set_page_pd_lsn(&mut content_guard[..], fpi_lsn);
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.cached_lsn = fpi_lsn;
+            // DPT anchor (§11.1): the FPI LSN is this checkpoint cycle's
+            // first modification of the page, so it is exactly the rec_lsn
+            // semantics require. Only set it when no first-dirty LSN is
+            // recorded yet: a page re-dirtied after a mid-cycle flush keeps
+            // the (older, conservative) anchor of its current dirty epoch.
+            if meta.first_dirty_lsn == Lsn::INVALID {
+                meta.first_dirty_lsn = fpi_lsn;
+            }
             meta.dirty = true;
         }
 
@@ -395,6 +431,33 @@ impl BufferPool {
                 let meta = frame.meta.lock();
                 if meta.dirty && meta.page_id != PageId::INVALID {
                     Some(meta.page_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Return `(page_id, rec_lsn)` for every currently dirty frame whose
+    /// first-dirty LSN is known (M2b Stage N; tech-selection §11.1/§11.4).
+    ///
+    /// This is the buffer pool's contribution to the checkpoint's Dirty Page
+    /// Table snapshot. Frames whose `first_dirty_lsn` is [`Lsn::INVALID`] —
+    /// freshly allocated pages whose writer never stamped a WAL LSN — are
+    /// filtered out: with no known rec_lsn there is no WAL position to anchor
+    /// them at, and their `PageAlloc`/content records are picked up by the
+    /// recovery WAL scan from the checkpoint LSN regardless.
+    ///
+    /// Like [`dirty_page_ids`](Self::dirty_page_ids), the result is a point-in
+    /// time snapshot; frames may be flushed or re-dirtied immediately after.
+    pub fn dirty_page_snapshot(&self) -> Vec<(PageId, Lsn)> {
+        self.frames
+            .iter()
+            .filter_map(|frame| {
+                let meta = frame.meta.lock();
+                if meta.dirty && meta.page_id != PageId::INVALID && meta.first_dirty_lsn.is_valid()
+                {
+                    Some((meta.page_id, meta.first_dirty_lsn))
                 } else {
                     None
                 }
@@ -508,6 +571,8 @@ impl BufferPool {
             // The page's pd_lsn is authoritative; cache a copy in the frame.
             // A fresh (zeroed) page yields Lsn::INVALID, matching M1 semantics.
             meta.cached_lsn = cached_lsn;
+            // A freshly loaded frame is clean, so it has no rec_lsn yet.
+            meta.first_dirty_lsn = Lsn::INVALID;
             meta.needs_fpi = true;
         }
 
@@ -615,28 +680,46 @@ impl BufferPool {
     /// started after this thread's `write_all_at` returned — already made the
     /// write durable, so it can skip its own syscall.
     fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
-        let page_id = {
+        let (page_id, saved_first_dirty_lsn) = {
             let mut meta = self.frames[frame_id.0].meta.lock();
             if !meta.dirty || meta.page_id == PageId::INVALID {
                 return Ok(());
             }
             meta.dirty = false;
-            meta.page_id
+            // Clear the rec_lsn atomically with the dirty flag (§11.1): the
+            // dirty epoch this flush makes durable ends here. A guard that
+            // re-dirties the page during the flush installs a fresh anchor;
+            // on error we restore the saved one only if no newer anchor
+            // appeared, mirroring the clear-before-write dirty protocol.
+            let saved = meta.first_dirty_lsn;
+            meta.first_dirty_lsn = Lsn::INVALID;
+            (meta.page_id, saved)
         };
 
         // Hold content.read across WAL flush + data write (WAL-before-data).
         let content = self.frames[frame_id.0].content.read();
         let page_lsn = page_pd_lsn(&content[..]);
-        if page_lsn.is_valid() && self.wal_writer.synced_lsn() < page_lsn {
+        // Skip the WAL flush when the page's LSN exceeds the clock: the LSN
+        // came from recovery replay (not a live append), so the WAL record
+        // is already durable on disk. `flush_to` would reject it anyway
+        // (LsnNotAvailable — the clock was never advanced to this LSN).
+        if page_lsn.is_valid()
+            && page_lsn <= self.wal_writer.current_lsn()
+            && self.wal_writer.synced_lsn() < page_lsn
+        {
             if let Err(e) = self.wal_writer.flush_to(page_lsn) {
-                self.frames[frame_id.0].meta.lock().dirty = true;
+                let mut meta = self.frames[frame_id.0].meta.lock();
+                meta.dirty = true;
+                restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
                 return Err(e);
             }
         }
 
         let offset = (page_id.0 - 1) * self.config.page_size() as u64;
         if let Err(e) = self.data_file.write_all_at(&*content, offset) {
-            self.frames[frame_id.0].meta.lock().dirty = true;
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            meta.dirty = true;
+            restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
             return Err(e);
         }
         let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
@@ -660,7 +743,9 @@ impl BufferPool {
         if self.synced_gen.load(Ordering::Acquire) < my_gen {
             let covered_gen = self.flush_gen.load(Ordering::Acquire);
             if let Err(e) = self.data_file.sync_all() {
-                self.frames[frame_id.0].meta.lock().dirty = true;
+                let mut meta = self.frames[frame_id.0].meta.lock();
+                meta.dirty = true;
+                restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
                 return Err(e);
             }
             self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
@@ -673,6 +758,24 @@ impl BufferPool {
         let mut meta = self.frames[frame_id.0].meta.lock();
         debug_assert!(meta.pin_count > 0, "unpin called on unpinned frame");
         meta.pin_count -= 1;
+    }
+}
+
+/// Restore a saved first-dirty anchor after a failed flush, keeping the
+/// OLDER of the saved anchor and any anchor a concurrent re-dirty installed
+/// meanwhile (min-merge; Stage N review, P2-2).
+///
+/// The write failed, so the on-disk image is still the pre-flush one and
+/// the correct rec_lsn of the current dirty epoch is the OLDEST anchor
+/// that describes it. The previous restore-only-when-INVALID rule kept a
+/// newer anchor (N > S) installed by a re-dirty during the flush — an
+/// over-estimate that a future min-formula redo start would read as
+/// "already on disk", silently skipping redo. A `saved` of
+/// [`Lsn::INVALID`] (dirty page whose writer never stamped a WAL LSN)
+/// restores nothing.
+fn restore_first_dirty_lsn(current: &mut Lsn, saved: Lsn) {
+    if saved.is_valid() && (*current == Lsn::INVALID || saved < *current) {
+        *current = saved;
     }
 }
 
@@ -762,6 +865,9 @@ impl AsMut<[u8]> for PageGuardMut<'_> {
 
 impl Drop for PageGuardMut<'_> {
     fn drop(&mut self) {
+        // Sample the authoritative page LSN (`page[0..8]`) while we still hold
+        // the write latch; it anchors the frame's rec_lsn below.
+        let lsn_at_drop = page_pd_lsn(&self.content_guard.as_ref().expect("guard is active")[..]);
         drop(self.content_guard.take());
 
         // A write guard may have modified the page. We cannot know whether it
@@ -771,6 +877,34 @@ impl Drop for PageGuardMut<'_> {
         {
             let mut meta = self.pool.frames[self.frame_id.0].meta.lock();
             if meta.page_id != PageId::INVALID {
+                // DPT anchor (ARIES rec_lsn, §11.1): only fill in the anchor
+                // when the frame has none — i.e. on the clean → dirty
+                // transition, since `flush_frame` clears the anchor together
+                // with the dirty flag. The value used is the page's `pd_lsn`
+                // at drop time, which approximates "the LSN that first
+                // dirtied the page since the last flush":
+                //
+                // - AMs stamp `pd_lsn = max(record.lsn, pd_lsn)` on every
+                //   WAL-logged modification (heap/btree `stamp_pd_lsn`), so
+                //   for the first dirtier of an epoch `lsn_at_drop` is exactly
+                //   that modification's record LSN.
+                // - For raw writes that never stamp `pd_lsn` the value is
+                //   stale, i.e. an *under*-estimate of the true first-dirty
+                //   LSN. An under-estimated rec_lsn is always safe: recovery
+                //   replays a few extra, pd_lsn-guarded (idempotent) records.
+                // - It cannot be an unsafe *over*-estimate: any WAL record
+                //   that dirtied the page in this epoch carries an LSN ≤ the
+                //   page's current `pd_lsn`, and a concurrent flush that
+                //   already made this guard's content durable merely leaves a
+                //   conservative extra anchor (redo skips via the pd_lsn
+                //   guard).
+                //
+                // A fresh zeroed page has `pd_lsn == INVALID`; it then stays
+                // INVALID and is filtered out of the DPT snapshot (its
+                // PageAlloc record is replayed from the WAL scan anyway).
+                if meta.first_dirty_lsn == Lsn::INVALID {
+                    meta.first_dirty_lsn = lsn_at_drop;
+                }
                 meta.dirty = true;
             }
         }
@@ -1344,6 +1478,137 @@ mod tests {
             pool.flush(*id).unwrap();
         }
         assert!(pool.dirty_page_ids().is_empty());
+    }
+
+    /// Stage N (§11.1/§11.4): the DPT snapshot reports `(page_id, rec_lsn)`
+    /// for dirty frames, anchors rec_lsn at the FPI LSN (or the page's
+    /// `pd_lsn` at guard drop when no FPI fires), keeps the epoch's first
+    /// anchor across repeated modifications, and drops the entry once the
+    /// page is flushed.
+    #[test]
+    fn dirty_page_snapshot_tracks_rec_lsn_epoch() {
+        let tmp = TempDir::new().unwrap();
+        let (allocator, wal, pool) = setup(&tmp);
+        let _ = &allocator;
+
+        // 1. A raw new-page write never stamps a WAL LSN, so its
+        //    first_dirty_lsn stays INVALID and the frame is filtered out of
+        //    the snapshot (its PageAlloc/content records are covered by the
+        //    recovery WAL scan regardless).
+        let page_id = {
+            let mut guard = pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 1;
+            guard.page_id()
+        };
+        assert!(pool.dirty_page_ids().contains(&page_id));
+        assert!(
+            pool.dirty_page_snapshot().is_empty(),
+            "unknown first-dirty LSN must be filtered out of the DPT snapshot"
+        );
+
+        // 2. Flush, publish a checkpoint LSN, and re-dirty via pin_mut: the
+        //    FPI path fires and the FPI LSN becomes the rec_lsn anchor.
+        pool.flush(page_id).unwrap();
+        pool.set_checkpoint_lsn(wal.current_lsn());
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 2;
+        }
+        let fpi_lsn = pool.frame_cached_lsn(page_id).unwrap();
+        assert!(fpi_lsn.is_valid());
+        assert_eq!(pool.dirty_page_snapshot(), vec![(page_id, fpi_lsn)]);
+
+        // 3. A second modification in the same dirty epoch keeps the epoch's
+        //    first anchor (ARIES rec_lsn = FIRST dirtying LSN since flush).
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 3;
+        }
+        assert_eq!(pool.dirty_page_snapshot(), vec![(page_id, fpi_lsn)]);
+
+        // 4. Flush ends the epoch: the page leaves the DPT snapshot.
+        pool.flush(page_id).unwrap();
+        assert!(pool.dirty_page_snapshot().is_empty());
+
+        // 5. Re-dirty without an FPI (the page's pd_lsn is already past the
+        //    checkpoint LSN): the guard-drop path anchors rec_lsn at the
+        //    page's pd_lsn. No new WAL record stamped the page here, so the
+        //    anchor is the stale FPI LSN — a safe under-estimate (see the
+        //    approximation argument in PageGuardMut::drop).
+        {
+            let mut guard = pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 4;
+        }
+        assert_eq!(pool.dirty_page_snapshot(), vec![(page_id, fpi_lsn)]);
+    }
+
+    /// Stage N review P2-1: `pin_mut` marks the frame dirty immediately, so
+    /// a fuzzy checkpoint collecting `dirty_page_ids()` while a write guard
+    /// is still held sees the page. Before the fix the dirty flag appeared
+    /// only at guard drop, and a guard straddling the collection lost its
+    /// update on crash (WAL record before begin_lsn, page never flushed).
+    #[test]
+    fn pin_mut_marks_frame_dirty_while_guard_is_held() {
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+
+        let page_id = {
+            let guard = pool.new_page().unwrap();
+            guard.page_id()
+        };
+        pool.flush(page_id).unwrap();
+        assert!(
+            !pool.dirty_page_ids().contains(&page_id),
+            "precondition: freshly flushed page is clean"
+        );
+
+        // Guard held, page not yet modified: write intent alone marks it.
+        let guard = pool.pin_mut(page_id).unwrap();
+        assert!(
+            pool.dirty_page_ids().contains(&page_id),
+            "pin_mut must mark the frame dirty while the guard is held"
+        );
+        drop(guard);
+        assert!(pool.dirty_page_ids().contains(&page_id));
+
+        // A read-only pin must NOT dirty the frame (flush resets first).
+        pool.flush(page_id).unwrap();
+        let read_guard = pool.pin(page_id).unwrap();
+        assert!(
+            !pool.dirty_page_ids().contains(&page_id),
+            "read-only pin must not dirty the frame"
+        );
+        drop(read_guard);
+    }
+
+    /// Stage N review P2-2: the failed-flush anchor restore is a min-merge,
+    /// not a restore-only-when-INVALID.
+    #[test]
+    fn restore_first_dirty_lsn_keeps_the_oldest_anchor() {
+        // Current INVALID: the saved anchor is restored.
+        let mut current = Lsn::INVALID;
+        restore_first_dirty_lsn(&mut current, Lsn(100));
+        assert_eq!(current, Lsn(100));
+
+        // Saved older than current: min wins (the failed write left the
+        // pre-flush image on disk, so the older anchor is the true rec_lsn).
+        let mut current = Lsn(200);
+        restore_first_dirty_lsn(&mut current, Lsn(100));
+        assert_eq!(current, Lsn(100));
+
+        // Saved newer than current: the concurrent re-dirty's older anchor
+        // must not be moved backwards.
+        let mut current = Lsn(100);
+        restore_first_dirty_lsn(&mut current, Lsn(200));
+        assert_eq!(current, Lsn(100));
+
+        // Saved INVALID (writer never stamped a WAL LSN): no-op.
+        let mut current = Lsn(100);
+        restore_first_dirty_lsn(&mut current, Lsn::INVALID);
+        assert_eq!(current, Lsn(100));
+        let mut current = Lsn::INVALID;
+        restore_first_dirty_lsn(&mut current, Lsn::INVALID);
+        assert_eq!(current, Lsn::INVALID);
     }
 
     /// Regression test for the clear-before-write dirty protocol in

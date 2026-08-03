@@ -390,8 +390,15 @@ impl TxnAbortRecord {
     }
 }
 
-/// Payload for a `CheckpointEnd` record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Payload for a `CheckpointEnd` record (v2 layout, M2b Stage N;
+/// tech-selection §11.4).
+///
+/// v2 moves the ATT/DPT out of the record payload into external snapshot
+/// files (a 100K-transaction ATT cannot fit the 64KB single-record payload
+/// limit) and adds `next_oid`, so the record carries six fields. v1 (M1)
+/// records carry only the first three; see [`CheckpointEndRecord::decode`]
+/// for the versioned decoding contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointEndRecord {
     /// The LSN of the corresponding `CheckpointBegin` record (redo point).
     pub checkpoint_lsn: Lsn,
@@ -399,6 +406,99 @@ pub struct CheckpointEndRecord {
     pub next_page_id: PageId,
     /// The next transaction ID to allocate after the checkpoint.
     pub next_txn_id: TxnId,
+    /// The next OID to allocate after the checkpoint (v2; v1 decodes default
+    /// this to [`crate::types::Oid::FIRST_USER`]).
+    pub next_oid: u64,
+    /// Path of the ATT snapshot file relative to the data directory, e.g.
+    /// `meta/att-0000000000000128.snapshot` (v2; empty for v1, meaning "no
+    /// snapshot — rebuild the ATT by a full WAL scan from `checkpoint_lsn`").
+    pub att_file: String,
+    /// Path of the DPT snapshot file relative to the data directory (v2;
+    /// empty for v1, same semantics as `att_file`).
+    pub dpt_file: String,
+}
+
+/// The M1 (v1) `CheckpointEnd` payload: three fields, no snapshot files.
+///
+/// Kept for decode-only migration of M1 data directories (tech-selection
+/// §11.4, v2.3-17); M2 never emits this layout.
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckpointEndRecordV1 {
+    /// The LSN of the corresponding `CheckpointBegin` record (redo point).
+    checkpoint_lsn: Lsn,
+    /// The next page ID to allocate after the checkpoint.
+    next_page_id: PageId,
+    /// The next transaction ID to allocate after the checkpoint.
+    next_txn_id: TxnId,
+}
+
+/// Payload version stamped on every `CheckpointEnd` record M2 emits.
+///
+/// # Version channel — deviation from tech-selection §11.4
+///
+/// §11.4 assigns the record payload version to the high 4 bits of a
+/// `WalRecord.flags: u16` (`flags >> 12`). M1, however, froze the 32-byte
+/// record header with `flags: u8` (`record.rs` header layout: bytes 24-27 =
+/// `record_type, flags, payload_len`), and the header cannot be widened
+/// without breaking every M1 segment on disk. The version therefore lives in
+/// the **high 4 bits of the `u8` flags**: `version = flags >> 4`, with the
+/// low 4 bits reserved for record-specific flags. All M1 records were written
+/// with `flags = 0`, so they are implicitly v1 — exactly the §11.4 semantics,
+/// shifted to the channel the frozen header actually provides.
+pub const CHECKPOINT_END_VERSION_V2: u8 = 1;
+
+/// The `flags` byte stamped on emitted v2 `CheckpointEnd` records: version 1
+/// in the high nibble, no record-specific flags in the low nibble.
+pub const CHECKPOINT_END_V2_FLAGS: u8 = CHECKPOINT_END_VERSION_V2 << 4;
+
+impl CheckpointEndRecord {
+    /// Decode a `CheckpointEnd` payload, dispatching on the record's `flags`
+    /// version nibble (tech-selection §11.4 v1/v2 migration, v2.3-17; see
+    /// [`CHECKPOINT_END_VERSION_V2`] for why the nibble is `flags >> 4`
+    /// rather than the spec's `flags >> 12`).
+    ///
+    /// - version 0 (v1, all M1 records): decode the 3-field M1 layout and
+    ///   fill the v2-only fields with defaults — `next_oid =
+    ///   `[`crate::types::Oid::FIRST_USER`]` (16384, the PG reserved-OID
+    ///   upper bound) and empty `att_file`/`dpt_file`. An empty `att_file`
+    ///   tells the analysis phase there is no snapshot: it rebuilds the ATT
+    ///   by a full WAL scan from `checkpoint_lsn` (Stage N wave 2 consumes
+    ///   this).
+    /// - version 1 (v2, emitted by M2): decode the full 6-field layout.
+    ///
+    /// Recovery never rewrites a v1 record as v2 (read-only recovery); the
+    /// upgrade happens naturally when M2 emits its own `CheckpointEnd`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on malformed payloads and on unknown version nibbles:
+    /// a record from a newer binary must never be silently mis-decoded.
+    pub fn decode(payload: &[u8], flags: u8) -> Result<Self> {
+        match flags >> 4 {
+            0 => {
+                let v1: CheckpointEndRecordV1 =
+                    bincode::serde::decode_from_slice(payload, bincode_config())
+                        .map_err(|e| StorageError::Serialize(e.to_string()))?
+                        .0;
+                Ok(Self {
+                    checkpoint_lsn: v1.checkpoint_lsn,
+                    next_page_id: v1.next_page_id,
+                    next_txn_id: v1.next_txn_id,
+                    next_oid: crate::types::Oid::FIRST_USER.0,
+                    att_file: String::new(),
+                    dpt_file: String::new(),
+                })
+            }
+            CHECKPOINT_END_VERSION_V2 => {
+                Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+                    .map_err(|e| StorageError::Serialize(e.to_string()))?
+                    .0)
+            }
+            v => Err(StorageError::WalReadFailed(format!(
+                "unknown CheckpointEnd payload version {v}"
+            ))),
+        }
+    }
 }
 
 /// A single WAL record.
@@ -628,22 +728,37 @@ impl WalRecord {
         Ok(rec)
     }
 
-    /// Create a `CheckpointEnd` record.
+    /// Create a v2 `CheckpointEnd` record (M2b Stage N; tech-selection §11.4).
+    ///
+    /// The record carries the six-field v2 payload and is stamped with
+    /// [`CHECKPOINT_END_V2_FLAGS`] (version 1 in the flags high nibble) so
+    /// readers can dispatch v1/v2 via [`CheckpointEndRecord::decode`].
+    /// `att_file`/`dpt_file` are the ATT/DPT snapshot paths relative to the
+    /// data directory; pass empty strings only when no snapshot was written
+    /// (the reader then rebuilds from `checkpoint_lsn` by a full WAL scan).
     pub fn checkpoint_end(
         checkpoint_lsn: Lsn,
         next_page_id: PageId,
         next_txn_id: TxnId,
+        next_oid: u64,
+        att_file: String,
+        dpt_file: String,
     ) -> Result<Self> {
         let payload = bincode::serde::encode_to_vec(
             CheckpointEndRecord {
                 checkpoint_lsn,
                 next_page_id,
                 next_txn_id,
+                next_oid,
+                att_file,
+                dpt_file,
             },
             bincode_config(),
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
-        Ok(Self::new(WalRecordType::CheckpointEnd, payload))
+        let mut rec = Self::new(WalRecordType::CheckpointEnd, payload);
+        rec.flags = CHECKPOINT_END_V2_FLAGS;
+        Ok(rec)
     }
 
     /// Return the total serialized size of this record, including padding.
@@ -706,7 +821,7 @@ impl WalRecord {
         let lsn = Lsn(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
         let prev_lsn = Lsn(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
         let txn_id = TxnId(u64::from_le_bytes(buf[16..24].try_into().unwrap()));
-        let record_type = WalRecordType::from_u8(buf[24])?;
+        let type_byte = buf[24];
         let flags = buf[25];
         let payload_len = u16::from_le_bytes(buf[26..28].try_into().unwrap()) as usize;
         let stored_crc = u32::from_le_bytes(buf[28..32].try_into().unwrap());
@@ -716,12 +831,18 @@ impl WalRecord {
             return Err(StorageError::WalCorrupted(lsn));
         }
 
+        // Verify CRC BEFORE checking the discriminant (Stage N review, P1):
+        // a valid CRC means the bytes on disk are intact; an unknown
+        // discriminant then is a genuine "type not recognized" error, not a
+        // bit-rot artifact that should be silently treated as end-of-WAL.
         let mut hasher = Hasher::new();
         hasher.update(&buf[0..28]);
         hasher.update(&buf[32..total]);
         if hasher.finalize() != stored_crc {
             return Err(StorageError::WalCorrupted(lsn));
         }
+
+        let record_type = WalRecordType::from_u8(type_byte)?;
 
         let payload = buf[32..32 + payload_len].to_vec();
         let record = Self {
@@ -787,14 +908,111 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_end_roundtrip() {
-        let mut record = WalRecord::checkpoint_end(Lsn(128), PageId(99), TxnId(7)).unwrap();
+    fn checkpoint_end_v2_roundtrip() {
+        let mut record = WalRecord::checkpoint_end(
+            Lsn(128),
+            PageId(99),
+            TxnId(7),
+            20_000,
+            "meta/att-0000000000000128.snapshot".to_string(),
+            "meta/dpt-0000000000000128.snapshot".to_string(),
+        )
+        .unwrap();
+        // Emitted v2 records carry version 1 in the flags high nibble
+        // (§11.4; the channel is `flags >> 4`, not the spec's `>> 12` — the
+        // M1 32-byte header froze `flags` at u8).
+        assert_eq!(record.flags, CHECKPOINT_END_V2_FLAGS);
+        assert_eq!(record.flags >> 4, CHECKPOINT_END_VERSION_V2);
         record.lsn = Lsn(256);
         let buf = record.encode().unwrap();
         let (decoded, _) = WalRecord::decode(&buf).unwrap();
         assert_eq!(decoded.lsn, Lsn(256));
         assert_eq!(decoded.record_type, WalRecordType::CheckpointEnd);
+        assert_eq!(decoded.flags, CHECKPOINT_END_V2_FLAGS);
         assert_eq!(decoded.payload, record.payload);
+
+        let payload = CheckpointEndRecord::decode(&decoded.payload, decoded.flags).unwrap();
+        assert_eq!(payload.checkpoint_lsn, Lsn(128));
+        assert_eq!(payload.next_page_id, PageId(99));
+        assert_eq!(payload.next_txn_id, TxnId(7));
+        assert_eq!(payload.next_oid, 20_000);
+        assert_eq!(payload.att_file, "meta/att-0000000000000128.snapshot");
+        assert_eq!(payload.dpt_file, "meta/dpt-0000000000000128.snapshot");
+    }
+
+    /// v1/v2 migration (§11.4, v2.3-17): a hand-built M1 v1 payload
+    /// (`flags = 0`, 3 fields) decodes with the v2-only fields defaulted —
+    /// `next_oid = 16384` (PG reserved-OID bound) and empty snapshot paths,
+    /// which analysis reads as "no snapshot: full rebuild from
+    /// `checkpoint_lsn`".
+    #[test]
+    fn checkpoint_end_v1_decode_defaults() {
+        let v1_payload = bincode::serde::encode_to_vec(
+            CheckpointEndRecordV1 {
+                checkpoint_lsn: Lsn(64),
+                next_page_id: PageId(5),
+                next_txn_id: TxnId(3),
+            },
+            bincode_config(),
+        )
+        .unwrap();
+
+        let decoded = CheckpointEndRecord::decode(&v1_payload, 0).unwrap();
+        assert_eq!(decoded.checkpoint_lsn, Lsn(64));
+        assert_eq!(decoded.next_page_id, PageId(5));
+        assert_eq!(decoded.next_txn_id, TxnId(3));
+        assert_eq!(decoded.next_oid, crate::types::Oid::FIRST_USER.0);
+        assert!(decoded.att_file.is_empty());
+        assert!(decoded.dpt_file.is_empty());
+    }
+
+    /// The version nibble (high 4 bits) and the record-specific flag bits
+    /// (low 4 bits) must not interfere: low bits set on a v1 record still
+    /// dispatch to v1, and on a v2 record still dispatch to v2.
+    #[test]
+    fn checkpoint_end_version_nibble_ignores_low_flag_bits() {
+        let v1_payload = bincode::serde::encode_to_vec(
+            CheckpointEndRecordV1 {
+                checkpoint_lsn: Lsn(64),
+                next_page_id: PageId(5),
+                next_txn_id: TxnId(3),
+            },
+            bincode_config(),
+        )
+        .unwrap();
+        let v1 = CheckpointEndRecord::decode(&v1_payload, 0x0F).unwrap();
+        assert_eq!(v1.next_oid, crate::types::Oid::FIRST_USER.0);
+        assert!(v1.att_file.is_empty());
+
+        let v2_record = WalRecord::checkpoint_end(
+            Lsn(64),
+            PageId(5),
+            TxnId(3),
+            20_000,
+            "meta/att-x.snapshot".to_string(),
+            "meta/dpt-x.snapshot".to_string(),
+        )
+        .unwrap();
+        let v2 = CheckpointEndRecord::decode(&v2_record.payload, CHECKPOINT_END_V2_FLAGS | 0x0F)
+            .unwrap();
+        assert_eq!(v2.next_oid, 20_000);
+        assert_eq!(v2.att_file, "meta/att-x.snapshot");
+    }
+
+    /// A record written by a newer binary (unknown version nibble) is a hard
+    /// error, never a silent mis-decode.
+    #[test]
+    fn checkpoint_end_decode_rejects_unknown_version() {
+        let record = WalRecord::checkpoint_end(
+            Lsn(64),
+            PageId(5),
+            TxnId(3),
+            1,
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert!(CheckpointEndRecord::decode(&record.payload, 2 << 4).is_err());
     }
 
     #[test]
@@ -1031,6 +1249,9 @@ mod tests {
                     Lsn(checkpoint_lsn),
                     PageId(next_page_id),
                     TxnId(next_txn_id),
+                    crate::types::Oid::FIRST_USER.0,
+                    String::new(),
+                    String::new(),
                 ).unwrap(),
                 WalRecordType::FullPageImage => {
                     let image = vec![image_seed; PAGE_SIZE];

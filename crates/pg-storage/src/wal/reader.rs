@@ -81,10 +81,25 @@ impl WalReader {
         }
 
         // An all-zero header means we have reached the uninitialized tail of
-        // the WAL. This is the normal end-of-WAL condition for a preallocated
-        // segment file. Roll back current_lsn so that repeated reads do not
-        // scan forward through padding zeros.
+        // the WAL — or a zero-filled hole left by a non-atomic reserve+append
+        // (Stage N review, P0-3). Before treating it as end-of-WAL, probe
+        // forward one header: if that candidate is also all zeros, we're at
+        // the preallocated tail. If it is non-zero, we've hit a hole — a
+        // crash filled a reserved slot that was never written, and the
+        // records after it are silently lost if we return Ok(None) here.
+        // Hard-fail instead.
         if header.iter().all(|&b| b == 0) {
+            let probe_pos = start_lsn.0 + WAL_RECORD_HEADER_SIZE as u64;
+            let mut probe = [0u8; WAL_RECORD_HEADER_SIZE];
+            if self.try_read_exact_at(probe_pos, &mut probe)?
+                && probe.iter().any(|&b| b != 0)
+            {
+                return Err(StorageError::MetadataCorrupted(format!(
+                    "WAL hole detected: zero-filled header at {:?} followed by non-zero data at {:?}; \
+                     an unflushed reserved slot truncated the log",
+                    start_lsn, Lsn(probe_pos)
+                )));
+            }
             self.current_lsn = start_lsn;
             return Ok(None);
         }
@@ -175,6 +190,43 @@ impl WalReader {
         }
 
         self.current_lsn = Lsn(self.current_lsn.0 + buf.len() as u64);
+        Ok(true)
+    }
+
+    /// Like [`Self::try_read_exact`] but reads from `pos` without advancing
+    /// `self.current_lsn`. Used by the zero-hole forward probe — the reader
+    /// peeks ahead while keeping its position at the start of the candidate
+    /// hole so that `next_record` can roll back cleanly.
+    fn try_read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<bool> {
+        let mut read = 0;
+        while read < buf.len() {
+            let p = Lsn(pos + read as u64);
+            let segment_id = p.segment_id(self.segment_size);
+            let offset = p.segment_offset(self.segment_size);
+
+            if segment_id != self.current_segment_id {
+                let path = self.wal_dir.join(wal_filename(segment_id));
+                if !path.exists() {
+                    return Ok(false);
+                }
+                self.current_file = Self::open_segment_file(&self.wal_dir, segment_id)?;
+                self.current_segment_id = segment_id;
+            }
+
+            let remaining_in_segment = (self.segment_size - offset) as usize;
+            let chunk = std::cmp::min(remaining_in_segment, buf.len() - read);
+            self.current_file
+                .seek(SeekFrom::Start(offset))
+                .map_err(StorageError::Io)?;
+            let n = self
+                .current_file
+                .read(&mut buf[read..read + chunk])
+                .map_err(StorageError::Io)?;
+            if n == 0 {
+                return Ok(false);
+            }
+            read += n;
+        }
         Ok(true)
     }
 }

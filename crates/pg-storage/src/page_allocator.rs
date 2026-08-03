@@ -498,7 +498,15 @@ mod tests {
         assert!(allocator.freelist.is_empty());
 
         // A CheckpointEnd record should also be ignored.
-        let end = WalRecord::checkpoint_end(Lsn(64), PageId(42), crate::types::TxnId(1)).unwrap();
+        let end = WalRecord::checkpoint_end(
+            Lsn(64),
+            PageId(42),
+            crate::types::TxnId(1),
+            crate::types::Oid::FIRST_USER.0,
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
         allocator.replay_record(&end).unwrap();
         assert_eq!(allocator.next_page_id(), PageId(1));
         assert!(allocator.freelist.is_empty());

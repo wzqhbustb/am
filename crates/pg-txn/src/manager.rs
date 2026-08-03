@@ -180,7 +180,6 @@ impl TxnManager {
         v.sort_unstable();
         v
     }
-
     /// Take a real Snapshot-Isolation snapshot for `current_xid`
     /// (tech-selection §7.1).
     ///
@@ -231,6 +230,19 @@ impl TxnManager {
     }
 }
 
+/// M2b Stage N wiring (tech-selection §11.4): the checkpoint coordinator in
+/// `pg-storage` captures the ATT snapshot through this trait, keeping the
+/// dependency direction `pg-txn` → `pg-storage` (same pattern as
+/// `ClogFlush`). The engine installs the manager at open time via
+/// `CheckpointCoordinator::set_att_provider`.
+impl pg_storage::recovery::AttProvider for TxnManager {
+    fn active_xids(&self) -> Vec<TxnId> {
+        // Delegates to the inherent method (sorted), so the ATT snapshot
+        // file is deterministic.
+        TxnManager::active_xids(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +269,23 @@ mod tests {
             Arc::new(OkWal),
             Arc::new(InMemoryClogAccessor::new()),
         )
+    }
+
+    /// M2b Stage N (§11.4): the manager doubles as the checkpoint
+    /// coordinator's ATT snapshot source — begun-but-not-committed XIDs show
+    /// up, committed/aborted ones do not.
+    #[test]
+    fn att_provider_reports_in_flight_xids() {
+        use pg_storage::recovery::AttProvider;
+
+        let mgr = manager();
+        let t1 = mgr.begin_txn();
+        let t2 = mgr.begin_txn();
+        let t3 = mgr.begin_txn();
+        mgr.commit_txn(t2).unwrap();
+        assert_eq!(AttProvider::active_xids(&mgr), vec![t1, t3]);
+        mgr.abort_txn(t1).unwrap();
+        assert_eq!(AttProvider::active_xids(&mgr), vec![t3]);
     }
 
     #[test]

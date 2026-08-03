@@ -30,9 +30,11 @@ use crate::wal::record::{bincode_config, FullPageImageRecord, WalRecord, WalReco
 
 /// Active transaction table (ARIES analysis).
 ///
-/// Stage D provides the type so that [`RedoContext`] is complete; analysis
-/// (rebuilding the ATT from the redo point) arrives in Stage N. Redo
-/// handlers currently do not consult it.
+/// Stage D provides the type so that [`RedoContext`] is complete. The
+/// analysis phase itself lives in [`crate::analysis`] (Stage N): it rebuilds
+/// the crash-time ATT and exposes it via
+/// [`crate::engine::StorageEngine::recovered_active_xids`]. Redo handlers
+/// currently do not consult this table.
 #[derive(Debug, Default)]
 pub struct ActiveXactTable {
     last_lsn: HashMap<TxnId, Lsn>,
@@ -68,10 +70,30 @@ impl ActiveXactTable {
 /// Dirty page table (ARIES analysis).
 ///
 /// Maps a dirty page to its recovery LSN (the oldest record that may need
-/// redoing for it). Populated from Stage N; see [`ActiveXactTable`].
+/// redoing for it). The analysis phase's rebuilt DPT lives in
+/// [`crate::analysis::AnalysisResult`]; this type completes [`RedoContext`]
+/// and is not consulted by redo handlers yet.
 #[derive(Debug, Default)]
 pub struct DirtyPageTable {
     rec_lsn: HashMap<PageId, Lsn>,
+}
+
+/// Source of the active transaction IDs captured into a checkpoint's ATT
+/// snapshot (M2b Stage N; tech-selection §11.4).
+///
+/// The checkpoint coordinator lives in `pg-storage`, but the set of
+/// in-flight transactions lives in `pg-txn` — which itself depends on
+/// `pg-storage`. This trait keeps the dependency direction intact: the
+/// coordinator holds a `dyn AttProvider`, and `pg-txn::TxnManager`
+/// implements it. The engine wires the provider at open time via
+/// [`crate::checkpoint::CheckpointCoordinator::set_att_provider`]; until a
+/// provider is installed (M1/M2a configurations) checkpoints snapshot an
+/// empty ATT, which analysis reads as "no snapshot — rebuild by a full WAL
+/// scan from the checkpoint LSN".
+pub trait AttProvider: std::fmt::Debug + Send + Sync {
+    /// Return the XIDs of all transactions that have begun but not yet
+    /// committed or aborted.
+    fn active_xids(&self) -> Vec<TxnId>;
 }
 
 impl DirtyPageTable {

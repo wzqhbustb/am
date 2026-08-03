@@ -517,16 +517,18 @@ CLOG 铺路。
 
 | 任务 | 交付物 |
 |------|--------|
-| Analysis 阶段 | 从 superblock `checkpoint_lsn` 起扫 WAL；构建 ATT（活跃 XID）+ DPT（`page_id → rec_lsn`）；redo LSN = `min(DPT.values.rec_lsn)` |
+| Analysis 阶段 | 从 superblock `checkpoint_lsn` 起扫 WAL；构建 ATT（活跃 XID）+ DPT（`page_id → rec_lsn`）；redo LSN = `checkpoint_lsn`（Stage N 实现修订，见下注） |
 | Redo 阶段 | 严格 LSN 顺序 + `RedoRegistry` 统一分发；FPI 走同一 dispatch；未注册 record 硬失败 |
 | CheckpointEnd v2 payload | 6 字段：`checkpoint_lsn / next_page_id / next_txn_id / next_oid / att_file / dpt_file` |
-| v1 / v2 decode 分派 | `flags >> 12`：`0 = M1 legacy v1`（3 字段，`next_oid=16384` 默认），`1 = M2 v2`（6 字段） |
+| v1 / v2 decode 分派 | `flags >> 4`：`0 = M1 legacy v1`（3 字段，`next_oid=16384` 默认），`1 = M2 v2`（6 字段）。注：实现用 `>> 4` 而非 spec 的 `>> 12`，因 M1 固定 32B 头部已将高 4 位用作版本 nibble |
 | ATT / DPT snapshot 文件 | `meta/att-{lsn}.snapshot` / `meta/dpt-{lsn}.snapshot` bincode `Vec<TxnId>` / `Vec<(PageId,Lsn)>` |
 | 写入顺序 | 三步硬顺序：`fsync(att/dpt snapshot files) → wal.append(CheckpointEnd) → wal.flush_to(ckpt_end_lsn)`（与 §3 P1-5 commit 硬顺序同风格） |
 | 旧文件清理 | 下一次 checkpoint 收尾同步删除除最近 3 个之外的旧 snapshot |
 
+> **注（Stage N 实现修订）**：redo LSN 原设计为 `min(DPT.values.rec_lsn)`。实现中该公式经双向钳制后恒等于 `checkpoint_lsn`：(a) 不能更晚——redo point 与首个脏页记录之间的 `TxnCommit/TxnAbort` 必须重放（CLOG piggyback）；(b) 不能更早——DPT 快照摄于 CheckpointBegin，其条目 rec_lsn 均 < begin_lsn，而完成的 checkpoint 在 emit End 前已将这些页全部刷盘，且其 WAL 段可能已被回收。DPT 仍完整返回（观测 + 未来 Undo 用）。恢复的 ATT 在 redo 重建 CLOG 后还会经 CLOG 过滤（移除已知 Committed/Aborted 成员，闭合 §11.4 快照竞态）。
+
 **关键 v2.3 约束**：
-- v2.3-17：v1/v2 迁移路径 + `flags >> 12` 版本判定 + 前向 crash 保护
+- v2.3-17：v1/v2 迁移路径 + `flags >> 4` 版本判定 + 前向 crash 保护
 - v2.3-24：未注册 record → 硬失败
 
 **验收标准**：

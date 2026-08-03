@@ -239,12 +239,29 @@ impl WalWriter {
         let mut state = self.inner.lock();
         Self::check_error(&state)?;
 
+        // Validate before touching the clock: a payload exceeding u16::MAX
+        // must not leave an unfilled reservation.
+        if record.payload.len() > u16::MAX as usize {
+            return Err(StorageError::Serialize(format!(
+                "payload length {} exceeds u16::MAX",
+                record.payload.len()
+            )));
+        }
+
         let record_size = record.record_size() as u64;
         let lsn = state.lsn_clock.next(record_size);
         record.lsn = lsn;
 
         let buf = record.encode()?;
-        write_record_to_segment(&mut state.segment_manager, &buf, lsn)?;
+        let cond = Arc::clone(&self.cond);
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
+            .inspect_err(|e| {
+                state.last_error = Some(format!(
+                    "append: segment write failed at {lsn}: {e}"
+                ));
+                state.shutdown = true;
+                cond.notify_all();
+            })?;
 
         state.pending += 1;
         let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
@@ -303,6 +320,15 @@ impl WalWriter {
             return Err(StorageError::LsnNotAvailable(lsn));
         }
 
+        // Validate before encode: a payload exceeding u16::MAX must be caught
+        // early so the caller can decide how to handle the reserved LSN gap.
+        if record.payload.len() > u16::MAX as usize {
+            return Err(StorageError::Serialize(format!(
+                "payload length {} exceeds u16::MAX",
+                record.payload.len()
+            )));
+        }
+
         record.lsn = lsn;
         let buf = record.encode()?;
         if buf.len() as u64 != reserved_size {
@@ -313,7 +339,15 @@ impl WalWriter {
             )));
         }
 
-        write_record_to_segment(&mut state.segment_manager, &buf, lsn)?;
+        let cond = Arc::clone(&self.cond);
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
+            .inspect_err(|e| {
+                state.last_error = Some(format!(
+                    "append_at: segment write failed at {lsn}: {e}"
+                ));
+                state.shutdown = true;
+                cond.notify_all();
+            })?;
 
         state.pending += 1;
         let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
@@ -421,11 +455,70 @@ impl WalWriter {
         Ok(state.lsn_clock.reserve(record_size))
     }
 
+    /// Reserve an LSN and immediately write a record at that position —
+    /// atomically under one lock hold, leaving no zero-filled hole between
+    /// reserve and write (the window where a crash would silently truncate
+    /// every record after the hole).
+    ///
+    /// This is the preferred method for callers that need to know the LSN
+    /// before emission (e.g. a checkpoint that publishes `begin_lsn` before
+    /// the `CheckpointBegin` record is durable). Callers that do not need
+    /// the LSN before writing should use [`Self::append`].
+    ///
+    /// # Poisoning
+    ///
+    /// If the segment write fails, the writer is **poisoned**: `last_error`
+    /// is set so all future operations return an error immediately. This
+    /// prevents a process from continuing with a hole in the WAL that would
+    /// silently truncate the log on the next recovery.
+    pub fn reserve_and_append(&self, mut record: WalRecord) -> Result<Lsn> {
+        let mut state = self.inner.lock();
+        Self::check_error(&state)?;
+
+        // Validate before touching the clock: a payload exceeding u16::MAX
+        // must not leave an unfilled reservation.
+        if record.payload.len() > u16::MAX as usize {
+            return Err(StorageError::Serialize(format!(
+                "payload length {} exceeds u16::MAX",
+                record.payload.len()
+            )));
+        }
+
+        let record_size = record.record_size() as u64;
+        let lsn = state.lsn_clock.next(record_size);
+        record.lsn = lsn;
+        let buf = record.encode()?;
+        let cond = Arc::clone(&self.cond);
+        write_record_to_segment(&mut state.segment_manager, &buf, lsn)
+            .inspect_err(|e| {
+                state.last_error = Some(format!(
+                    "reserve_and_append: segment write failed at {lsn}: {e}"
+                ));
+                state.shutdown = true;
+                cond.notify_all();
+            })?;
+        state.pending += 1;
+        let timeout = Duration::from_millis(self.config.wal_group_commit_timeout_ms);
+        let should_wake = state.pending >= self.config.wal_group_commit_batch_size
+            || state.last_flush.elapsed() >= timeout;
+        if should_wake {
+            self.cond.notify_one();
+        }
+        Ok(lsn)
+    }
+
     /// Recycle WAL segment files whose contents are all before `lsn`.
     ///
     /// The segment that contains `lsn` itself is preserved.
     pub fn recycle_before(&self, lsn: Lsn) -> Result<()> {
-        self.inner.lock().segment_manager.recycle_before(lsn)?;
+        let mut state = self.inner.lock();
+        Self::check_error(&state)?;
+        if state.shutdown {
+            return Err(StorageError::WalWriteFailed(
+                "wal writer shut down".to_string(),
+            ));
+        }
+        state.segment_manager.recycle_before(lsn)?;
         Ok(())
     }
 
@@ -447,7 +540,8 @@ impl WalWriter {
             }
 
             let should_flush = state.pending > 0
-                && (state.flush_requested
+                && (state.shutdown
+                    || state.flush_requested
                     || state.pending >= config.wal_group_commit_batch_size
                     || state.last_flush.elapsed() >= timeout);
 
@@ -516,7 +610,12 @@ impl WalWriter {
             } else {
                 Lsn((cover_segment + 1) * state.segment_manager.segment_size())
             };
-            state.last_error = None;
+            // Only clear a transient fsync error; never clear a poison set by
+            // an append-path failure (which also set shutdown). Clearing it
+            // would revive the writer and leave a permanent WAL hole.
+            if !state.shutdown {
+                state.last_error = None;
+            }
             state.synced_lsn = state.synced_lsn.max(durable);
             state.pending -= cover_pending;
             state.flush_requested = false;

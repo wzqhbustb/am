@@ -638,6 +638,19 @@ impl UpdatableAM for HeapAM {
 }
 
 impl Vacuumable for HeapAM {
+    /// Scan `rel` for dead tuples.
+    ///
+    /// # InProgress vs Aborted (建档 note)
+    ///
+    /// The "InProgress ≡ Aborted for visibility" equivalence that recovery
+    /// relies on (pg-storage `analysis` module docs) holds ONLY for
+    /// visibility, not for reclamation: a tuple inserted by a crashed
+    /// transaction has `t_xmin` whose CLOG entry reads `InProgress` (no
+    /// terminal record exists), so case 1 below does NOT collect it. Such
+    /// orphan tuples are reclaimed only once the crashed XIDs are
+    /// explicitly stamped ABORTED — recovery-end ATT marking is M2c work
+    /// (and vacuum/autovacuum M3); until then they are dead weight but
+    /// never visible.
     fn scan_dead_tuples(
         &self,
         rel: RelationDesc<'_>,

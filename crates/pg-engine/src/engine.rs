@@ -30,7 +30,9 @@
 //!    correction in `Catalog::open` exists to close.
 //! 5. `HeapAM::new` over the shared buffer pool / WAL writer.
 //! 6. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
-//!    `Arc<dyn CommitWal>`, and the same CLOG.
+//!    `Arc<dyn CommitWal>`, and the same CLOG. The manager is held in an
+//!    `Arc` and also installed as the checkpoint coordinator's ATT snapshot
+//!    source (`set_att_provider`, Stage N, tech-selection §11.4).
 //! 7. The in-memory **table registry** (`RwLock<HashMap<String, TableEntry>>`)
 //!    is rebuilt from the catalog: `pg_class` rows with `relkind = 'r'` (last
 //!    version per OID wins, `relkind = 'd'` marks a drop) joined with
@@ -105,6 +107,7 @@ use pg_catalog::{Catalog, RelationRow, TypeOid};
 use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
+use pg_storage::recovery::AttProvider;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_txn::{txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, Snapshot, TxnManager};
 
@@ -229,7 +232,9 @@ pub struct Engine {
     storage: StorageEngine,
     catalog: Catalog,
     heap: HeapAM,
-    txn: TxnManager,
+    /// Shared with the checkpoint coordinator as its ATT snapshot source
+    /// (Stage N, §11.4), hence the `Arc`.
+    txn: Arc<TxnManager>,
     clog: Arc<ClogBuffer>,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
@@ -315,11 +320,19 @@ impl Engine {
             Arc::clone(storage.wal_writer()),
         );
         let wal: Arc<dyn CommitWal> = Arc::clone(storage.wal_writer()) as Arc<dyn CommitWal>;
-        let txn = TxnManager::new(
+        let txn = Arc::new(TxnManager::new(
             storage.txn_id_clock(),
             wal,
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
-        );
+        ));
+        // 6b. Checkpoint ATT snapshot source (Stage N, §11.4): every
+        //     checkpoint persists the manager's in-flight XIDs as the ATT
+        //     snapshot file referenced by the v2 CheckpointEnd record. The
+        //     engine never starts background checkpointing, so this cannot
+        //     race a checkpoint already in flight (same argument as step 3).
+        storage
+            .checkpoint()
+            .set_att_provider(Arc::clone(&txn) as Arc<dyn AttProvider>);
 
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.

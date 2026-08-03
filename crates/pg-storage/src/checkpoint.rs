@@ -29,6 +29,14 @@ use crate::types::Lsn;
 use crate::wal::record::WalRecord;
 use crate::wal::writer::WalWriter;
 
+/// Number of recent checkpoints whose ATT/DPT snapshot files are retained
+/// under `meta/` (tech-selection §11.4 P2-7). Older files are deleted
+/// synchronously at checkpoint completion. Only the superblock's current
+/// checkpoint group is usable for recovery — older snapshots' WAL segments
+/// have already been recycled — but retaining a small window guards against
+/// a crash that corrupts the very latest snapshot file.
+const RETAINED_SNAPSHOT_CHECKPOINTS: usize = 3;
+
 /// Coordinates fuzzy checkpoints and persists the resulting anchor state.
 #[derive(Debug)]
 pub struct CheckpointCoordinator {
@@ -48,9 +56,9 @@ pub struct CheckpointCoordinator {
     /// via [`set_next_oid_source`](Self::set_next_oid_source).
     ///
     /// The counter holds the *next OID to hand out* (same semantics as
-    /// `Superblock::next_oid`). Until the CheckpointEnd WAL record switches
-    /// to v2 (Stage N), the superblock — not the WAL — is the authoritative
-    /// source of `next_oid` across checkpoints.
+    /// `Superblock::next_oid`). Since Stage N the v2 CheckpointEnd WAL record
+    /// carries the same value, so the superblock and the WAL agree on
+    /// `next_oid` across checkpoints.
     ///
     /// Wrapped in `Arc<Mutex<..>>` and shared with the background thread's
     /// clone so that a [`set_next_oid_source`](Self::set_next_oid_source)
@@ -82,6 +90,16 @@ pub struct CheckpointCoordinator {
     /// thread's clone for the same reason as `next_oid_source`: the engine
     /// may install the hook after background checkpointing has started.
     clog_flush: Arc<Mutex<Option<Arc<dyn crate::clog::ClogFlush>>>>,
+    /// Source of the ATT snapshot written at every checkpoint (M2b Stage N,
+    /// tech-selection §11.4). `None` until the engine layer wires its
+    /// `TxnManager` via [`set_att_provider`](Self::set_att_provider);
+    /// configurations without a provider snapshot an empty ATT, which the
+    /// analysis phase reads as "no snapshot — rebuild by a full WAL scan
+    /// from the checkpoint LSN".
+    ///
+    /// Wrapped in `Arc<Mutex<Option<..>>>` and shared with the background
+    /// thread's clone for the same reason as `clog_flush`.
+    att_provider: Arc<Mutex<Option<Arc<dyn crate::recovery::AttProvider>>>>,
     shutdown: Arc<AtomicBool>,
     background_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -117,6 +135,7 @@ impl CheckpointCoordinator {
             next_oid_source: Arc::new(Mutex::new(OidCounter::new(next_oid))),
             next_txn_id_source: Arc::new(Mutex::new(TxnIdClock::new(next_txn_id))),
             clog_flush: Arc::new(Mutex::new(None)),
+            att_provider: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             background_handle: Mutex::new(None),
         }
@@ -170,6 +189,55 @@ impl CheckpointCoordinator {
     /// [`set_next_oid_source`](Self::set_next_oid_source).
     pub fn set_clog_flush(&self, source: Arc<dyn crate::clog::ClogFlush>) {
         *self.clog_flush.lock() = Some(source);
+    }
+
+    /// Install the ATT snapshot source (M2b Stage N wiring; tech-selection
+    /// §11.4).
+    ///
+    /// Each [`trigger_checkpoint`](Self::trigger_checkpoint) calls
+    /// [`AttProvider::active_xids`](crate::recovery::AttProvider::active_xids)
+    /// once and persists the result as the ATT snapshot file referenced by
+    /// the v2 `CheckpointEnd` record. Until a provider is installed the ATT
+    /// snapshot is empty — the analysis phase treats an empty ATT snapshot
+    /// like a v1 record's empty `att_file`: rebuild from the checkpoint LSN
+    /// by a full WAL scan.
+    ///
+    /// # Commit barrier required for correctness
+    ///
+    /// The ATT snapshot's correctness depends on the CALLER serializing
+    /// checkpoints against in-flight commits. Without a commit barrier,
+    /// the following interleaving is possible:
+    ///
+    /// 1. A commit's WAL record is appended before the checkpoint's
+    ///    `CheckpointBegin`, but its `active.remove` has not yet run.
+    /// 2. Phase 2a samples the XID into the ATT snapshot (it is still
+    ///    "active").
+    /// 3. Phase 4b flushes the CLOG — but `set_state(COMMITTED)` has not
+    ///    yet run (it runs after `flush_to` in the commit hard order), so
+    ///    the CLOG does NOT carry the Committed bit.
+    /// 4. The `CheckpointEnd` is emitted with a snapshot that lists an
+    ///    already-committed XID, and the CLOG has no record of its commit.
+    ///
+    /// After recovery the post-redo ATT filter (engine.rs step 5b) cannot
+    /// drop this XID, and it remains permanently "active" — a committed
+    /// transaction whose tuples are visible as InProgress forever.
+    ///
+    /// pg-engine provides the required barrier by serializing commit and
+    /// checkpoint under its transaction-level lock. Code paths that use
+    /// [`start_background_checkpointing`](Self::start_background_checkpointing)
+    /// or [`trigger_checkpoint`](Self::trigger_checkpoint) from the
+    /// storage layer alone (no barrier) are therefore **unsafe** — the
+    /// caller must supply its own barrier, or accept the corruption risk.
+    /// In M2c the barrier should be pushed down into `TxnManager` so the
+    /// storage layer is safe by construction.
+    ///
+    /// The slot is shared (via `Arc`) with the background checkpoint thread's
+    /// clone, so installing a provider *after*
+    /// [`start_background_checkpointing`](Self::start_background_checkpointing)
+    /// still takes effect on the next background checkpoint — same pattern as
+    /// [`set_clog_flush`](Self::set_clog_flush).
+    pub fn set_att_provider(&self, provider: Arc<dyn crate::recovery::AttProvider>) {
+        *self.att_provider.lock() = Some(provider);
     }
 
     /// Start a background thread that triggers checkpoints periodically.
@@ -263,10 +331,16 @@ impl CheckpointCoordinator {
 
         // -- Phase 1: CheckpointBegin ----------------------------------------
         //
-        // 1. Atomically reserve the checkpoint LSN, publish it to the buffer
-        //    pool, and snapshot the freelist — all under the page_allocator
-        //    lock. This is the core correctness invariant for concurrent
-        //    free_page during a fuzzy checkpoint:
+        // 1. Atomically reserve the checkpoint LSN, write the
+        //    CheckpointBegin record, publish the LSN to the buffer pool, and
+        //    snapshot the freelist — all under the page_allocator lock.
+        //    `reserve_and_append` holds the WAL lock for the full reserve +
+        //    write, eliminating the zero-filled hole between `reserve_lsn` and
+        //    `append_at` that a crash would interpret as end-of-WAL (Stage N
+        //    review, P0-3).
+        //
+        //    This is the core correctness invariant for concurrent free_page
+        //    during a fuzzy checkpoint:
         //
         //    - A free_page that completes BEFORE this critical section has its
         //      page in the snapshot AND its WAL record at LSN < begin_lsn (not
@@ -278,12 +352,13 @@ impl CheckpointCoordinator {
         //      the page_allocator lock), so there is no window where a page
         //      is both in the snapshot and has a post-begin_lsn WAL record.
         //
-        //    Lock order is page_allocator → WAL inner (reserve_lsn), which
-        //    matches free_page's lock order — no deadlock.
-        const CHECKPOINT_BEGIN_SIZE: u64 = crate::wal::record::WAL_RECORD_HEADER_SIZE as u64;
+        //    Lock order is page_allocator → WAL inner (reserve_and_append),
+        //    which matches free_page's lock order — no deadlock.
         let (begin_lsn, freelist_snap) = {
             let pa = self.page_allocator.lock();
-            let begin_lsn = self.wal_writer.reserve_lsn(CHECKPOINT_BEGIN_SIZE)?;
+            let begin_lsn = self
+                .wal_writer
+                .reserve_and_append(WalRecord::checkpoint_begin())?;
             // Publish the checkpoint LSN immediately so any pin_mut from this
             // point on writes an FPI. Must be inside the lock to preserve the
             // Stage B FPI race fix (no window between reserve and publish).
@@ -291,14 +366,49 @@ impl CheckpointCoordinator {
             let snap = pa.snapshot(begin_lsn);
             (begin_lsn, snap)
         };
-        debug!(%begin_lsn, "checkpoint begin (LSN reserved, freelist snapshot taken)");
+        debug!(%begin_lsn, "checkpoint begin (LSN reserved, record emitted, freelist snapshot taken)");
 
-        // 2. Emit the CheckpointBegin record into the reserved slot. This does
-        //    not need the page_allocator lock — it only writes WAL.
-        let begin_record = WalRecord::checkpoint_begin();
-        self.wal_writer
-            .append_at(begin_record, begin_lsn, CHECKPOINT_BEGIN_SIZE)?;
-        debug!(%begin_lsn, "checkpoint begin record emitted");
+        // -- Phase 2a: ATT/DPT snapshot files (Stage N, §11.4) ---------------
+        //
+        // 2a. Capture the ARIES tables as of the checkpoint begin and persist
+        //     them as snapshot files BEFORE flushing any dirty pages:
+        //
+        //     - ATT: the provider's in-flight XIDs (empty when no provider is
+        //       installed — analysis then rebuilds by a full WAL scan, same
+        //       as for a v1 CheckpointEnd).
+        //     - DPT: `(page_id, rec_lsn)` per dirty frame. This must be
+        //       sampled before the Phase 2 flush below, which would drain
+        //       the very dirty set the DPT describes.
+        //
+        //     This is the first leg of the three-step hard order (§11.4,
+        //     same style as the §3 P1-5 commit hard order):
+        //
+        //       fsync(att/dpt snapshot files)     <- here, via write_atomic
+        //         -> wal.append(CheckpointEnd v2) <- step 6
+        //         -> wal.flush_to(ckpt_end_lsn)   <- step 7
+        //
+        //     `write_atomic` fsyncs the file, renames, and fsyncs the
+        //     directory, so by the time the v2 CheckpointEnd names these
+        //     files they are durable. A snapshot write failure aborts the
+        //     checkpoint — same discipline as a failed page flush: emitting a
+        //     v2 record that references missing snapshot files would send
+        //     recovery after dangling paths.
+        let att: Vec<crate::types::TxnId> = self
+            .att_provider
+            .lock()
+            .as_ref()
+            .map(|p| p.active_xids())
+            .unwrap_or_default();
+        let dpt = self.buffer_pool.dirty_page_snapshot();
+        let att_file = format!("meta/att-{:016}.snapshot", begin_lsn.0);
+        let dpt_file = format!("meta/dpt-{:016}.snapshot", begin_lsn.0);
+        self.write_snapshot_file(&att_file, &att)?;
+        self.write_snapshot_file(&dpt_file, &dpt)?;
+        debug!(
+            att = att.len(),
+            dpt = dpt.len(),
+            "wrote ATT/DPT snapshot files"
+        );
 
         // -- Phase 2: Flush dirty pages --------------------------------------
 
@@ -350,13 +460,25 @@ impl CheckpointCoordinator {
 
         // -- Phase 3: CheckpointEnd and superblock update ---------------------
 
-        // 5. Capture allocator state for the checkpoint end record.
+        // 5. Capture allocator state for the checkpoint end record. `next_oid`
+        //    is read once here so the v2 CheckpointEnd record and the
+        //    superblock persist the same value.
         let next_page_id = self.page_allocator.lock().next_page_id();
         let next_txn_id = self.next_txn_id_source.lock().current();
+        let next_oid = self.next_oid_source.lock().current();
 
-        // 6. Write CheckpointEnd. This marks the point at which the superblock
-        //    can be safely updated.
-        let end_record = WalRecord::checkpoint_end(begin_lsn, next_page_id, next_txn_id)?;
+        // 6. Write CheckpointEnd (v2 payload, flags version nibble = 1; §11.4).
+        //    The snapshot files are already fsynced (Phase 2a), satisfying the
+        //    first leg of the three-step hard order. This marks the point at
+        //    which the superblock can be safely updated.
+        let end_record = WalRecord::checkpoint_end(
+            begin_lsn,
+            next_page_id,
+            next_txn_id,
+            next_oid.0,
+            att_file,
+            dpt_file,
+        )?;
         let end_lsn = self.wal_writer.append(end_record)?;
         debug!(%end_lsn, "checkpoint end");
 
@@ -384,18 +506,15 @@ impl CheckpointCoordinator {
         }
 
         // 9. Update the superblock. The redo LSN is the CheckpointBegin LSN.
-        //    next_oid rides along in the v2 superblock: until the CheckpointEnd
-        //    WAL record switches to v2 (Stage N), the superblock — not the WAL —
-        //    is the authoritative source of next_oid across checkpoints. The
-        //    source is always installed (seeded from the superblock at
-        //    creation, replaced by the catalog's allocator later), so the
-        //    persisted value is monotone.
+        //    next_oid rides along in the v2 superblock; since Stage N the v2
+        //    CheckpointEnd WAL record carries the same value (read once at
+        //    step 5), so WAL and superblock never disagree across a crash.
         {
             let mut sb = self.superblock.lock();
             sb.checkpoint_lsn = begin_lsn;
             sb.next_page_id = next_page_id;
             sb.next_txn_id = next_txn_id;
-            sb.next_oid = self.next_oid_source.lock().current();
+            sb.next_oid = next_oid;
             let sb_path = Superblock::path(&self.data_dir);
             sb.write(&sb_path)?;
         }
@@ -404,7 +523,140 @@ impl CheckpointCoordinator {
         // 10. Recycle WAL segments that are no longer needed for recovery.
         self.wal_writer.recycle_before(begin_lsn)?;
 
+        // 11. Prune old ATT/DPT snapshot files, keeping the most recent
+        //     checkpoints' files (tech-selection §11.4 P2-7). Synchronous,
+        //     at checkpoint completion — no background thread. Non-fatal:
+        //     a prune failure leaves extra files behind, never missing ones.
+        self.prune_snapshot_files();
+
         Ok(begin_lsn)
+    }
+
+    /// Serialize a checkpoint snapshot (ATT `Vec<TxnId>` or DPT
+    /// `Vec<(PageId, Lsn)>`) as bincode and atomically write it to
+    /// `{data_dir}/{rel_path}` (Stage N, §11.4).
+    ///
+    /// [`crate::io::write_atomic`] fsyncs the temp file, renames it over the
+    /// target, and fsyncs the parent directory, so once this returns the file
+    /// named by the v2 `CheckpointEnd` record is durable — the first leg of
+    /// the three-step hard order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::CheckpointFailed`] on any I/O or serialization
+    /// failure so the caller aborts the checkpoint rather than emitting a
+    /// `CheckpointEnd` that references a missing snapshot file.
+    fn write_snapshot_file<T: serde::Serialize>(&self, rel_path: &str, snapshot: &T) -> Result<()> {
+        let body = bincode::serde::encode_to_vec(snapshot, crate::wal::record::bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        // Prepend a CRC32 over the body (same format as FreelistMeta) so that
+        // bit-rot in a snapshot file is detected rather than silently producing
+        // a "valid but wrong" ATT/DPT baseline (Stage N review, P1).
+        let crc = crc32fast::hash(&body);
+        let mut bytes = Vec::with_capacity(4 + body.len());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        crate::io::write_atomic(&self.data_dir.join(rel_path), &bytes).map_err(|e| {
+            StorageError::CheckpointFailed(format!("failed to write snapshot file {rel_path}: {e}"))
+        })
+    }
+
+    /// Delete `meta/att-*.snapshot` / `meta/dpt-*.snapshot` files belonging to
+    /// checkpoints older than the [`RETAINED_SNAPSHOT_CHECKPOINTS`] most
+    /// recent ones (tech-selection §11.4 P2-7).
+    ///
+    /// Runs synchronously at checkpoint completion — no background thread.
+    /// All failures are logged and swallowed: leaving extra files behind is
+    /// harmless, while failing a completed checkpoint over cleanup would be
+    /// wrong.
+    fn prune_snapshot_files(&self) {
+        let meta_dir = self.data_dir.join("meta");
+        let entries = match std::fs::read_dir(&meta_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                warn!(error = %e, "failed to list snapshot directory; skipping prune");
+                return;
+            }
+        };
+
+        // Parse the embedded checkpoint LSN out of each file name so stray
+        // files (leftover write_atomic temp files, foreign names) are ignored
+        // rather than accidentally kept or deleted.
+        let mut snapshots: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(lsn) = Self::parse_snapshot_file_lsn(name) else {
+                continue;
+            };
+            snapshots.push((lsn, entry.path()));
+        }
+
+        // Unconditionally retain the superblock's current checkpoint group:
+        // if ≥3 consecutive checkpoints abort after writing their snapshot
+        // files but before updating the superblock, the orphan groups sort
+        // newer than the valid one and push it out of the retention window
+        // (Stage N review, P1 — orphan snapshots are dead weight, not
+        // fallback targets). The current group is the ONLY one that
+        // corresponds to a completed checkpoint; losing it removes the only
+        // valid recovery baseline.
+        let current_checkpoint_lsn = self.superblock.lock().checkpoint_lsn.0;
+
+        // Keep the newest RETAINED_SNAPSHOT_CHECKPOINTS distinct checkpoint
+        // LSNs (each has an att- and a dpt- file), PLUS the superblock's
+        // current checkpoint LSN; delete everything older.
+        let mut lsns: Vec<u64> = snapshots.iter().map(|(lsn, _)| *lsn).collect();
+        lsns.sort_unstable_by(|a, b| b.cmp(a));
+        lsns.dedup();
+        let mut keep: std::collections::HashSet<u64> = lsns
+            .into_iter()
+            .take(RETAINED_SNAPSHOT_CHECKPOINTS)
+            .collect();
+        keep.insert(current_checkpoint_lsn);
+
+        let mut removed = 0usize;
+        for (lsn, path) in snapshots {
+            if keep.contains(&lsn) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    debug!(path = %path.display(), "pruned old checkpoint snapshot file");
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "failed to prune old snapshot file");
+                }
+            }
+        }
+        if removed > 0 {
+            if let Err(e) = crate::io::sync_dir(&meta_dir) {
+                warn!(error = %e, "failed to fsync snapshot directory after prune");
+            }
+        }
+    }
+
+    /// Parse the embedded checkpoint LSN out of an
+    /// `att-{lsn}.snapshot` / `dpt-{lsn}.snapshot` file name.
+    ///
+    /// The writer zero-pads to 16 digits (`{lsn:016}`) so names sort
+    /// lexicographically in LSN order; the PARSER accepts any non-empty
+    /// digit run (Stage N review, P3-2): once LSNs reach 10^16 the padded
+    /// form exceeds 16 digits, and an exact-width check would reject every
+    /// file and silently stop pruning forever. A digit run too large for
+    /// `u64` fails the final `parse` and is ignored — safe, since real LSNs
+    /// are `u64`.
+    fn parse_snapshot_file_lsn(name: &str) -> Option<u64> {
+        let rest = name
+            .strip_prefix("att-")
+            .or_else(|| name.strip_prefix("dpt-"))?;
+        let digits = rest.strip_suffix(".snapshot")?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
     }
 
     /// Stop the background checkpoint thread if it is running.
@@ -448,6 +700,8 @@ impl CheckpointCoordinator {
             // installed after the background thread starts must still be
             // invoked by background checkpoints.
             clog_flush: Arc::clone(&self.clog_flush),
+            // Share the ATT provider slot for the same reason as clog_flush.
+            att_provider: Arc::clone(&self.att_provider),
             shutdown: Arc::clone(&self.shutdown),
             background_handle: Mutex::new(None),
         }
@@ -557,13 +811,11 @@ mod tests {
             match rec.record_type {
                 crate::wal::record::WalRecordType::CheckpointBegin => saw_begin = true,
                 crate::wal::record::WalRecordType::CheckpointEnd => {
-                    let decoded: crate::wal::record::CheckpointEndRecord =
-                        bincode::serde::decode_from_slice(
-                            &rec.payload,
-                            crate::wal::record::bincode_config(),
-                        )
-                        .unwrap()
-                        .0;
+                    // Stage N: emitted records are v2 (version nibble = 1).
+                    assert_eq!(rec.flags, crate::wal::record::CHECKPOINT_END_V2_FLAGS);
+                    let decoded =
+                        crate::wal::record::CheckpointEndRecord::decode(&rec.payload, rec.flags)
+                            .unwrap();
                     assert_eq!(decoded.checkpoint_lsn, begin_lsn);
                     saw_end = true;
                 }
@@ -959,5 +1211,336 @@ mod tests {
         hook.fail.store(true, Ordering::Relaxed);
         assert!(coordinator.trigger_checkpoint().is_err());
         assert_eq!(hook.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Read back a bincode snapshot file written by a checkpoint (Stage N).
+    /// The file format is `crc32(4) + body` — skip the CRC prefix.
+    fn read_snapshot<T: serde::de::DeserializeOwned>(
+        data_dir: &std::path::Path,
+        rel_path: &str,
+    ) -> T {
+        let bytes = std::fs::read(data_dir.join(rel_path)).unwrap();
+        bincode::serde::decode_from_slice(&bytes[4..], crate::wal::record::bincode_config())
+            .unwrap()
+            .0
+    }
+
+    fn att_snapshot_path(lsn: Lsn) -> String {
+        format!("meta/att-{:016}.snapshot", lsn.0)
+    }
+
+    fn dpt_snapshot_path(lsn: Lsn) -> String {
+        format!("meta/dpt-{:016}.snapshot", lsn.0)
+    }
+
+    #[derive(Debug)]
+    struct MockAttProvider {
+        xids: Mutex<Vec<crate::types::TxnId>>,
+    }
+
+    impl crate::recovery::AttProvider for MockAttProvider {
+        fn active_xids(&self) -> Vec<crate::types::TxnId> {
+            self.xids.lock().clone()
+        }
+    }
+
+    /// Find and decode the first `CheckpointEnd` record at or after `from`.
+    fn scan_checkpoint_end(
+        data_dir: &std::path::Path,
+        config: &StorageConfig,
+        from: Lsn,
+    ) -> (Lsn, u8, crate::wal::record::CheckpointEndRecord) {
+        let mut reader = crate::wal::reader::WalReader::open_at(
+            data_dir.join("wal"),
+            config.wal_segment_size,
+            from,
+        )
+        .unwrap();
+        while let Some(rec) = reader.next_record().unwrap() {
+            if rec.record_type == crate::wal::record::WalRecordType::CheckpointEnd {
+                let decoded =
+                    crate::wal::record::CheckpointEndRecord::decode(&rec.payload, rec.flags)
+                        .unwrap();
+                return (rec.lsn, rec.flags, decoded);
+            }
+        }
+        panic!("no CheckpointEnd record found at or after {from:?}");
+    }
+
+    /// Stage N (§11.4): a checkpoint captures the ATT from the installed
+    /// provider and the DPT from the buffer pool, persists both as fsynced
+    /// snapshot files, and emits a v2 `CheckpointEnd` that names them —
+    /// in the hard order snapshot-fsync → append → flush_to.
+    #[test]
+    fn checkpoint_captures_att_and_dpt_snapshots() {
+        use crate::types::{PageId, TxnId};
+
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        // A page that survives checkpoint #1 and is re-dirtied afterwards
+        // through the FPI path, giving it a known rec_lsn anchor.
+        let page_id = {
+            let mut guard = buffer_pool.new_page().unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 42;
+            guard.page_id()
+        };
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool.clone(),
+            page_allocator,
+            wal_writer,
+        );
+        let provider = Arc::new(MockAttProvider {
+            xids: Mutex::new(vec![TxnId(5), TxnId(9)]),
+        });
+        coordinator.set_att_provider(provider.clone());
+
+        // Checkpoint #1: captures the ATT; the DPT is empty because the raw
+        // page write above never stamped a WAL LSN (first_dirty_lsn INVALID
+        // is filtered out of the snapshot).
+        let begin1 = coordinator.trigger_checkpoint().unwrap();
+        let att1: Vec<TxnId> = read_snapshot(&data_dir, &att_snapshot_path(begin1));
+        assert_eq!(att1, vec![TxnId(5), TxnId(9)]);
+        let dpt1: Vec<(PageId, Lsn)> = read_snapshot(&data_dir, &dpt_snapshot_path(begin1));
+        assert!(dpt1.is_empty());
+
+        // Re-dirty the page via pin_mut: the page is older than checkpoint
+        // #1, so the FPI path fires and the FPI LSN becomes the rec_lsn.
+        {
+            let mut guard = buffer_pool.pin_mut(page_id).unwrap();
+            guard.page_mut()[PAGE_HEADER_SIZE] = 43;
+        }
+        let expected_dpt = buffer_pool.dirty_page_snapshot();
+        assert_eq!(expected_dpt.len(), 1);
+        assert_eq!(expected_dpt[0].0, page_id);
+        assert!(expected_dpt[0].1.is_valid());
+
+        // One of the active transactions committed meanwhile.
+        *provider.xids.lock() = vec![TxnId(9)];
+
+        // Checkpoint #2: the DPT snapshot must hold the page as of begin2
+        // (captured before the flush phase drains the dirty set).
+        let begin2 = coordinator.trigger_checkpoint().unwrap();
+        let att2: Vec<TxnId> = read_snapshot(&data_dir, &att_snapshot_path(begin2));
+        assert_eq!(att2, vec![TxnId(9)]);
+        let dpt2: Vec<(PageId, Lsn)> = read_snapshot(&data_dir, &dpt_snapshot_path(begin2));
+        assert_eq!(dpt2, expected_dpt);
+
+        // The v2 CheckpointEnd names both snapshot files; the files exist
+        // (they were fsynced before the record was appended — step 1 of the
+        // hard order) and the record's own LSN is past the begin LSN embedded
+        // in their names (step 2/3 ordering).
+        let (end_lsn, flags, end) = scan_checkpoint_end(&data_dir, &config, begin2);
+        assert_eq!(flags, crate::wal::record::CHECKPOINT_END_V2_FLAGS);
+        assert_eq!(end.checkpoint_lsn, begin2);
+        assert_eq!(end.att_file, att_snapshot_path(begin2));
+        assert_eq!(end.dpt_file, dpt_snapshot_path(begin2));
+        assert!(end_lsn > begin2);
+        assert!(data_dir.join(&end.att_file).exists());
+        assert!(data_dir.join(&end.dpt_file).exists());
+        // next_oid rides in the v2 payload: seeded from the superblock here
+        // (no catalog wired in this test), so FIRST_USER.
+        assert_eq!(end.next_oid, crate::types::Oid::FIRST_USER.0);
+    }
+
+    /// With no ATT provider installed (M1/M2a configuration) the checkpoint
+    /// still writes a v2 record, but the ATT snapshot is empty — which
+    /// analysis reads as "rebuild by a full WAL scan from the checkpoint
+    /// LSN", the same semantics as a v1 record's empty `att_file`.
+    #[test]
+    fn checkpoint_without_att_provider_writes_empty_att_snapshot() {
+        use crate::types::{PageId, TxnId};
+
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool,
+            page_allocator,
+            wal_writer,
+        );
+
+        let begin = coordinator.trigger_checkpoint().unwrap();
+
+        let att: Vec<TxnId> = read_snapshot(&data_dir, &att_snapshot_path(begin));
+        assert!(att.is_empty());
+        let dpt: Vec<(PageId, Lsn)> = read_snapshot(&data_dir, &dpt_snapshot_path(begin));
+        assert!(dpt.is_empty());
+
+        let (_end_lsn, flags, end) = scan_checkpoint_end(&data_dir, &config, begin);
+        assert_eq!(flags, crate::wal::record::CHECKPOINT_END_V2_FLAGS);
+        assert_eq!(end.att_file, att_snapshot_path(begin));
+        assert_eq!(end.dpt_file, dpt_snapshot_path(begin));
+        assert!(data_dir.join(&end.att_file).exists());
+        assert!(data_dir.join(&end.dpt_file).exists());
+    }
+
+    #[test]
+    fn parse_snapshot_file_lsn_accepts_any_digit_run() {
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("att-0000000000000128.snapshot"),
+            Some(128)
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("dpt-0000000000012345.snapshot"),
+            Some(12345)
+        );
+        // Non-padded and beyond-16-digit forms (LSN >= 10^16) parse too:
+        // the writer's zero-padding is for sort order, not a parse contract
+        // (P3-2 — an exact-width check would stop pruning forever once
+        // LSNs outgrow 16 digits).
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("att-128.snapshot"),
+            Some(128)
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn(
+                "att-10000000000000000.snapshot" // 10^16, 17 digits
+            ),
+            Some(10_000_000_000_000_000)
+        );
+        // Empty / non-numeric infixes, unknown prefixes, leftover
+        // write_atomic temp files, and digit runs beyond u64 are ignored.
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("att-.snapshot"),
+            None
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn(
+                "att-0000000000000128.snapshot.pg_rust_tmp"
+            ),
+            None
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("freelist-0000000000000128.snapshot"),
+            None
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn("att-0000000000000abc.snapshot"),
+            None
+        );
+        assert_eq!(
+            CheckpointCoordinator::parse_snapshot_file_lsn(
+                "att-99999999999999999999999999.snapshot"
+            ),
+            None
+        );
+    }
+
+    /// §11.4 P2-7: checkpoint completion prunes `meta/` down to the
+    /// ATT/DPT snapshots of the most recent three checkpoints.
+    #[test]
+    fn prune_snapshot_files_keeps_latest_three_checkpoints() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool.clone(),
+            page_allocator,
+            wal_writer,
+        );
+
+        let meta_dir = data_dir.join("meta");
+        let snapshot_names = |begin: Lsn| -> [String; 2] {
+            [
+                format!("att-{:016}.snapshot", begin.0),
+                format!("dpt-{:016}.snapshot", begin.0),
+            ]
+        };
+        let list_meta = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&meta_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                // Snapshot files and crash-leftover temp files; skips
+                // freelist.meta, which shares the directory.
+                .filter(|name| name.contains(".snapshot"))
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        // Seed two fake old checkpoint snapshot groups, then run five real
+        // checkpoints. After each of the last three, the retained set must
+        // shrink to the latest three groups.
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        for fake_lsn in [8u64, 16] {
+            for name in snapshot_names(Lsn(fake_lsn)) {
+                std::fs::write(meta_dir.join(name), b"fake").unwrap();
+            }
+        }
+
+        let mut begins = Vec::new();
+        for i in 0..5u8 {
+            {
+                let mut guard = buffer_pool.new_page().unwrap();
+                guard.page_mut()[PAGE_HEADER_SIZE] = i;
+            }
+            begins.push(coordinator.trigger_checkpoint().unwrap());
+        }
+
+        let kept = list_meta();
+        let mut expected: Vec<String> = begins[2..5]
+            .iter()
+            .flat_map(|begin| snapshot_names(*begin))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            kept, expected,
+            "meta/ must hold exactly the att/dpt snapshots of the latest 3 checkpoints"
+        );
+
+        // A crash leftover (write_atomic temp file) is neither pruned nor
+        // counted as a snapshot group.
+        std::fs::write(
+            meta_dir.join("att-0000000000000064.snapshot.pg_rust_tmp"),
+            b"partial",
+        )
+        .unwrap();
+        coordinator.prune_snapshot_files();
+        assert!(meta_dir
+            .join("att-0000000000000064.snapshot.pg_rust_tmp")
+            .exists());
+        assert_eq!(list_meta().len(), expected.len() + 1);
+    }
+
+    /// `prune_snapshot_files` must be a no-op (not an error) when the
+    /// `meta/` directory does not exist — e.g. a directory where `meta/`
+    /// was lost or never created. The `read_dir → ErrorKind::NotFound`
+    /// early-return path.
+    #[test]
+    fn prune_snapshot_files_handles_missing_meta_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (data_dir, config, superblock, buffer_pool, page_allocator, wal_writer) = setup(&tmp);
+
+        let coordinator = CheckpointCoordinator::new(
+            &data_dir,
+            &config,
+            superblock,
+            buffer_pool.clone(),
+            page_allocator,
+            wal_writer,
+        );
+
+        // `setup` calls `ensure_data_dir`, which creates `meta/`. Remove
+        // it to simulate a directory that lost its `meta/` subdir.
+        std::fs::remove_dir_all(data_dir.join("meta")).unwrap();
+        assert!(!data_dir.join("meta").exists());
+
+        // Prune must not panic or error.
+        coordinator.prune_snapshot_files();
+
+        // Still no meta/ — prune did not recreate it.
+        assert!(!data_dir.join("meta").exists());
     }
 }

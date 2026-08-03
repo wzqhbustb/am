@@ -11,9 +11,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::analysis;
 use crate::buffer_pool::BufferPool;
 use crate::checkpoint::CheckpointCoordinator;
-use crate::clog::{ClogAccessor, NoOpClogAccessor};
+use crate::clog::{ClogAccessor, NoOpClogAccessor, TxnState};
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
 use crate::freelist_meta::FreelistMeta;
@@ -26,9 +27,9 @@ use crate::recovery::{
 };
 use crate::superblock::Superblock;
 use crate::txn_id::TxnIdClock;
-use crate::types::{Lsn, TxnId};
+use crate::types::{Lsn, PageId, TxnId};
 use crate::wal::reader::WalReader;
-use crate::wal::record::WalRecordType;
+use crate::wal::record::{CheckpointEndRecord, WalRecordType};
 use crate::wal::writer::WalWriter;
 
 /// Owning handle for a recovered or newly created storage engine.
@@ -52,6 +53,10 @@ pub struct StorageEngine {
     /// post-recovery queries. Defaults to `NoOpClogAccessor` when the caller
     /// opens without one (M1 / heap-only paths).
     clog: Arc<dyn ClogAccessor>,
+    /// XIDs that were active (neither committed nor aborted) when the
+    /// previous instance stopped, rebuilt by the analysis phase (M2b Stage N;
+    /// tech-selection §11.1). Empty on a freshly created database.
+    recovered_att: Vec<TxnId>,
 }
 
 impl StorageEngine {
@@ -168,6 +173,7 @@ impl StorageEngine {
             checkpoint,
             txn_id_clock,
             clog,
+            recovered_att: Vec::new(),
         })
     }
 
@@ -186,9 +192,10 @@ impl StorageEngine {
     ///
     /// From Stage I recovery opens the buffer pool **before** replay so that
     /// redo handlers can pin/dirty pages through it (`RedoContext.buffer_pool`
-    /// is `Some`). Order: superblock → WAL writer → page allocator → freelist
-    /// snapshot → buffer pool → replay → flush dirty pages → checkpoint
-    /// coordinator.
+    /// is `Some`). Since Stage N the replay start comes from the ARIES
+    /// analysis phase (tech-selection §11.1). Order: superblock → WAL writer
+    /// → page allocator → freelist snapshot → buffer pool → **analysis** →
+    /// replay (redo) → flush dirty pages → checkpoint coordinator.
     pub fn recover_with_redo_handlers(
         data_dir: PathBuf,
         config: &StorageConfig,
@@ -270,15 +277,16 @@ impl StorageEngine {
             Arc::clone(&wal_writer),
         )?);
 
-        // 5. Replay WAL from the checkpoint redo point. If no checkpoint has
-        //    ever run, start from Lsn::FIRST so that all WAL records written
-        //    before the first checkpoint are replayed.
-        let replay_start = if checkpoint_lsn.is_valid() {
-            checkpoint_lsn
-        } else {
-            warn!("checkpoint_lsn is invalid; replaying WAL from the beginning");
-            Lsn::FIRST
-        };
+        // 5. Analysis phase (M2b Stage N; tech-selection §11.1): locate the
+        //    latest *completed* CheckpointEnd, rebuild the ATT/DPT from its
+        //    snapshot files plus the WAL tail, and derive the redo start LSN.
+        //    A CheckpointBegin without a matching CheckpointEnd (crash
+        //    mid-checkpoint) is invisible here: the superblock still points
+        //    at the previous completed checkpoint, whose CheckpointEnd is
+        //    the latest one the scan finds.
+        let analysis_result = Self::run_analysis(&data_dir, config, checkpoint_lsn)?;
+        let replay_start = analysis_result.redo_start;
+        let recovered_att = analysis_result.att;
         let replayed_max_txn_id = Self::replay_wal(
             data_dir.clone(),
             config,
@@ -289,6 +297,28 @@ impl StorageEngine {
             clog.as_ref(),
         )?;
         page_allocator.lock().mark_recovery_complete();
+
+        // 5b. Simplified undo, filter half (§11.3; see the analysis module
+        //     docs): now that redo has rebuilt the CLOG, drop ATT members
+        //     the CLOG already knows as Committed/Aborted — they are NOT in
+        //     flight. This closes the §11.4 ATT-snapshot race where a
+        //     commit's WAL record predates the checkpoint begin (invisible
+        //     to the analysis scan) while the racy snapshot still lists the
+        //     XID. The survivors are genuinely uncommitted; Stage N writes
+        //     no ABORTED for them (M2c work). NOTE: with the NoOp CLOG
+        //     (M1/heap-only configurations) every XID reads Committed, so
+        //     the recovered ATT comes back empty — correct there, since a
+        //     configuration without a real CLOG has no visibility decisions
+        //     to inform.
+        let recovered_att: Vec<TxnId> = recovered_att
+            .into_iter()
+            .filter(|xid| {
+                !matches!(
+                    clog.get_state(*xid),
+                    TxnState::Committed | TxnState::Aborted
+                )
+            })
+            .collect();
 
         // Seed the buffer pool's checkpoint_lsn from the superblock. Without
         // this it stays INVALID until the first new checkpoint, and
@@ -352,11 +382,91 @@ impl StorageEngine {
             checkpoint,
             txn_id_clock,
             clog,
+            recovered_att,
         })
     }
 
-    /// Replay WAL from `checkpoint_lsn` and return the highest `txn_id`
-    /// stamped on any replayed record.
+    /// Run the ARIES analysis phase (M2b Stage N; tech-selection §11.1).
+    ///
+    /// `checkpoint_lsn` is the superblock's redo point. The WAL scan starts
+    /// there (a guaranteed record boundary) and looks for the latest
+    /// completed `CheckpointEnd`:
+    ///
+    /// - found, with the same `checkpoint_lsn` — the normal case: analyze
+    ///   from that record, consuming its ATT/DPT snapshot files (v2) or
+    ///   rebuilding with an empty baseline (v1);
+    /// - found, but NEWER than the superblock — the instance crashed after
+    ///   `flush_to(end_lsn)` but before the superblock write (checkpoint.rs
+    ///   steps 7→9). The superblock's older anchors (`next_page_id`,
+    ///   `next_txn_id`) still seed the allocator and XID clock, so redo must
+    ///   cover the records between the two redo points: analyze from the
+    ///   superblock's point with an empty baseline, exactly like a v1
+    ///   record;
+    /// - not found — either no checkpoint ever completed (`checkpoint_lsn`
+    ///   invalid, analyze from [`Lsn::FIRST`]) or the WAL lost the record
+    ///   (warn; analyze from the superblock's point with an empty
+    ///   baseline).
+    fn run_analysis(
+        data_dir: &Path,
+        config: &StorageConfig,
+        checkpoint_lsn: Lsn,
+    ) -> Result<analysis::AnalysisResult> {
+        let scan_start = if checkpoint_lsn.is_valid() {
+            checkpoint_lsn
+        } else {
+            warn!("checkpoint_lsn is invalid; analyzing WAL from the beginning");
+            Lsn::FIRST
+        };
+        let end_record = match analysis::find_latest_checkpoint_end(
+            &data_dir.join("wal"),
+            config.wal_segment_size,
+            scan_start,
+        )? {
+            Some((end, _end_lsn)) if end.checkpoint_lsn == checkpoint_lsn => end,
+            Some((end, end_lsn)) => {
+                warn!(
+                    superblock_checkpoint_lsn = %checkpoint_lsn,
+                    end_checkpoint_lsn = %end.checkpoint_lsn,
+                    %end_lsn,
+                    "WAL holds a CheckpointEnd newer than the superblock \
+                     (crash between WAL flush and superblock write); \
+                     rebuilding analysis baseline from the superblock redo point"
+                );
+                Self::synthesized_checkpoint_end(scan_start)
+            }
+            None => {
+                if checkpoint_lsn.is_valid() {
+                    warn!(
+                        %checkpoint_lsn,
+                        "no CheckpointEnd record found for the superblock's \
+                         checkpoint; rebuilding analysis baseline from the \
+                         superblock redo point"
+                    );
+                }
+                Self::synthesized_checkpoint_end(scan_start)
+            }
+        };
+        analysis::run_analysis(data_dir, config.wal_segment_size, &end_record)
+    }
+
+    /// Build an in-memory v1-equivalent `CheckpointEnd` anchor: the empty
+    /// snapshot file references make analysis rebuild the ATT/DPT by a full
+    /// WAL scan from `checkpoint_lsn` (§11.4 empty-`att_file` semantics).
+    /// Only `checkpoint_lsn` is consumed by analysis; the remaining fields
+    /// are placeholders.
+    fn synthesized_checkpoint_end(checkpoint_lsn: Lsn) -> CheckpointEndRecord {
+        CheckpointEndRecord {
+            checkpoint_lsn,
+            next_page_id: PageId::INVALID,
+            next_txn_id: TxnId::INVALID,
+            next_oid: 0,
+            att_file: String::new(),
+            dpt_file: String::new(),
+        }
+    }
+
+    /// Replay WAL from `replay_start` (the analysis phase's redo point) and
+    /// return the highest `txn_id` stamped on any replayed record.
     ///
     /// The returned XID is the recovery high-water mark: every record that a
     /// transaction wrote carries its XID (`WalRecord::txn_id`), so the largest
@@ -368,17 +478,14 @@ impl StorageEngine {
     fn replay_wal(
         data_dir: PathBuf,
         config: &StorageConfig,
-        checkpoint_lsn: Lsn,
+        replay_start: Lsn,
         page_allocator: &Arc<Mutex<PageAllocator>>,
         buffer_pool: &BufferPool,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
         clog: &dyn ClogAccessor,
     ) -> Result<TxnId> {
-        let mut reader = WalReader::open_at(
-            data_dir.join("wal"),
-            config.wal_segment_size,
-            checkpoint_lsn,
-        )?;
+        let mut reader =
+            WalReader::open_at(data_dir.join("wal"), config.wal_segment_size, replay_start)?;
 
         // The FPI handler routes through the buffer pool when present (it is,
         // here), but still needs a data-file handle for its no-pool fallback.
@@ -429,8 +536,13 @@ impl StorageEngine {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    // A bad final record is treated as end-of-WAL; anything
-                    // before it has already been applied.
+                    // Propagate hard errors (hole detection, corrupt
+                    // metadata) — they are not end-of-WAL. Genuine tail
+                    // truncation (WalCorrupted) is safe to treat as
+                    // end-of-WAL: records before it are already applied.
+                    if analysis::is_hard_error(&e) {
+                        return Err(e);
+                    }
                     warn!(error = %e, "WAL replay stopped at truncated/final record");
                     break;
                 }
@@ -495,6 +607,24 @@ impl StorageEngine {
     /// Return the commit-log accessor injected at open.
     pub fn clog(&self) -> &Arc<dyn ClogAccessor> {
         &self.clog
+    }
+
+    /// XIDs that were active (neither committed nor aborted) when the
+    /// previous instance stopped, rebuilt by the analysis phase (M2b
+    /// Stage N; tech-selection §11.1) and filtered through the rebuilt
+    /// CLOG (members the CLOG knows as Committed/Aborted are dropped — see
+    /// the [`crate::analysis`] module docs). Empty on a freshly created
+    /// database, when every transaction reached a terminal record before
+    /// the crash, or under the `NoOp` CLOG (which reads every XID as
+    /// Committed).
+    ///
+    /// Stage N runs no explicit undo for these XIDs: they have no terminal
+    /// record in the durable WAL, so the rebuilt CLOG reads them as
+    /// InProgress and MVCC visibility already hides their tuples. See the
+    /// [`crate::analysis`] module docs for the §11.3 alignment of this
+    /// decision.
+    pub fn recovered_active_xids(&self) -> &[TxnId] {
+        &self.recovered_att
     }
 
     /// Return the `next_oid` currently recorded in the superblock.

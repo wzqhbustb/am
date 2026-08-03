@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
+use pg_storage::error::StorageError;
 use pg_storage::page::PAGE_HEADER_SIZE;
 use pg_storage::types::PageId;
 
@@ -538,36 +539,21 @@ fn crash_with_large_wal_recovers_across_segments() {
 #[test]
 fn crash_reserve_without_emit_recovers_baseline() {
     // Simulates a crash between reserve_lsn and append_at during a checkpoint.
-    // The reserved range is zeros in the WAL; recovery treats zeros as end-of-WAL.
-    // The baseline (pre-gap) checkpoint data must be fully intact. Post-gap
-    // allocations are lost — this is the expected/acceptable behavior documented
-    // in WalWriter::reserve_lsn's crash-safety note.
+    // The reserved range is zeros in the WAL. With the Stage N P0-3 fix,
+    // the WAL reader forwards-probes past an all-zero header and hard-fails
+    // when it finds non-zero data — rather than silently truncating the log
+    // and losing the post-gap records. The baseline (pre-gap) data on disk
+    // is intact and can be recovered by a tool that fills the hole.
     let iterations = 8;
     let tmp = run_manual_crash_test("reserve_without_emit", iterations, 50, None);
     let data_dir = tmp.path();
 
-    // Recovery must succeed without panic.
+    // Recovery must hard-fail on the WAL hole (MetadataCorrupted), not panic.
     let config = StorageConfig::new(data_dir);
-    let engine = StorageEngine::open(data_dir, &config).unwrap();
-
-    // The baseline pages (written and checkpointed before the gap) must survive.
-    for i in 1..=iterations {
-        let page_id = PageId(i as u64);
-        let guard = engine.buffer_pool().pin(page_id).unwrap();
-        assert!(
-            verify_test_pattern(guard.page(), i),
-            "baseline page {page_id} lost after reserve-without-emit crash"
-        );
-    }
-
-    // The 4 post-gap allocations are NOT guaranteed to survive (their WAL
-    // records are beyond the gap). The allocator may or may not know about them
-    // depending on whether recovery stopped before or after their PageAlloc
-    // records (it stops at the gap, so they are lost).
-    let next_page_id = engine.page_allocator().lock().next_page_id().0;
+    let err = StorageEngine::open(data_dir, &config).unwrap_err();
     assert!(
-        next_page_id >= (iterations as u64 + 1),
-        "allocator should have at least the checkpointed pages"
+        matches!(err, StorageError::MetadataCorrupted(_)),
+        "expected MetadataCorrupted for WAL hole, got {err:?}"
     );
 }
 
