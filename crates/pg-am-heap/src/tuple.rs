@@ -52,6 +52,18 @@ pub const HEAP_XMAX_COMMITTED: u16 = 0x0400;
 pub const HEAP_XMAX_INVALID: u16 = 0x0800;
 /// Tuple is an updated version.
 pub const HEAP_UPDATED: u16 = 0x2000;
+/// `t_xmax` holds a row LOCK, not a delete (M2c Stage P, tech-selection
+/// §9.1): set by `SELECT ... FOR UPDATE` / `HeapAM::lock_tuple`. The row
+/// stays visible to every snapshot — visibility masks a LOCK_ONLY `t_xmax`
+/// to INVALID — but the row-lock protocol treats the non-INVALID `t_xmax`
+/// as "row locked" until the stamper's transaction ends. A real delete or
+/// update by the lock holder clears the bit when it overwrites the stamp.
+///
+/// Bit 0x1000 sits between PG's `HEAP_XMAX_INVALID` (0x0800) and
+/// `HEAP_UPDATED` (0x2000), mirroring where PG keeps its own
+/// `HEAP_XMAX_LOCK_ONLY`; this crate's infomask layout is §三, not PG's, so
+/// only the relative gap matters.
+pub const HEAP_XMAX_LOCK_ONLY: u16 = 0x1000;
 
 // `t_infomask2` bits (§三): natts occupies bits 0..=10 (up to 2047 columns;
 // 11 bits represent 0..=2047).

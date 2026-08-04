@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::buffer_pool::BufferPool;
@@ -100,6 +100,22 @@ pub struct CheckpointCoordinator {
     /// Wrapped in `Arc<Mutex<Option<..>>>` and shared with the background
     /// thread's clone for the same reason as `clog_flush`.
     att_provider: Arc<Mutex<Option<Arc<dyn crate::recovery::AttProvider>>>>,
+    /// Commit/checkpoint barrier (M2c Stage P): when installed,
+    /// [`trigger_checkpoint`](Self::trigger_checkpoint) holds the WRITE guard
+    /// across the whole checkpoint critical section — from `begin_lsn`
+    /// capture through ATT/DPT sampling and the CLOG flush to WAL
+    /// recycling — while `TxnManager::commit_txn`/`abort_txn` hold READ
+    /// guards for their hard order. This is the barrier the `AttProvider`
+    /// contract has always required (see
+    /// [`set_att_provider`](Self::set_att_provider)), sunk into the
+    /// storage/txn layers so it is enforced by construction instead of by
+    /// caller discipline. `None` keeps M1/M2a-style standalone
+    /// configurations (no `TxnManager`) working unchanged.
+    ///
+    /// Same `Arc<Mutex<Option<..>>>` slot pattern as `clog_flush` /
+    /// `att_provider`: the engine may install it after background
+    /// checkpointing has started and the next checkpoint still picks it up.
+    commit_barrier: Arc<Mutex<Option<Arc<RwLock<()>>>>>,
     shutdown: Arc<AtomicBool>,
     background_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -136,6 +152,7 @@ impl CheckpointCoordinator {
             next_txn_id_source: Arc::new(Mutex::new(TxnIdClock::new(next_txn_id))),
             clog_flush: Arc::new(Mutex::new(None)),
             att_provider: Arc::new(Mutex::new(None)),
+            commit_barrier: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
             background_handle: Mutex::new(None),
         }
@@ -204,9 +221,9 @@ impl CheckpointCoordinator {
     ///
     /// # Commit barrier required for correctness
     ///
-    /// The ATT snapshot's correctness depends on the CALLER serializing
-    /// checkpoints against in-flight commits. Without a commit barrier,
-    /// the following interleaving is possible:
+    /// The ATT snapshot's correctness depends on serializing checkpoints
+    /// against in-flight commits. Without a commit barrier, the following
+    /// interleaving is possible:
     ///
     /// 1. A commit's WAL record is appended before the checkpoint's
     ///    `CheckpointBegin`, but its `active.remove` has not yet run.
@@ -222,14 +239,14 @@ impl CheckpointCoordinator {
     /// drop this XID, and it remains permanently "active" — a committed
     /// transaction whose tuples are visible as InProgress forever.
     ///
-    /// pg-engine provides the required barrier by serializing commit and
-    /// checkpoint under its transaction-level lock. Code paths that use
-    /// [`start_background_checkpointing`](Self::start_background_checkpointing)
-    /// or [`trigger_checkpoint`](Self::trigger_checkpoint) from the
-    /// storage layer alone (no barrier) are therefore **unsafe** — the
-    /// caller must supply its own barrier, or accept the corruption risk.
-    /// In M2c the barrier should be pushed down into `TxnManager` so the
-    /// storage layer is safe by construction.
+    /// Since M2c Stage P the barrier is built in: `TxnManager` owns an
+    /// internal `RwLock` whose READ guard covers the commit/abort hard
+    /// order, and pg-engine installs it here via
+    /// [`set_commit_barrier`](Self::set_commit_barrier) so every checkpoint
+    /// runs under the WRITE guard. Configurations that drive checkpoints
+    /// WITHOUT a `TxnManager`-backed barrier installed (storage-only
+    /// setups) remain **unsafe** in the sense above — such callers must
+    /// supply their own serialization, or accept the corruption risk.
     ///
     /// The slot is shared (via `Arc`) with the background checkpoint thread's
     /// clone, so installing a provider *after*
@@ -238,6 +255,27 @@ impl CheckpointCoordinator {
     /// [`set_clog_flush`](Self::set_clog_flush).
     pub fn set_att_provider(&self, provider: Arc<dyn crate::recovery::AttProvider>) {
         *self.att_provider.lock() = Some(provider);
+    }
+
+    /// Install the commit/checkpoint barrier (M2c Stage P).
+    ///
+    /// Once installed, every
+    /// [`trigger_checkpoint`](Self::trigger_checkpoint) holds the barrier's
+    /// WRITE guard across the whole checkpoint critical section — from
+    /// `begin_lsn` capture through ATT/DPT sampling and the CLOG flush to
+    /// WAL recycling — while `TxnManager::commit_txn`/`abort_txn` hold READ
+    /// guards for their hard order. This is the serialization the
+    /// `AttProvider` contract (above) has always required, enforced by
+    /// construction rather than by caller discipline. pg-engine wires
+    /// `TxnManager::commit_barrier()` in at open; storage-only
+    /// configurations leave this unset and behave exactly as before.
+    ///
+    /// Same shared-slot pattern as
+    /// [`set_att_provider`](Self::set_att_provider): an install after
+    /// background checkpointing has started takes effect on the next
+    /// checkpoint.
+    pub fn set_commit_barrier(&self, barrier: Arc<RwLock<()>>) {
+        *self.commit_barrier.lock() = Some(barrier);
     }
 
     /// Start a background thread that triggers checkpoints periodically.
@@ -328,6 +366,26 @@ impl CheckpointCoordinator {
         // Serialize checkpoints so that manual and background checkpoints do not
         // interleave and produce redundant or overlapping checkpoint records.
         let _lock = self.checkpoint_lock.lock();
+
+        // -- Phase 0: commit barrier (M2c Stage P) --------------------------
+        //
+        // Hold the commit barrier's WRITE guard across the whole checkpoint
+        // (when a barrier is installed — pg-engine wires
+        // `TxnManager::commit_barrier()` in at open). Commits/aborts hold
+        // READ guards for their hard order, so while this checkpoint runs:
+        //
+        // - a commit durable before `begin_lsn` has already finished its
+        //   `clog.set_state` — its bit is inside the Phase 4b CLOG flush;
+        // - a commit starting after blocks until the checkpoint completes
+        //   and then lands past `begin_lsn` — replay rebuilds it.
+        //
+        // No commit can sit in the "neither the fsynced CLOG nor the
+        // replay" window. See `set_att_provider` for the failure shape this
+        // closes. Lock order: checkpoint_lock → commit_barrier → WAL/page
+        // locks; the commit side takes commit_barrier (read) before the WAL
+        // lock, so the orders compose without a cycle.
+        let barrier = self.commit_barrier.lock().clone();
+        let _barrier = barrier.as_ref().map(|b| b.write());
 
         // -- Phase 1: CheckpointBegin ----------------------------------------
         //
@@ -702,6 +760,10 @@ impl CheckpointCoordinator {
             clog_flush: Arc::clone(&self.clog_flush),
             // Share the ATT provider slot for the same reason as clog_flush.
             att_provider: Arc::clone(&self.att_provider),
+            // Share the commit-barrier slot for the same reason: a barrier
+            // installed after the background thread starts must still guard
+            // background checkpoints.
+            commit_barrier: Arc::clone(&self.commit_barrier),
             shutdown: Arc::clone(&self.shutdown),
             background_handle: Mutex::new(None),
         }

@@ -1,14 +1,14 @@
 //! Minimal SQL parser: tokenizer + recursive descent (no external deps).
 //!
-//! Supports the M2b subset: BEGIN/COMMIT/ROLLBACK, CREATE TABLE,
-//! INSERT, SELECT (with WHERE/ORDER BY/LIMIT), UPDATE, DELETE,
-//! CREATE INDEX. One statement per `parse` call; a single trailing `;`
-//! is allowed and stripped. Unquoted identifiers are lowercased
-//! (PostgreSQL fold-to-lower semantics); quoted identifiers do not
-//! exist in this subset, so table and column lookup is uniformly
-//! case-insensitive.
+//! Supports the M2b/M2c subset: BEGIN/COMMIT/ROLLBACK, CREATE TABLE,
+//! INSERT, SELECT (with WHERE/ORDER BY/LIMIT and the M2c `FOR UPDATE` /
+//! `FOR SHARE` lock clause), UPDATE, DELETE, CREATE INDEX. One statement
+//! per `parse` call; a single trailing `;` is allowed and stripped.
+//! Unquoted identifiers are lowercased (PostgreSQL fold-to-lower
+//! semantics); quoted identifiers do not exist in this subset, so table
+//! and column lookup is uniformly case-insensitive.
 //!
-//! # Not supported (by design, M2b)
+//! # Not supported (by design, M2b/M2c)
 //!
 //! - `--` / `/* */` comments: `-` is only ever a negative-number sign,
 //!   so `-- comment` fails with "invalid number: -" rather than being
@@ -19,6 +19,10 @@
 //! - RETURNING, JOIN, subqueries, aggregates, GROUP BY/HAVING, `<=`/`>=`/
 //!   `<>`/`!=` (only `=` / `<` / `>`), parenthesized expressions, and
 //!   arithmetic in statements.
+//! - `FOR NO KEY UPDATE` / `FOR KEY SHARE` (only the bare `FOR UPDATE` /
+//!   `FOR SHARE` forms). `FOR SHARE` parses but execution fails with
+//!   `Unsupported` — shared row locks need multixact, a later stage
+//!   (tech-selection §9.1).
 
 #![allow(missing_docs)]
 
@@ -49,6 +53,8 @@ pub enum Statement {
         filter: Option<Filter>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
+        /// Row-lock clause (M2c Stage P): `FOR UPDATE` / `FOR SHARE`.
+        lock: Option<LockClause>,
     },
     Update {
         table: String,
@@ -63,6 +69,16 @@ pub enum Statement {
         table: String,
         column: String,
     },
+}
+
+/// A SELECT row-lock clause (M2c Stage P, tech-selection §9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockClause {
+    /// `FOR UPDATE`: exclusive row lock via the lock-only `t_xmax` stamp.
+    ForUpdate,
+    /// `FOR SHARE`: parses, but execution returns `Unsupported` — shared
+    /// row locks require multixact, deferred to a later stage.
+    ForShare,
 }
 
 /// A column definition in CREATE TABLE.
@@ -131,6 +147,8 @@ enum Token {
     Asc,
     Desc,
     Limit,
+    For,
+    Share,
     Update,
     Set,
     Delete,
@@ -306,6 +324,8 @@ impl<'a> Tokenizer<'a> {
             "ASC" => Token::Asc,
             "DESC" => Token::Desc,
             "LIMIT" => Token::Limit,
+            "FOR" => Token::For,
+            "SHARE" => Token::Share,
             "UPDATE" => Token::Update,
             "SET" => Token::Set,
             "DELETE" => Token::Delete,
@@ -555,6 +575,7 @@ impl Parser {
         let filter = self.parse_optional_filter()?;
         let order_by = self.parse_optional_order_by()?;
         let limit = self.parse_optional_limit()?;
+        let lock = self.parse_optional_lock_clause()?;
         self.eat(&Token::Eof)?;
         Ok(Statement::Select {
             columns,
@@ -562,7 +583,25 @@ impl Parser {
             filter,
             order_by,
             limit,
+            lock,
         })
+    }
+
+    /// The M2c row-lock clause (§9.1): `FOR UPDATE` / `FOR SHARE`, after
+    /// LIMIT and before the statement end. `FOR NO KEY UPDATE` and
+    /// `FOR KEY SHARE` are out of the subset.
+    fn parse_optional_lock_clause(&mut self) -> Result<Option<LockClause>> {
+        if !matches!(self.peek(), Token::For) {
+            return Ok(None);
+        }
+        self.bump(); // FOR
+        match self.bump() {
+            Token::Update => Ok(Some(LockClause::ForUpdate)),
+            Token::Share => Ok(Some(LockClause::ForShare)),
+            other => Err(EngineError::InvalidArgument(format!(
+                "expected UPDATE or SHARE after FOR, got {other:?}"
+            ))),
+        }
     }
 
     fn parse_select_cols(&mut self) -> Result<SelectCols> {
@@ -752,12 +791,14 @@ mod tests {
                 filter,
                 order_by,
                 limit,
+                lock,
             } => {
                 assert_eq!(columns, SelectCols::All);
                 assert_eq!(table, "users");
                 assert!(filter.is_none());
                 assert!(order_by.is_none());
                 assert!(limit.is_none());
+                assert!(lock.is_none());
             }
             other => panic!("expected Select, got {other:?}"),
         }
@@ -774,6 +815,7 @@ mod tests {
                 filter,
                 order_by,
                 limit,
+                lock,
             } => {
                 assert_eq!(
                     columns,
@@ -788,9 +830,43 @@ mod tests {
                 assert_eq!(ob.column, "name");
                 assert!(ob.desc);
                 assert_eq!(limit, Some(5));
+                assert!(lock.is_none());
             }
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_select_for_update() {
+        let stmt = parse("SELECT * FROM t WHERE id = 1 FOR UPDATE").unwrap();
+        match stmt {
+            Statement::Select { lock, filter, .. } => {
+                assert_eq!(lock, Some(LockClause::ForUpdate));
+                assert!(filter.is_some());
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+        // The lock clause sits after LIMIT; a trailing semicolon still works.
+        let stmt = parse("SELECT id FROM t LIMIT 3 FOR UPDATE;").unwrap();
+        match stmt {
+            Statement::Select { lock, limit, .. } => {
+                assert_eq!(lock, Some(LockClause::ForUpdate));
+                assert_eq!(limit, Some(3));
+            }
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_select_for_share() {
+        let stmt = parse("SELECT * FROM t FOR SHARE").unwrap();
+        match stmt {
+            Statement::Select { lock, .. } => assert_eq!(lock, Some(LockClause::ForShare)),
+            other => panic!("expected Select, got {other:?}"),
+        }
+        // FOR alone / FOR with an unknown mode is a parse error.
+        assert!(parse("SELECT * FROM t FOR").is_err());
+        assert!(parse("SELECT * FROM t FOR NO KEY UPDATE").is_err());
     }
 
     #[test]

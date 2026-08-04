@@ -28,11 +28,13 @@
 //!    opened **once per Engine** and kept: re-opening after DDL would reset
 //!    the OID allocator and reopen the crash-rollback window the startup
 //!    correction in `Catalog::open` exists to close.
-//! 5. `HeapAM::new` over the shared buffer pool / WAL writer.
-//! 6. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
+//! 5. `TxnManager::new` over `engine.txn_id_clock()`, the WAL writer as
 //!    `Arc<dyn CommitWal>`, and the same CLOG. The manager is held in an
 //!    `Arc` and also installed as the checkpoint coordinator's ATT snapshot
 //!    source (`set_att_provider`, Stage N, tech-selection §11.4).
+//! 6. `HeapAM::new` over the shared buffer pool / WAL writer, with the
+//!    manager installed as its row-lock waiter (`set_row_waiter`, M2c
+//!    Stage P: the §9.1 5-step `t_xmax` protocol).
 //! 7. The in-memory **table registry** (`RwLock<HashMap<String, TableEntry>>`)
 //!    is rebuilt from the catalog: `pg_class` rows with `relkind = 'r'` (last
 //!    version per OID wins, `relkind = 'd'` marks a drop) joined with
@@ -81,9 +83,25 @@
 //! # Concurrency scope
 //!
 //! DML (`insert` / `scan` / `update` / `delete`) is safe to call from many
-//! threads concurrently (Stage K 100-thread acceptance). DDL is serialized
-//! by an internal lock, but DDL racing DML on the same table is **not**
-//! supported in M2a (no table locks yet — those arrive in M2c).
+//! threads concurrently (Stage K 100-thread acceptance). M2c Stage P adds
+//! the two-tier locking of tech-selection §9:
+//!
+//! - **Row locks** (§9.1): UPDATE/DELETE and `SELECT ... FOR UPDATE` run
+//!   the 5-step `t_xmax` protocol in the heap AM — a row stamped by a
+//!   still-active transaction is WAITED on (not errored), and a committed
+//!   stamper surfaces as `HeapError::TupleConcurrentlyUpdated`.
+//! - **Table locks** (§9.2): statements acquire `AccessShare` (SELECT),
+//!   `RowExclusive` (INSERT/UPDATE/DELETE, FOR UPDATE), `Exclusive`
+//!   (CREATE INDEX), or `AccessExclusive` (CREATE/DROP TABLE) after table
+//!   resolution; locks are keyed by XID and released at commit/abort (2PL).
+//!
+//! DDL is additionally serialized by an internal lock. Deadlock DETECTION
+//! is Stage R: a table-lock cycle (e.g. two transactions upgrading
+//! `AccessShare` → `RowExclusive` on the same table) wedges the
+//! participants. The snapshot-only read APIs (`scan`, `index_lookup`) and
+//! plain auto-commit SELECT take no table lock (they own no transaction),
+//! so a `DROP TABLE` racing them can still produce `TableNotFound` —
+//! unchanged from M2b.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -113,10 +131,13 @@ use pg_storage::engine::StorageEngine;
 use pg_storage::recovery::AttProvider;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::WalWriter;
-use pg_txn::{is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, Snapshot, TxnManager};
+use pg_txn::{
+    is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, LockManager, LockMode,
+    RowWaiter, Snapshot, TxnManager,
+};
 
 use crate::error::{EngineError, Result};
-use crate::sql::{self, CmpOp, Filter, Literal, OrderBy, SelectCols, Statement};
+use crate::sql::{self, CmpOp, Filter, Literal, LockClause, OrderBy, SelectCols, Statement};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
 ///
@@ -329,9 +350,23 @@ pub struct Engine {
     catalog: Catalog,
     heap: HeapAM,
     /// Shared with the checkpoint coordinator as its ATT snapshot source
-    /// (Stage N, §11.4), hence the `Arc`.
+    /// (Stage N, §11.4), hence the `Arc`. The manager also OWNS the
+    /// commit/checkpoint barrier (M2c Stage P): its `commit_txn`/`abort_txn`
+    /// take the read guard internally, and the checkpoint coordinator takes
+    /// the write guard via `set_commit_barrier` — so the engine no longer
+    /// carries its own `commit_barrier` field (Stage L's arrangement).
     txn: Arc<TxnManager>,
     clog: Arc<ClogBuffer>,
+    /// Table-level lock manager (M2c Stage P, tech-selection §9.2): SELECT
+    /// takes `AccessShare`, DML and `SELECT ... FOR UPDATE` take
+    /// `RowExclusive`, `CREATE INDEX` takes `Exclusive`, `CREATE`/`DROP
+    /// TABLE take `AccessExclusive`. Locks key by XID and are held to
+    /// transaction end (2PL — released only by `release_all` at
+    /// commit/abort, never mid-transaction). Always the blocking `acquire`:
+    /// there is no NOWAIT and no deadlock detection yet (Stage R consumes
+    /// `table_lock_state` + `TxnManager::wait_edges`), so a table-lock cycle
+    /// wedges only the participating transactions.
+    lock_manager: Arc<LockManager>,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
     /// All live indexes (M2b Stage M wave 2). Rebuilt at open by scanning
@@ -341,29 +376,6 @@ pub struct Engine {
     /// Serializes `create_table` / `drop_table` (see the module docs for the
     /// DDL-vs-DML concurrency scope).
     ddl_lock: Mutex<()>,
-    /// Commit/checkpoint barrier: every auto-commit statement holds a read
-    /// guard for its whole lifetime (commit/abort included), and
-    /// [`Engine::checkpoint`] holds the write guard across the **entire**
-    /// storage checkpoint — from `begin_lsn` capture through the CLOG flush
-    /// to WAL recycling.
-    ///
-    /// This is still load-bearing with the disk CLOG. The window it closes
-    /// is the M2a "neither snapshot nor replay" window, now against the
-    /// checkpoint's CLOG flush: a commit whose `TxnCommit` WAL record landed
-    /// before the checkpoint's `begin_lsn` (so recovery will never replay
-    /// it) but whose `clog.set_state` ran after the checkpoint's
-    /// `flush_dirty` would be present in NEITHER the fsynced CLOG NOR the
-    /// replay — committed, yet reading `InProgress` (invisible) after
-    /// restart. With the barrier, a commit durable before `begin_lsn` has
-    /// finished `set_state` before the flush runs (its bit is fsynced), and
-    /// any commit starting after the barrier is assigned an LSN past
-    /// `begin_lsn` (so replay rebuilds it). The commit's WAL fsync and the
-    /// CLOG flush are otherwise independent: `set_state` only touches an
-    /// in-memory frame, and `flush_dirty` takes the same buffer-wide lock,
-    /// so there is no data race — the barrier exists purely for this
-    /// durability ordering. (Serializing concurrent `Engine::checkpoint`
-    /// calls is redundant with the coordinator's internal checkpoint lock.)
-    commit_barrier: Arc<RwLock<()>>,
     /// This engine's identity (see `NEXT_ENGINE_INSTANCE_ID`).
     instance_id: u64,
     /// Per-transaction index undo log, keyed by XID (Stage O review: index
@@ -399,11 +411,13 @@ pub struct Engine {
 /// future snapshot.
 pub struct TxnHandle {
     txn: Arc<TxnManager>,
-    barrier: Arc<RwLock<()>>,
     xid: Option<TxnId>,
     snapshot: RefCell<Snapshot>,
     /// Identity of the creating engine (see `NEXT_ENGINE_INSTANCE_ID`).
     instance_id: u64,
+    /// Shared with the engine: table locks are keyed by XID, so commit /
+    /// abort / Drop release them through this handle (2PL release point).
+    lock_manager: Arc<LockManager>,
     /// Shared with the engine: this txn's index maintenance ops, reversed
     /// on abort and discarded on commit.
     index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
@@ -428,10 +442,17 @@ impl TxnHandle {
     ///
     /// The transaction's index undo entries are discarded: its index
     /// maintenance becomes durable with the commit.
+    ///
+    /// The commit-barrier read guard is taken inside `TxnManager::commit_txn`
+    /// itself (M2c Stage P), so this path — and every other commit path — is
+    /// serialized against checkpoints by construction.
     pub fn commit(mut self) -> Result<()> {
         let xid = self.xid.take().expect("commit called twice");
-        let _guard = self.barrier.read();
         let result = self.txn.commit_txn(xid);
+        // 2PL release point (M2c Stage P): table locks go AFTER the CLOG
+        // bit flips, so a woken row-lock waiter that then needs this
+        // transaction's table locks never observes the reverse order.
+        self.lock_manager.release_all(xid);
         // Discard the undo log either way: on success the entries are
         // durable; on failure the txn stays in-progress (its heap writes
         // invisible) and the `index_lookup` visibility mask covers the
@@ -449,9 +470,10 @@ impl TxnHandle {
     /// row whose index entry is already gone (or vice versa).
     pub fn abort(mut self) -> Result<()> {
         let xid = self.xid.take().expect("abort called twice");
-        let _guard = self.barrier.read();
         apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
-        self.txn.abort_txn(xid)?;
+        let result = self.txn.abort_txn(xid);
+        self.lock_manager.release_all(xid);
+        result?;
         Ok(())
     }
 }
@@ -464,11 +486,9 @@ impl Drop for TxnHandle {
             // lingering in the active set forever (which would make
             // its writes invisible to all future snapshots).
             //
-            // Takes the same commit-barrier read guard as `commit`/`abort`
-            // (Stage O review): a checkpoint holds the write guard, so the
-            // read guard simply waits it out — no deadlock, and the abort's
-            // `set_state` cannot race the checkpoint's CLOG flush.
-            let _guard = self.barrier.read();
+            // No commit-barrier guard is needed here anymore (M2c Stage P):
+            // `abort_txn` takes the read guard internally, so the abort's
+            // `set_state` cannot race a checkpoint's CLOG flush.
             apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
             if let Err(e) = self.txn.abort_txn(xid) {
                 // Same reporting level as the auto-commit error path: a
@@ -477,6 +497,10 @@ impl Drop for TxnHandle {
                 // must be loud even though Drop cannot propagate.
                 tracing::warn!(error = %e, xid = xid.0, "txn handle drop auto-abort failed");
             }
+            // Release table locks even when the abort failed: a leaked
+            // lock would wedge DDL on the table forever, and the XID is
+            // gone from this handle either way.
+            self.lock_manager.release_all(xid);
         }
     }
 }
@@ -573,17 +597,25 @@ impl Engine {
         // 4. One catalog per engine (module docs: OID-allocator monotonicity).
         let catalog = Catalog::open(&storage)?;
 
-        // 5./6. Heap AM and transaction manager over the shared components.
-        let heap = HeapAM::new(
-            Arc::clone(storage.buffer_pool()),
-            Arc::clone(storage.wal_writer()),
-        );
+        // 5./6. Transaction manager and heap AM over the shared components.
+        //     The manager comes FIRST: the heap AM's §9.1 row-lock protocol
+        //     (M2c Stage P) needs its wait capability installed before the
+        //     AM is shared.
         let wal: Arc<dyn CommitWal> = Arc::clone(storage.wal_writer()) as Arc<dyn CommitWal>;
         let txn = Arc::new(TxnManager::new(
             storage.txn_id_clock(),
             wal,
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
         ));
+        let mut heap = HeapAM::new(
+            Arc::clone(storage.buffer_pool()),
+            Arc::clone(storage.wal_writer()),
+        );
+        // 5b. Row-lock waiter (M2c Stage P): with this installed, the heap
+        //     AM runs the full §9.1 5-step protocol (wait on an in-progress
+        //     t_xmax, `TupleConcurrentlyUpdated` on a committed one) instead
+        //     of the legacy "second-writer-errors" behavior.
+        heap.set_row_waiter(Arc::clone(&txn) as Arc<dyn RowWaiter>);
         // 6b. Checkpoint ATT snapshot source (Stage N, §11.4): every
         //     checkpoint persists the manager's in-flight XIDs as the ATT
         //     snapshot file referenced by the v2 CheckpointEnd record. The
@@ -592,6 +624,16 @@ impl Engine {
         storage
             .checkpoint()
             .set_att_provider(Arc::clone(&txn) as Arc<dyn AttProvider>);
+
+        // 6c. Commit/checkpoint barrier (M2c Stage P): the checkpoint
+        //     coordinator takes the manager's barrier WRITE guard across its
+        //     critical section while commit_txn/abort_txn hold READ guards,
+        //     closing the "neither snapshot nor replay" window by
+        //     construction (this replaces the engine-level `commit_barrier`
+        //     field of Stage L). Same no-race argument as step 3.
+        storage
+            .checkpoint()
+            .set_commit_barrier(txn.commit_barrier());
 
         // 7. Table registry from the catalog, index registry from the
         //    `pg_index` heap chain.
@@ -604,10 +646,10 @@ impl Engine {
             heap,
             txn,
             clog,
+            lock_manager: Arc::new(LockManager::new()),
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
             ddl_lock: Mutex::new(()),
-            commit_barrier: Arc::new(RwLock::new(())),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
         })
@@ -756,16 +798,11 @@ impl Engine {
     /// `CheckpointBegin` and `CheckpointEnd`, via the `ClogFlush` hook
     /// installed at open (tech-selection §6.4, v2.3-21) — so there is no
     /// separate engine-level dump step: this is a pure
-    /// `trigger_checkpoint` plus the commit-barrier semantics below. This
-    /// is the only supported checkpoint path; background checkpointing is
-    /// never started.
+    /// `trigger_checkpoint` call. The commit-barrier write guard that Stage
+    /// L took here is now taken inside the coordinator itself (M2c Stage P,
+    /// wired at open via `set_commit_barrier`). This is the only supported
+    /// checkpoint path; background checkpointing is never started.
     pub fn checkpoint(&self) -> Result<()> {
-        // Take the commit barrier across the whole storage checkpoint (see
-        // the field docs): commits durable before begin_lsn must have
-        // finished `clog.set_state` before the checkpoint's CLOG flush, and
-        // commits starting after must land past begin_lsn so replay
-        // rebuilds them.
-        let _barrier = self.commit_barrier.write();
         self.storage.trigger_checkpoint()?;
         Ok(())
     }
@@ -803,7 +840,14 @@ impl Engine {
         }
 
         let oid = self.catalog.oid_allocator().alloc();
-        let first_page = self.auto_commit(|snap| self.create_table_inner(snap, oid, name, schema));
+        // AccessExclusive on the fresh OID (M2c Stage P): ceremonial today
+        // — nobody else can reference an OID that was just allocated — but
+        // it fixes the DDL lock mode by construction and covers the
+        // catalog-row writes like any other DDL.
+        let first_page = self.auto_commit(|snap| {
+            self.lock_oid(snap.current_xid, oid, LockMode::AccessExclusive)?;
+            self.create_table_inner(snap, oid, name, schema)
+        });
         match first_page {
             Ok(first_page) => {
                 self.registry.write().insert(
@@ -895,6 +939,17 @@ impl Engine {
     /// row is left behind; it is keyed by the table's never-reused OID and
     /// ignored by the rebuild (leaked row, documented M2a simplification).
     ///
+    /// The registry entry is removed INSIDE the transaction, before commit
+    /// releases the AccessExclusive lock (M2c Stage P review): a DML
+    /// statement that resolved the table before the drop and queued behind
+    /// its lock must observe the removal the moment its own lock is
+    /// granted — `lock_table_entry`'s post-lock registry re-check relies on
+    /// this ordering. If the commit itself fails (WAL-fatal, process
+    /// teardown territory) the in-memory removal has already happened while
+    /// the durable pg_class row is not marked 'd': the two diverge until
+    /// restart, when the rebuild resurrects the table consistent with the
+    /// durable state.
+    ///
     /// Fails with [`EngineError::TableNotFound`] if the table does not
     /// exist.
     pub fn drop_table(&self, name: &str) -> Result<()> {
@@ -906,9 +961,16 @@ impl Engine {
             .cloned()
             .ok_or_else(|| EngineError::TableNotFound(name.to_string()))?;
 
-        self.auto_commit(|snap| self.drop_table_inner(snap, name, &entry))?;
-        self.registry.write().remove(name);
-        Ok(())
+        self.auto_commit(|snap| {
+            // AccessExclusive (§9.2): blocks — and is blocked by — every
+            // other lock mode on this table, so a DROP waits for in-flight
+            // readers/writers and new ones queue behind it (M2c Stage P).
+            self.lock_table(snap.current_xid, &entry, LockMode::AccessExclusive)?;
+            self.drop_table_inner(snap, name, &entry)?;
+            // Remove BEFORE commit releases the lock (see the fn docs).
+            self.registry.write().remove(name);
+            Ok(())
+        })
     }
 
     /// The page-freeing half of `drop_table`, inside transaction `snap`.
@@ -1012,33 +1074,52 @@ impl Engine {
         let index_oid = self.catalog.oid_allocator().alloc();
         self.ensure_index_catalog_room(&entry, column, index_oid)?;
 
-        // Collect (key_bytes, tid) from a full heap scan (M2b: simple scan,
-        // no ordering assumption on the source).
+        // The scan + bulk load + catalog write run as ONE auto-commit
+        // transaction holding the table's Exclusive lock (M2c Stage P,
+        // §9.2): Exclusive conflicts with RowExclusive, so concurrent
+        // writers block for the duration of the build instead of racing
+        // it, and the build's heap scan reads one consistent SI snapshot.
+        // Catalog rows stay LAST inside the transaction (see the fn docs
+        // for the crash-atomicity order); a failed build aborts the
+        // transaction, leaving only unreachable pages — the documented
+        // "leak, never corruption" policy.
         let col_types = column_types(&entry);
-        let snap = self.txn.snapshot(TxnId::INVALID);
-        let rows = self.heap.scan(ScanContext {
-            rel: relation_desc(&entry, &col_types),
-            snapshot: &snap,
-            clog: self.clog.as_ref(),
-        })?;
-        let mut entries = Vec::with_capacity(rows.len());
-        for (tid, values) in rows {
-            // NULL keys are not indexed (see the fn docs).
-            if let Some(datum) = &values[col_index] {
-                entries.push((encode_key(datum)?, tid));
+        let meta_page = self.auto_commit(|snap| {
+            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::Exclusive)?;
+            // Re-take the snapshot AFTER the lock wait (M2c Stage P
+            // review): `auto_commit`'s snapshot was taken before we queued
+            // on Exclusive, so a writer we blocked behind would be stuck in
+            // its `xip` and its rows would silently never enter the index.
+            // The lock guarantees no writer can be in flight now, so a
+            // fresh snapshot sees exactly the committed contents the index
+            // must cover.
+            let mut snap = self.txn.snapshot(snap.current_xid);
+            snap.advance_curcid();
+
+            // Collect (key_bytes, tid) from a full heap scan (M2b: simple
+            // scan, no ordering assumption on the source).
+            let rows = self.heap.scan(ScanContext {
+                rel: relation_desc(&entry, &col_types),
+                snapshot: &snap,
+                clog: self.clog.as_ref(),
+            })?;
+            let mut entries = Vec::with_capacity(rows.len());
+            for (tid, values) in rows {
+                // NULL keys are not indexed (see the fn docs).
+                if let Some(datum) = &values[col_index] {
+                    entries.push((encode_key(datum)?, tid));
+                }
             }
-        }
 
-        let btree = BTreeAM::new(
-            Arc::clone(self.storage.buffer_pool()),
-            Arc::clone(self.storage.wal_writer()),
-        );
-        let index = btree.build_index(index_oid, key_type, entries)?;
-        let meta_page = index.meta_page();
+            let btree = BTreeAM::new(
+                Arc::clone(self.storage.buffer_pool()),
+                Arc::clone(self.storage.wal_writer()),
+            );
+            let index = btree.build_index(index_oid, key_type, entries)?;
+            let meta_page = index.meta_page();
 
-        // Catalog rows LAST (see the fn docs for the crash-atomicity order).
-        self.auto_commit(|snap| {
-            self.create_index_catalog_rows(snap, &entry, column, index_oid, meta_page)
+            self.create_index_catalog_rows(&snap, &entry, column, index_oid, meta_page)?;
+            Ok(meta_page)
         })?;
         self.indexes.write().push(IndexEntry {
             index_oid,
@@ -1200,6 +1281,9 @@ impl Engine {
     /// transactional logic should NOT compose this API — use
     /// [`Engine::exec`] with SQL instead, which routes SELECT through
     /// `scan_inner` under the transaction snapshot.
+    ///
+    /// Takes no table lock, for the same reason as [`Engine::scan`] (no
+    /// owning transaction; M2c Stage P).
     pub fn index_lookup(&self, table: &str, column: &str, key: &Datum) -> Result<Option<Tid>> {
         let mut snap = self.txn.snapshot(TxnId::INVALID);
         snap.advance_curcid();
@@ -1229,9 +1313,16 @@ impl Engine {
             return Ok(false);
         };
         let header = TupleHeader::read_from(&bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE])?;
+        // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete: mask it
+        // off so a FOR-UPDATE-locked row stays visible (§9.1, M2c Stage P).
+        let xmax = if header.t_infomask & pg_am_heap::tuple::HEAP_XMAX_LOCK_ONLY != 0 {
+            TxnId::INVALID
+        } else {
+            header.t_xmax
+        };
         Ok(is_visible(
             header.t_xmin,
-            header.t_xmax,
+            xmax,
             header.t_cid,
             snap,
             self.clog.as_ref(),
@@ -1273,7 +1364,7 @@ impl Engine {
     /// (NULL keys are skipped, matching `create_index`).
     pub fn insert(&self, table: &str, values: &[Value]) -> Result<Tid> {
         self.auto_commit(|snap| {
-            let entry = self.table_entry(table)?;
+            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
             self.insert_inner(snap, &entry, values)
         })
     }
@@ -1311,6 +1402,12 @@ impl Engine {
     /// Scans with a real SI snapshot against the engine's CLOG: committed
     /// rows are visible, aborted or in-progress writers are not.
     /// `predicate` applies a single-column filter after visibility.
+    ///
+    /// Takes NO table lock (M2c Stage P): this snapshot-only read owns no
+    /// transaction, so there is no XID to key a lock on or a commit to
+    /// release it at. A `DROP TABLE` racing this scan is the pre-existing
+    /// documented DDL-vs-DML gap; SQL SELECT inside an explicit transaction
+    /// (`exec`) DOES take `AccessShare`.
     pub fn scan(
         &self,
         table: &str,
@@ -1348,7 +1445,10 @@ impl Engine {
     /// `(new_key, new_tid)` inserted, all in the same transaction. NULL keys
     /// are skipped on both sides.
     pub fn update(&self, table: &str, tid: Tid, values: &[Value]) -> Result<Tid> {
-        self.auto_commit(|snap| self.update_inner(snap, table, tid, values))
+        self.auto_commit(|snap| {
+            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.update_inner(snap, table, tid, values)
+        })
     }
 
     fn update_inner(
@@ -1405,7 +1505,10 @@ impl Engine {
     /// a consistent index (its `EntryNotFound` would mean the index and the
     /// table already disagreed). NULL keys are skipped.
     pub fn delete(&self, table: &str, tid: Tid) -> Result<()> {
-        self.auto_commit(|snap| self.delete_inner(snap, table, tid))
+        self.auto_commit(|snap| {
+            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.delete_inner(snap, table, tid)
+        })
     }
 
     fn delete_inner(&self, snap: &Snapshot, table: &str, tid: Tid) -> Result<()> {
@@ -1504,16 +1607,23 @@ impl Engine {
     /// commit/abort control (§21 M2b API). The snapshot is taken at this
     /// point (SI isolation); `curcid` starts at 0 and is advanced by the
     /// executor before each SQL statement.
+    ///
+    /// No commit-barrier guard is taken at begin (M2c Stage P): the barrier
+    /// protects the commit/abort hard order against the checkpoint's CLOG
+    /// flush, and `TxnManager::commit_txn`/`abort_txn` now guard themselves.
+    /// Begin + snapshot only read the active set, which checkpoints never
+    /// mutate. Begin also takes NO table locks: the first statement touching
+    /// a table acquires what it needs (`lock_table`), and commit/abort/Drop
+    /// release everything (`LockManager::release_all`).
     pub fn begin_txn(&self) -> Result<TxnHandle> {
-        let _barrier = self.commit_barrier.read();
         let xid = self.txn.begin_txn();
         let snapshot = self.txn.snapshot(xid);
         Ok(TxnHandle {
             txn: Arc::clone(&self.txn),
-            barrier: Arc::clone(&self.commit_barrier),
             xid: Some(xid),
             snapshot: RefCell::new(snapshot),
             instance_id: self.instance_id,
+            lock_manager: Arc::clone(&self.lock_manager),
             index_undo: Arc::clone(&self.index_undo),
             buffer_pool: Arc::clone(self.storage.buffer_pool()),
             wal_writer: Arc::clone(self.storage.wal_writer()),
@@ -1533,6 +1643,17 @@ impl Engine {
     /// There are no subtransactions: if a statement inside an explicit
     /// transaction fails mid-way, the rows it already wrote REMAIN in the
     /// transaction, and the only safe follow-up is [`TxnHandle::abort`].
+    ///
+    /// # Row locks: `SELECT ... FOR UPDATE` (M2c Stage P)
+    ///
+    /// A SELECT with a `FOR UPDATE` clause takes the table's `RowExclusive`
+    /// lock and stamps every result row with a lock-only `t_xmax` (§9.1);
+    /// concurrent writers/lockers of those rows block until this
+    /// transaction ends. In auto-commit mode the locks are stamped with the
+    /// statement's own short-lived transaction and released when it
+    /// commits — allowed, but only meaningful inside an explicit
+    /// transaction (same as PG). `FOR SHARE` parses but returns
+    /// [`EngineError::Unsupported`] (multixact is a later stage).
     pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
         let stmt = sql::parse(sql)?;
         match txn {
@@ -1573,7 +1694,8 @@ impl Engine {
                 rows,
             } => {
                 let count = self.auto_commit(|snap| {
-                    let entry = self.table_entry(&table)?;
+                    let entry =
+                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
                     let mut count = 0;
                     for row in &rows {
                         let values = build_insert_values(&entry, &columns, row)?;
@@ -1590,10 +1712,33 @@ impl Engine {
                 filter,
                 order_by,
                 limit,
+                lock,
             } => {
-                let mut snap = self.txn.snapshot(TxnId::INVALID);
-                snap.advance_curcid();
-                self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit)
+                match lock {
+                    // Plain auto-commit SELECT owns no transaction, so it
+                    // takes no table lock — same shape as `Engine::scan`
+                    // (see its doc). MVCC makes the read consistent; a
+                    // racing DROP TABLE is the documented DDL-vs-DML gap.
+                    None => {
+                        let mut snap = self.txn.snapshot(TxnId::INVALID);
+                        snap.advance_curcid();
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false)
+                    }
+                    // FOR UPDATE (M2c Stage P) needs a real transaction:
+                    // the row locks are stamped with its XID and the table
+                    // lock keys on it; both are released when the
+                    // auto-commit transaction ends (matching PG, where a
+                    // statement-level FOR UPDATE's locks die with the
+                    // statement).
+                    Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
+                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true)
+                    }),
+                    Some(LockClause::ForShare) => Err(EngineError::Unsupported(
+                        "SELECT ... FOR SHARE: shared row locks need multixact (deferred to a later stage, tech-selection §9.1)"
+                            .to_string(),
+                    )),
+                }
             }
             Statement::Update {
                 table,
@@ -1601,7 +1746,8 @@ impl Engine {
                 filter,
             } => {
                 let count = self.auto_commit(|snap| {
-                    let entry = self.table_entry(&table)?;
+                    let entry =
+                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
                     let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -1616,7 +1762,8 @@ impl Engine {
             }
             Statement::Delete { table, filter } => {
                 let count = self.auto_commit(|snap| {
-                    let entry = self.table_entry(&table)?;
+                    let entry =
+                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
                     let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -1663,7 +1810,7 @@ impl Engine {
                 columns,
                 rows,
             } => {
-                let entry = self.table_entry(&table)?;
+                let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let mut count = 0;
                 for row in &rows {
                     let values = build_insert_values(&entry, &columns, row)?;
@@ -1678,13 +1825,29 @@ impl Engine {
                 filter,
                 order_by,
                 limit,
-            } => self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit),
+                lock,
+            } => {
+                match lock {
+                    None => {
+                        self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false)
+                    }
+                    Some(LockClause::ForUpdate) => {
+                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true)
+                    }
+                    Some(LockClause::ForShare) => Err(EngineError::Unsupported(
+                        "SELECT ... FOR SHARE: shared row locks need multixact (deferred to a later stage, tech-selection §9.1)"
+                            .to_string(),
+                    )),
+                }
+            }
             Statement::Update {
                 table,
                 sets,
                 filter,
             } => {
-                let entry = self.table_entry(&table)?;
+                let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
@@ -1696,7 +1859,7 @@ impl Engine {
                 Ok(QueryResult::Affected(count))
             }
             Statement::Delete { table, filter } => {
-                let entry = self.table_entry(&table)?;
+                let entry = self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
                 let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                 let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
                 let mut count = 0;
@@ -1709,6 +1872,26 @@ impl Engine {
         }
     }
 
+    /// Shared SELECT execution. `lock_rows` is the M2c `FOR UPDATE` mode
+    /// (§9.1): after the scan/filter/sort/LIMIT, every surviving row is
+    /// stamped with a lock-only `t_xmax` via [`HeapAM::lock_tuple`] BEFORE
+    /// projection — locking after LIMIT matches PG (only returned rows are
+    /// locked). The caller must have already taken the statement's table
+    /// lock, and `snap.current_xid` must be a real transaction XID (auto-
+    /// commit FOR UPDATE runs inside `auto_commit` for exactly this
+    /// reason); the locks are released when that transaction ends.
+    ///
+    /// A row deleted or updated-and-committed between the scan and the
+    /// lock surfaces as `HeapError::TupleConcurrentlyUpdated` (SI write
+    /// conflict; PG would re-check via EvalPlanQual — M2c reports the
+    /// error instead, and the caller may retry with a fresh snapshot).
+    ///
+    /// Locks are taken in the final RESULT order (i.e. ORDER BY's value
+    /// order when sorting, not storage/scan order). Two transactions
+    /// locking overlapping row sets in different value orders widen the
+    /// deadlock surface; Stage P accepts this (Stage R's detector consumes
+    /// the row-wait registry to break cycles).
+    #[allow(clippy::too_many_arguments)] // mirrors the parsed Select AST fields
     fn exec_select(
         &self,
         snap: &Snapshot,
@@ -1717,6 +1900,7 @@ impl Engine {
         filter: &Option<Filter>,
         order_by: &Option<OrderBy>,
         limit: &Option<usize>,
+        lock_rows: bool,
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
         let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
@@ -1742,6 +1926,11 @@ impl Engine {
         }
         if let Some(n) = limit {
             rows.truncate(*n);
+        }
+        if lock_rows {
+            for (tid, _) in &rows {
+                self.heap.lock_tuple(*tid, snap, self.clog.as_ref())?;
+            }
         }
         let (col_names, projected) = match columns {
             SelectCols::All => {
@@ -1782,14 +1971,27 @@ impl Engine {
     /// On error the transaction's index maintenance is reverse-applied from
     /// the undo log (Stage O review) and the transaction is aborted
     /// best-effort; the *original* error is returned.
+    ///
+    /// The commit/abort barrier guard lives inside `TxnManager` (M2c Stage
+    /// P), so this wrapper no longer takes one itself. Table locks acquired
+    /// by `op` are released by `release_all` at the end of BOTH the success
+    /// and the failure path (2PL release point, M2c Stage P).
+    ///
+    /// # Panic policy
+    ///
+    /// A panic inside `op` skips `release_all` (and the abort path): the
+    /// transaction's XID and table locks leak. That is deliberate — a
+    /// panic mid-transaction leaves in-memory state no one can vouch for,
+    /// and the process-level failure policy (same as a WAL-fatal error)
+    /// applies rather than a best-effort cleanup that might make it worse.
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
-        let _barrier = self.commit_barrier.read();
         let xid = self.txn.begin_txn();
         let mut snap = self.txn.snapshot(xid);
         snap.advance_curcid();
         match op(&snap) {
             Ok(v) => {
                 let result = self.txn.commit_txn(xid);
+                self.lock_manager.release_all(xid);
                 // Discard the undo log either way (see TxnHandle::commit).
                 self.index_undo.lock().remove(&xid);
                 result?;
@@ -1805,6 +2007,7 @@ impl Engine {
                 if let Err(abort_err) = self.txn.abort_txn(xid) {
                     tracing::warn!(error = %abort_err, "auto-commit abort failed");
                 }
+                self.lock_manager.release_all(xid);
                 Err(e)
             }
         }
@@ -1919,6 +2122,52 @@ impl Engine {
             .ok_or_else(|| EngineError::TableNotFound(table.to_string()))
     }
 
+    /// Acquire the statement's table lock (M2c Stage P, §9.2) — called
+    /// after the TableEntry is resolved, before any data is touched. Locks
+    /// key by XID and are held to transaction end (`release_all` at
+    /// commit/abort; 2PL, no downgrade). Re-acquisition upgrades in place,
+    /// so calling this per statement is cheap and idempotent.
+    ///
+    /// Always the blocking `acquire`: Stage P has no NOWAIT and no deadlock
+    /// detector (Stage R), so a table-lock cycle — e.g. two transactions
+    /// upgrading `AccessShare` → `RowExclusive` on the same table — wedges
+    /// the participants instead of erroring.
+    fn lock_table(&self, xid: TxnId, entry: &TableEntry, mode: LockMode) -> Result<()> {
+        self.lock_oid(xid, entry.oid, mode)
+    }
+
+    /// [`Self::lock_table`] by OID, for DDL that acts on a table before /
+    /// without a registry entry (e.g. `create_table` locks its fresh OID).
+    fn lock_oid(&self, xid: TxnId, table: Oid, mode: LockMode) -> Result<()> {
+        Ok(self.lock_manager.acquire(xid, table, mode)?)
+    }
+
+    /// Resolve `table` and acquire `mode` on it, closing the
+    /// resolution→acquisition TOCTOU (M2c Stage P review): without the
+    /// post-lock re-check, a `drop_table` could complete in the window —
+    /// freeing the table's pages for reuse — while the statement goes on
+    /// to read/write them through the stale entry. The re-check is
+    /// authoritative because `drop_table` removes the registry entry
+    /// BEFORE releasing its AccessExclusive lock: once our lock is
+    /// granted, a missing (or rebound-to-another-OID) name means the table
+    /// we resolved was dropped while we waited — fail with
+    /// [`EngineError::TableNotFound`]; the lock we took on the dead OID is
+    /// released by the caller's normal commit/abort path.
+    fn lock_table_entry(&self, xid: TxnId, table: &str, mode: LockMode) -> Result<TableEntry> {
+        let entry = self.table_entry(table)?;
+        self.lock_table(xid, &entry, mode)?;
+        let current = self
+            .registry
+            .read()
+            .get(table)
+            .cloned()
+            .ok_or_else(|| EngineError::TableNotFound(table.to_string()))?;
+        if current.oid != entry.oid {
+            return Err(EngineError::TableNotFound(table.to_string()));
+        }
+        Ok(current)
+    }
+
     /// A cloned registry entry for `table` (testing / advanced use, e.g.
     /// building a [`RelationDesc`] to drive the heap AM directly).
     pub fn describe_table(&self, table: &str) -> Option<TableEntry> {
@@ -1938,18 +2187,30 @@ impl Engine {
     /// The transaction manager (testing / advanced use, e.g. driving an
     /// explicit abort through the engine's own CLOG).
     ///
-    /// **Caveat — the commit barrier does NOT cover this back door** (Stage L
-    /// review): `commit_txn` / `abort_txn` called directly here can race
-    /// [`Engine::checkpoint`], and a commit whose WAL append lands before the
-    /// checkpoint's `begin_lsn` while its `set_state` lands after the
-    /// checkpoint's CLOG `flush_dirty` is present in neither the fsynced CLOG
-    /// nor the replay — the row reads `InProgress` after a restart. Only the
-    /// engine's auto-commit path (`insert` / `update` / `delete` / DDL)
-    /// takes the barrier read guard. Using this handle for commits
-    /// concurrent with `Engine::checkpoint` is undefined behavior; M2c will
-    /// sink the barrier into `TxnManager` itself.
+    /// Direct `commit_txn` / `abort_txn` through this handle is safe with
+    /// respect to checkpoints (M2c Stage P): the manager takes its own
+    /// commit-barrier read guard internally, and the checkpoint coordinator
+    /// holds the matching write guard — the Stage L caveat about racing
+    /// [`Engine::checkpoint`] through this back door is resolved by
+    /// construction.
+    ///
+    /// # WARNING: table locks
+    ///
+    /// A raw `commit_txn` / `abort_txn` does NOT release the transaction's
+    /// table locks (the `LockManager` lives at the engine layer). Pair any
+    /// back-door commit/abort with `lock_manager().release_all(xid)`, or
+    /// the transaction's `RowExclusive` etc. grants linger forever and
+    /// later DDL on those tables wedges.
     pub fn txn_manager(&self) -> &TxnManager {
         &self.txn
+    }
+
+    /// The table lock manager (testing / observability, M2c Stage P):
+    /// `is_granted` / `held_by` / `table_lock_state` let tests observe
+    /// grants and wait queues; `release_all` pairs with back-door
+    /// commits through [`Self::txn_manager`] (see its doc).
+    pub fn lock_manager(&self) -> &LockManager {
+        &self.lock_manager
     }
 
     /// The engine's disk CLOG (testing / advanced use).

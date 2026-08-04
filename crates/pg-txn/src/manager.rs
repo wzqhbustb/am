@@ -32,11 +32,12 @@
 //! to the commit record, and the LSN clock is monotonic, so every earlier
 //! `PageAlloc`/`PageFree` LSN is covered.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
+use thiserror::Error;
 
 use pg_storage::clog::{ClogAccessor, TxnState};
 use pg_storage::error::Result;
@@ -70,6 +71,64 @@ impl CommitWal for WalWriter {
     }
 }
 
+/// Errors from transaction wait operations (M2c Stage P).
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TxnError {
+    /// A transaction asked to wait on itself. That is always a caller bug:
+    /// the row-lock protocol (§9.1) only ever waits on a *different* XID
+    /// read from a tuple's `t_xmax`.
+    #[error("transaction {0} cannot wait on itself")]
+    SelfWait(TxnId),
+}
+
+/// The row-lock wait capability the heap AM's §9.1 5-step protocol needs
+/// (M2c Stage P).
+///
+/// Implemented by [`TxnManager`]; declared as a separate trait so
+/// `pg-am-heap` depends on the narrow register/wait surface instead of the
+/// concrete manager type, and so AM tests can inject a fake. The protocol's
+/// ordering requirements are on the methods.
+pub trait RowWaiter: std::fmt::Debug + Send + Sync {
+    /// Register the wait edge `self_xid → blocking_xid` (§9.1 step 5a).
+    ///
+    /// The caller MUST invoke this while still holding the page latch under
+    /// which it read `blocking_xid` from the tuple's `t_xmax`, and MUST NOT
+    /// release that latch before the call returns — registration before
+    /// latch release is what makes the subsequent [`RowWaiter::wait_for`]
+    /// wakeup unmissable.
+    fn register_row_wait(&self, self_xid: TxnId, blocking_xid: TxnId);
+
+    /// Drop `self_xid`'s wait edge without waiting (caller-side cleanup on
+    /// paths that leave the protocol without a completed
+    /// [`RowWaiter::wait_for`], which otherwise clears the edge itself).
+    fn unregister_row_wait(&self, self_xid: TxnId);
+
+    /// Block until `blocking_xid` commits or aborts (§9.1 step 5c). The
+    /// caller must hold NO page latch while blocked. Clears the wait edge
+    /// on success.
+    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId)
+        -> std::result::Result<(), TxnError>;
+
+    /// Is `xid` a live, in-flight transaction?
+    ///
+    /// The gate needs this to distinguish a genuinely active stamper (wait
+    /// on it) from one whose CLOG entry reads `InProgress` but whose XID is
+    /// gone from the active set. That combination has TWO causes, and the
+    /// caller must tell them apart by RE-READING the CLOG after a `false`
+    /// return:
+    ///
+    /// - the stamper ended between the caller's CLOG read and this check
+    ///   (normal race): `end_txn` flips the CLOG bit BEFORE removing the
+    ///   XID, so observing not-active orders the caller after the terminal
+    ///   write and the CLOG re-read yields the terminal state;
+    /// - the stamper CRASHED (post-recovery; recovery-end ATT abort
+    ///   marking is still open, §11.3): the re-read still says
+    ///   `InProgress`, and — WAL replay having rebuilt every durable
+    ///   commit's bit — the stamp must be treated as aborted, never waited
+    ///   on (waiting would return instantly and the gate would spin).
+    fn is_active(&self, xid: TxnId) -> bool;
+}
+
 /// Coordinates XID allocation and durable commit/abort for M2a.
 ///
 /// Cheap to clone conceptually via `Arc`; hold a single instance per engine
@@ -82,6 +141,24 @@ pub struct TxnManager {
     clog: Arc<dyn ClogAccessor>,
     /// XIDs that have begun but not yet committed or aborted.
     active: Mutex<HashSet<TxnId>>,
+    /// Commit/checkpoint barrier (M2c Stage P: sunk down from pg-engine,
+    /// where it was introduced in Stage L). `commit_txn` / `abort_txn` hold
+    /// a READ guard for their whole hard order; the checkpoint coordinator
+    /// in pg-storage takes the WRITE guard across the checkpoint critical
+    /// section (ATT sampling + CLOG flush, via `set_commit_barrier`). This
+    /// closes the "neither snapshot nor replay" window by construction: a
+    /// commit durable before the checkpoint's `begin_lsn` has finished its
+    /// `clog.set_state` before the checkpoint's CLOG flush runs (its bit is
+    /// fsynced), and a commit starting after lands past `begin_lsn` (replay
+    /// rebuilds it).
+    commit_barrier: Arc<RwLock<()>>,
+    /// Row-lock wait registry (§9.1 step 5a): waiter XID → the XID it is
+    /// blocked on. Paired with `row_wait_cv`; waiters clear their own entry
+    /// when their wait completes ([`Self::wait_for`]).
+    row_wait_registry: Mutex<HashMap<TxnId, TxnId>>,
+    /// Broadcast on every commit/abort (see [`Self::end_txn`]) so row-lock
+    /// waiters re-check whether their blocking XID left the active set.
+    row_wait_cv: Condvar,
 }
 
 impl TxnManager {
@@ -96,7 +173,19 @@ impl TxnManager {
             wal,
             clog,
             active: Mutex::new(HashSet::new()),
+            commit_barrier: Arc::new(RwLock::new(())),
+            row_wait_registry: Mutex::new(HashMap::new()),
+            row_wait_cv: Condvar::new(),
         }
+    }
+
+    /// The commit/checkpoint barrier (M2c Stage P). The engine installs
+    /// this into the pg-storage checkpoint coordinator
+    /// (`CheckpointCoordinator::set_commit_barrier`) at open time so every
+    /// checkpoint's ATT sampling + CLOG flush runs under the write guard
+    /// while commits/aborts run under read guards.
+    pub fn commit_barrier(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.commit_barrier)
     }
 
     /// Begin a transaction: allocate a fresh XID and mark it active.
@@ -126,6 +215,15 @@ impl TxnManager {
     /// Returns an error (leaving the CLOG bit unflipped) if the WAL append or
     /// fsync fails, so a non-durable commit is never observable as committed.
     ///
+    /// # Table locks are NOT released here
+    ///
+    /// The manager knows nothing about the table `LockManager` (it lives in
+    /// pg-engine, keyed by XID). Callers that acquired table locks through
+    /// the engine MUST pair this with `LockManager::release_all(xid)` — the
+    /// engine's `TxnHandle::commit` / `auto_commit` do so; a raw
+    /// `commit_txn` through `Engine::txn_manager()` leaves the transaction's
+    /// table locks behind, which later DDL (`AccessExclusive`) wedges on.
+    ///
     /// # Failure semantics of the active set
     ///
     /// If step 1 or step 2 fails, `xid` is left in the active set on purpose.
@@ -147,14 +245,21 @@ impl TxnManager {
     /// The reverse order (remove-then-set) would open a window where the XID is
     /// neither active nor yet Committed, i.e. momentarily invisible as either.
     pub fn commit_txn(&self, xid: TxnId) -> Result<()> {
+        // Commit-barrier read guard for the WHOLE hard order (M2c Stage P):
+        // a checkpoint holds the write guard across its ATT sampling + CLOG
+        // flush, so this commit's `set_state` can never land in the window
+        // where it would be present in neither the fsynced CLOG nor the
+        // replay. The guard is taken here, inside the manager, so every
+        // caller — engine auto-commit, explicit TxnHandle, or direct
+        // `txn_manager()` access — is covered by construction.
+        let _barrier = self.commit_barrier.read();
         // 1. Append the commit record.
         let lsn = self.wal.append(WalRecord::txn_commit(xid)?)?;
         // 2. fsync it — the commit becomes durable here.
         self.wal.flush_to(lsn)?;
         // 3. Flip the in-memory CLOG bit (only after the record is durable).
-        self.clog.set_state(xid, TxnState::Committed);
-        // 4. Drop the XID from the active set (after the CLOG bit; see doc).
-        self.active.lock().remove(&xid);
+        // 4. Drop the XID from the active set and wake row-lock waiters.
+        self.end_txn(xid, TxnState::Committed);
         Ok(())
     }
 
@@ -165,13 +270,140 @@ impl TxnManager {
     ///
     /// Failure and ordering semantics mirror [`Self::commit_txn`]: on a WAL
     /// error `xid` stays active (the abort is not durable), and the CLOG bit is
-    /// set before the active-set removal.
+    /// set before the active-set removal. The same table-lock caveat applies:
+    /// raw callers must pair this with `LockManager::release_all(xid)` (see
+    /// [`Self::commit_txn`]).
     pub fn abort_txn(&self, xid: TxnId) -> Result<()> {
+        // Same commit-barrier read guard as commit_txn (see there).
+        let _barrier = self.commit_barrier.read();
         let lsn = self.wal.append(WalRecord::txn_abort(xid)?)?;
         self.wal.flush_to(lsn)?;
-        self.clog.set_state(xid, TxnState::Aborted);
-        self.active.lock().remove(&xid);
+        self.end_txn(xid, TxnState::Aborted);
         Ok(())
+    }
+
+    /// The shared tail of commit/abort: flip the CLOG bit, drop the XID
+    /// from the active set, then broadcast to row-lock waiters (§9.1 step
+    /// 5d, M2c Stage P).
+    ///
+    /// # Broadcast ordering requirement
+    ///
+    /// The `notify_all` runs strictly AFTER `clog.set_state` (and after the
+    /// active-set removal): a woken waiter that re-reads the CLOG must see
+    /// the terminal state, never a stale `InProgress` that would send it
+    /// back to sleep on a condvar nobody will signal again. The broadcast
+    /// itself is delivered under the registry mutex — `wait_for` checks its
+    /// predicate and sleeps atomically with respect to that mutex, so the
+    /// removal-then-notify sequence cannot be missed (a waiter either sees
+    /// the XID gone before sleeping, or is woken after it).
+    ///
+    /// Registry *entries* are not touched here: each waiter clears its own
+    /// edge on wake (`wait_for` removes it), which keeps the wait-for graph
+    /// free of stale edges without end_txn having to scan for them.
+    ///
+    /// # Lock order
+    ///
+    /// The active-set and registry mutexes are taken SEQUENTIALLY here,
+    /// never nested; the only nested direction anywhere in this manager is
+    /// registry → active (inside [`Self::wait_for`]), so no inversion is
+    /// possible.
+    fn end_txn(&self, xid: TxnId, state: TxnState) {
+        self.clog.set_state(xid, state);
+        // Active-set removal AFTER the CLOG bit; see the commit_txn doc on
+        // the step 3/4 ordering argument.
+        self.active.lock().remove(&xid);
+        // Wake row-lock waiters (§9.1 5d) AFTER the terminal state is
+        // visible; see the ordering doc above.
+        let _registry = self.row_wait_registry.lock();
+        self.row_wait_cv.notify_all();
+    }
+
+    /// Register a row-lock wait edge (§9.1 step 5a): `self_xid` is about to
+    /// block on `blocking_xid`. Idempotent — re-registering the same waiter
+    /// overwrites its edge, matching the protocol's restart-from-step-1
+    /// loop where a waiter may re-block on a *different* XID.
+    pub fn register_row_wait(&self, self_xid: TxnId, blocking_xid: TxnId) {
+        self.row_wait_registry.lock().insert(self_xid, blocking_xid);
+    }
+
+    /// Drop `self_xid`'s wait edge, if any. Called on paths that leave the
+    /// wait protocol without going through [`Self::wait_for`] (e.g. the
+    /// caller aborts); `wait_for` itself clears the edge on completion.
+    pub fn unregister_row_wait(&self, self_xid: TxnId) {
+        self.row_wait_registry.lock().remove(&self_xid);
+    }
+
+    /// Snapshot of all row-lock wait edges `(waiter, waiting_on)` — the
+    /// row-lock half of Stage R's wait-for graph (the table-lock half comes
+    /// from `LockManager::table_lock_state`).
+    pub fn wait_edges(&self) -> Vec<(TxnId, TxnId)> {
+        let mut edges: Vec<(TxnId, TxnId)> = self
+            .row_wait_registry
+            .lock()
+            .iter()
+            .map(|(&w, &b)| (w, b))
+            .collect();
+        edges.sort_unstable();
+        edges
+    }
+
+    /// Block until `blocking_xid` leaves the active set (§9.1 step 5c).
+    ///
+    /// Returns immediately when `blocking_xid` is already terminated
+    /// (committed/aborted XIDs are removed from the active set by
+    /// [`Self::end_txn`]). Spurious wakeups are handled by looping on the
+    /// predicate; the only wakeup source is `end_txn`'s broadcast.
+    ///
+    /// While blocked this holds NO `TxnManager` lock except the registry
+    /// mutex the condvar releases — the active set, CLOG, and WAL stay
+    /// available to the blocking transaction's own commit/abort, which is
+    /// exactly the progress the waiter is sleeping on.
+    ///
+    /// # Lock order
+    ///
+    /// The only legal nesting is registry → active (this function holds the
+    /// registry mutex and takes the active mutex inside it). `end_txn`
+    /// takes the two sequentially, never nested, so it cannot invert the
+    /// order.
+    ///
+    /// # Non-returning waits
+    ///
+    /// There is no timeout and no interruption: if the blocking
+    /// transaction's commit/abort never completes — e.g. its WAL fsync
+    /// failed and the process is tearing down (the WAL writer marks itself
+    /// shut down on fsync failure) — this wait never returns. That is a
+    /// process-level failure policy, not a liveness bug: the waiter's own
+    /// transaction cannot make meaningful progress in a tearing-down
+    /// process either.
+    ///
+    /// TODO(Stage R): the deadlock detector must be able to break a wait —
+    /// a victim selected for abort is typically blocked inside this
+    /// function. Add an interruption/timeout channel (e.g. a victim flag
+    /// checked alongside the predicate, or `wait_timeout` with re-check)
+    /// when the detector lands.
+    ///
+    /// On success the waiter's registry edge is cleared (§9.1: waiters
+    /// clear their own entries on wake).
+    ///
+    /// # Errors
+    ///
+    /// [`TxnError::SelfWait`] if `self_xid == blocking_xid` — a transaction
+    /// waiting on itself is a caller bug, not a schedulable state.
+    pub fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError> {
+        if self_xid == blocking_xid {
+            return Err(TxnError::SelfWait(self_xid));
+        }
+        let mut registry = self.row_wait_registry.lock();
+        loop {
+            // Predicate: the blocking XID has left the active set. Checked
+            // while holding the registry mutex; `end_txn` notifies under
+            // the same mutex after removing the XID, so no wakeup is lost.
+            if !self.active.lock().contains(&blocking_xid) {
+                registry.remove(&self_xid);
+                return Ok(());
+            }
+            self.row_wait_cv.wait(&mut registry);
+        }
     }
 
     /// Snapshot of the currently active XIDs (test/observability helper).
@@ -179,6 +411,13 @@ impl TxnManager {
         let mut v: Vec<TxnId> = self.active.lock().iter().copied().collect();
         v.sort_unstable();
         v
+    }
+
+    /// Is `xid` a live, in-flight transaction? See [`RowWaiter::is_active`]
+    /// for how the row-lock gate uses this to tell a crashed stamper from
+    /// an active one.
+    pub fn is_active(&self, xid: TxnId) -> bool {
+        self.active.lock().contains(&xid)
     }
     /// Take a real Snapshot-Isolation snapshot for `current_xid`
     /// (tech-selection §7.1).
@@ -240,6 +479,27 @@ impl pg_storage::recovery::AttProvider for TxnManager {
         // Delegates to the inherent method (sorted), so the ATT snapshot
         // file is deterministic.
         TxnManager::active_xids(self)
+    }
+}
+
+/// The heap AM's row-lock protocol (§9.1 step 5) drives the manager through
+/// this narrow surface; every method delegates to the inherent implementation
+/// documented there.
+impl RowWaiter for TxnManager {
+    fn register_row_wait(&self, self_xid: TxnId, blocking_xid: TxnId) {
+        TxnManager::register_row_wait(self, self_xid, blocking_xid);
+    }
+
+    fn unregister_row_wait(&self, self_xid: TxnId) {
+        TxnManager::unregister_row_wait(self, self_xid);
+    }
+
+    fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError> {
+        TxnManager::wait_for(self, self_xid, blocking_xid)
+    }
+
+    fn is_active(&self, xid: TxnId) -> bool {
+        TxnManager::is_active(self, xid)
     }
 }
 

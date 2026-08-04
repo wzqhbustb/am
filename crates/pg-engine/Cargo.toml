@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "m2b_perf"
 harness = false
+
+[[bench]]
+name = "m2c_locks"
+harness = false

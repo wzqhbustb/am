@@ -25,8 +25,19 @@
 //! its full §7.1 field set (`xip: SmallVec<[TxnId; 32]>`, `curcid`),
 //! [`TxnManager::snapshot`] produces real SI snapshots, and
 //! [`visibility::PgVisibilityOracle`] implements the complete §7.2 textbook
-//! judgment including the `t_cid`/`curcid` self-command branches. The lock
-//! manager arrives later.
+//! judgment including the `t_cid`/`curcid` self-command branches.
+//!
+//! # M2c scope (Stage P)
+//!
+//! Stage P adds the lock surface: [`lock_manager::LockManager`] provides the
+//! four table-level lock modes (tech-selection §9.2) with FIFO fair waiting,
+//! and [`TxnManager`] grows the row-lock wait protocol (§9.1): the
+//! `row_wait_registry`, `register_row_wait` / `wait_for` / `wait_edges`, and
+//! the `end_txn` wakeup broadcast. The heap AM consumes that protocol
+//! through the narrow [`manager::RowWaiter`] trait (register + wait), which
+//! [`TxnManager`] implements. The commit/checkpoint barrier is sunk into
+//! [`TxnManager`] itself, so commits are serialized against checkpoint CLOG
+//! flushes by construction. Deadlock *detection* is Stage R.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -34,6 +45,7 @@
 pub mod clog_buffer;
 pub mod clog_file;
 pub mod clog_mem;
+pub mod lock_manager;
 pub mod manager;
 pub mod redo;
 pub mod snapshot;
@@ -41,7 +53,8 @@ pub mod visibility;
 
 pub use clog_buffer::ClogBuffer;
 pub use clog_mem::InMemoryClogAccessor;
-pub use manager::{CommitWal, TxnManager};
+pub use lock_manager::{LockError, LockManager, LockMode, TableLockState};
+pub use manager::{CommitWal, RowWaiter, TxnError, TxnManager};
 pub use pg_storage::clog::{ClogAccessor, TxnState};
 pub use redo::txn_redo_handlers;
 pub use snapshot::Snapshot;

@@ -62,6 +62,53 @@
 //! [`SlottedPage::add_tuple`] always *appends* on a heap page (no `Unused` slot
 //! to recycle), so the slot it returns is deterministically `slot_count`. Redo
 //! relies on this to reproduce identical slots without a slot-addressed writer.
+//!
+//! # Row-lock `t_xmax` protocol (M2c Stage P, tech-selection §9.1)
+//!
+//! Write-write arbitration on a row lives in its `t_xmax`: any non-INVALID
+//! `t_xmax` — a real delete/update stamp OR a [`HEAP_XMAX_LOCK_ONLY`] stamp
+//! (`SELECT ... FOR UPDATE`) — means "row locked". A writer reaching a row
+//! runs the 5-step protocol ([`HeapAM::row_lock_gate`] + the restart loops
+//! in `delete` / `update` / [`HeapAM::lock_tuple`]):
+//!
+//! 1. under the page write latch, read `t_xmax`;
+//! 2. `t_xmax == INVALID` or `== self` → stamp immediately (the latch
+//!    serializes check and stamp, so the pair IS the "CAS" of §9.1);
+//! 3. `t_xmax` of a COMMITTED real deleter →
+//!    [`HeapError::TupleConcurrentlyUpdated`] (the addressed version is
+//!    dead; distinct from "row does not exist"). A committed LOCK_ONLY
+//!    stamp is NOT a delete: the row stays modifiable and the stamp is
+//!    simply overwritten;
+//! 4. `t_xmax` of an ABORTED stamper → overwrite, same as step 2;
+//! 5. `t_xmax` of a still-active OTHER transaction → register the wait edge
+//!    in the `TxnManager`'s `row_wait_registry` WHILE STILL HOLDING THE
+//!    LATCH (step 5a), then release the latch (5b), block in
+//!    `TxnManager::wait_for` (5c) until the holder's commit/abort broadcast
+//!    (5d), and restart from step 1 (5e).
+//!
+//! Registration strictly precedes latch release, so the wakeup can never be
+//! missed: the holder's `end_txn` broadcast is serialized against the
+//! registry by its mutex, and the latch serializes the stamper against any
+//! state change of `t_xmax`.
+//!
+//! ## Backward compatibility (no waiter installed)
+//!
+//! The wait capability arrives via [`HeapAM::set_row_waiter`] (the engine
+//! installs the `TxnManager` at open). A `HeapAM` WITHOUT a waiter — every
+//! pre-Stage-P construction site — keeps the old "first-writer-wins +
+//! second-writer-errors" behavior: any non-INVALID, non-ABORTED `t_xmax`
+//! (committed OR in-progress) is rejected with [`HeapError::TupleNotFound`]
+//! instead of waiting, and no `TupleConcurrentlyUpdated` is produced.
+//!
+//! ## Lock-only stamps and visibility
+//!
+//! A [`HEAP_XMAX_LOCK_ONLY`] stamp is a lock, not a delete: scan/visibility
+//! paths mask it to INVALID before judging ([`visibility_xmax`]), so a
+//! locked row reads as live for everyone. Lock-only stamps are NOT
+//! WAL-logged (PostgreSQL does not log row locks either): they are
+//! transient concurrency markers whose meaning ends with the stamper's
+//! transaction, and a stamp that survives a crash reads as an in-progress
+//! or aborted XID — never hiding the row.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -74,7 +121,7 @@ use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::WalWriter;
 
-use pg_txn::is_visible;
+use pg_txn::{is_visible, RowWaiter, Snapshot};
 
 use crate::access_method::{
     AccessMethod, DeleteContext, InsertContext, RelationDesc, ScanContext, UpdatableAM,
@@ -84,7 +131,9 @@ use crate::error::{HeapError, Result};
 use crate::line_pointer::{LpFlags, LINE_POINTER_SIZE};
 use crate::redo::{HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
-use crate::tuple::{decode_tuple, TupleHeader, HEAP_UPDATED, TUPLE_HEADER_SIZE};
+use crate::tuple::{
+    decode_tuple, TupleHeader, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
+};
 
 /// Largest tuple that can ever fit on a heap page (page minus special space,
 /// header, and one LP).
@@ -107,6 +156,11 @@ pub struct HeapAM {
     /// holding a page latch, so it cannot deadlock with the update path
     /// (which takes page latches but never this lock).
     extend_lock: Mutex<()>,
+    /// Row-lock wait capability for the §9.1 5-step protocol (M2c Stage P),
+    /// installed by the engine via [`Self::set_row_waiter`]. `None` keeps
+    /// the pre-Stage-P "second-writer-errors" behavior — see the module
+    /// docs' backward-compatibility section.
+    row_waiter: Option<Arc<dyn RowWaiter>>,
 }
 
 impl HeapAM {
@@ -117,7 +171,16 @@ impl HeapAM {
             wal_writer,
             pages: Mutex::new(HashMap::new()),
             extend_lock: Mutex::new(()),
+            row_waiter: None,
         }
+    }
+
+    /// Install the row-lock wait capability (M2c Stage P). Called once by
+    /// the engine at open time, before the AM is shared: the field is a
+    /// plain `Option`, so installing requires `&mut self` and cannot race
+    /// concurrent use.
+    pub fn set_row_waiter(&mut self, waiter: Arc<dyn RowWaiter>) {
+        self.row_waiter = Some(waiter);
     }
 
     /// Allocate and initialize a relation's first heap page, tracking it as a
@@ -391,37 +454,273 @@ impl HeapAM {
         if updated {
             header.t_infomask |= HEAP_UPDATED;
         }
+        // A real delete/update supersedes any lock-only stamp on the row
+        // (e.g. `SELECT ... FOR UPDATE` followed by DELETE in the same
+        // transaction): leaving LOCK_ONLY set would mask the delete from
+        // visibility checks and resurrect the row for scans.
+        header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
         Ok(())
     }
 
-    /// Read the tuple header at `tid`'s slot, or [`HeapError::TupleNotFound`]
-    /// if the tuple is not live.
+    /// §9.1 steps 1–5a of the row-lock protocol: read the tuple header at
+    /// `tid`'s slot (under the page write latch the caller holds) and decide
+    /// whether the caller may stamp the tuple.
     ///
-    /// Liveness is LP `Normal` **and** the tuple is not *effectively*
-    /// deleted: `t_xmax == INVALID`, or the stamping deleter ABORTED (its
-    /// delete never took effect, so the tuple may be deleted/updated again —
-    /// without consulting the CLOG such a tuple would stay visible yet be
-    /// permanently unmodifiable). A tuple whose deleter COMMITTED is dead
-    /// (`TupleNotFound`); one whose deleter is still IN_PROGRESS is also
-    /// rejected — overwriting its stamp would resurrect the row if the
-    /// original deleter commits and the overwriter aborts (M2a has no
-    /// wait-for-xmax machinery; callers may retry once it resolves).
-    fn live_tuple_header(
+    /// `self_xid` is the writer's own XID (`snapshot.current_xid`) — the
+    /// row-lock identity. A `t_xmax` naming `self_xid` is a self-conflict:
+    /// the caller already locked/deleted/updated this row version inside its
+    /// own transaction and simply proceeds (never waits on itself).
+    ///
+    /// `for_lock` marks the lock-only acquisition path
+    /// ([`Self::lock_tuple`]): re-stamping a row whose existing stamp is my
+    /// own REAL delete/update (not [`HEAP_XMAX_LOCK_ONLY`]) would re-add the
+    /// lock-only bit on top of a delete stamp, and the visibility mask
+    /// would then resurrect the row — so that combination is rejected and
+    /// only idempotent re-locking of my own LOCK_ONLY stamp proceeds.
+    /// Delete/update pass `false` (overwriting their own stamp is the
+    /// normal same-transaction re-write).
+    ///
+    /// When the verdict is [`RowLockGate::Wait`] the wait edge
+    /// (`self_xid → t_xmax`) is registered BEFORE this function returns —
+    /// i.e. still under the latch — so the caller releasing the latch and
+    /// sleeping cannot miss the blocker's commit/abort broadcast (the
+    /// step-5a-before-5b ordering, see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// - [`HeapError::TupleNotFound`]: the slot does not hold a live
+    ///   (`Normal`) tuple. ALSO the legacy no-waiter behavior for a
+    ///   committed or in-progress `t_xmax` (module docs, backward
+    ///   compatibility).
+    /// - [`HeapError::TupleConcurrentlyUpdated`] (§9.1 step 3): `t_xmax` is
+    ///   a REAL delete/update stamp (not [`HEAP_XMAX_LOCK_ONLY`]) whose
+    ///   transaction COMMITTED — the addressed row version is dead. A
+    ///   committed LOCK_ONLY stamp is not a delete: the row stays
+    ///   modifiable and the stamp is overwritten (Proceed).
+    /// - [`HeapError::InvalidArgument`] (`for_lock` only): the row already
+    ///   carries MY real delete/update stamp (see above).
+    fn row_lock_gate(
+        &self,
         page: &[u8; PAGE_SIZE],
         tid: Tid,
+        self_xid: TxnId,
         clog: &dyn ClogAccessor,
-    ) -> Result<TupleHeader> {
+        for_lock: bool,
+    ) -> Result<RowLockGate> {
         let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
         if lp.flags() != LpFlags::Normal {
             return Err(HeapError::TupleNotFound(tid));
         }
         let off = lp.off() as usize;
         let header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
-        if header.t_xmax != TxnId::INVALID && clog.get_state(header.t_xmax) != TxnState::Aborted {
+        let xmax = header.t_xmax;
+        // Step 2 (no stamp yet) / self-conflict (my own stamp).
+        if xmax == TxnId::INVALID || xmax == self_xid {
+            if for_lock && xmax == self_xid && header.t_infomask & HEAP_XMAX_LOCK_ONLY == 0 {
+                return Err(HeapError::InvalidArgument(format!(
+                    "cannot lock {tid:?}: row version already deleted or updated by this transaction"
+                )));
+            }
+            return Ok(RowLockGate::Proceed);
+        }
+        let lock_only = header.t_infomask & HEAP_XMAX_LOCK_ONLY != 0;
+        let mut state = clog.get_state(xmax);
+        if matches!(state, TxnState::InProgress | TxnState::SubCommitted) {
+            // Step 5a: the holder LOOKS active. `SubCommitted` (M3-reserved,
+            // never produced in M2) folds in here: a sub-committed stamper's
+            // parent may still abort, so it is "not terminally committed",
+            // matching the visibility oracle's `!= Committed` treatment.
+            match &self.row_waiter {
+                Some(waiter) => {
+                    if waiter.is_active(xmax) {
+                        // Genuinely active holder: register the wait edge
+                        // UNDER THE LATCH; the caller releases latches and
+                        // blocks (steps 5b/5c).
+                        waiter.register_row_wait(self_xid, xmax);
+                        return Ok(RowLockGate::Wait(xmax));
+                    }
+                    // Not active despite the InProgress CLOG read. Two
+                    // cases:
+                    //
+                    // - The stamper ENDED between our CLOG read and the
+                    //   active-set check (normal race): `end_txn` flips the
+                    //   CLOG bit BEFORE removing the XID from the active
+                    //   set, so observing not-active orders us after the
+                    //   terminal write — re-reading the CLOG now yields the
+                    //   terminal state, which the match below handles.
+                    // - The stamper CRASHED (post-recovery; recovery-end
+                    //   ATT abort marking is still open, §11.3): the CLOG
+                    //   re-read still says InProgress. WAL replay rebuilt
+                    //   every durable commit's bit, so this means "never
+                    //   committed" — treat the stamp as aborted (Proceed).
+                    //   Waiting would spin forever on a transaction that
+                    //   can never end.
+                    state = clog.get_state(xmax);
+                }
+                None => return Err(HeapError::TupleNotFound(tid)), // legacy mode
+            }
+        }
+        match state {
+            // Step 4: the stamp never took effect (or its stamper crashed);
+            // overwrite it. A terminal LOCK_ONLY stamp (committed or
+            // aborted) lands in the Proceed arms too — a lock is not a
+            // delete, so the row stays modifiable.
+            TxnState::Aborted => Ok(RowLockGate::Proceed),
+            // InProgress/SubCommitted here is only reachable via the
+            // crashed-stamper re-read above (a live holder took the `Wait`
+            // early return; legacy mode returned already).
+            TxnState::InProgress | TxnState::SubCommitted => Ok(RowLockGate::Proceed),
+            TxnState::Committed if lock_only => Ok(RowLockGate::Proceed),
+            // Step 3: a committed real delete/update owns this version.
+            TxnState::Committed => match &self.row_waiter {
+                Some(_) => Err(HeapError::TupleConcurrentlyUpdated(tid)),
+                None => Err(HeapError::TupleNotFound(tid)), // legacy mode
+            },
+        }
+    }
+
+    /// §9.1 steps 5b–5c: block until `blocking_xid` ends. The caller must
+    /// have dropped every page latch already; the wait edge was registered
+    /// by [`Self::row_lock_gate`] while the latch was still held.
+    fn wait_row_lock(&self, self_xid: TxnId, blocking_xid: TxnId) -> Result<()> {
+        let waiter = self
+            .row_waiter
+            .as_ref()
+            .expect("row_lock_gate only returns Wait with a waiter installed");
+        waiter
+            .wait_for(self_xid, blocking_xid)
+            .map_err(|e| {
+                // Unreachable through the gate (it never returns
+                // `Wait(self_xid)`), but a failed wait must not leak the
+                // registered edge — Stage R's deadlock detector reads the
+                // registry as the wait-for graph.
+                waiter.unregister_row_wait(self_xid);
+                HeapError::InvalidArgument(format!("row-lock wait failed: {e}"))
+            })
+    }
+
+    /// Acquire the §9.1 row lock on the tuple at `tid` WITHOUT deleting it
+    /// (M2c Stage P: `SELECT ... FOR UPDATE`): stamps
+    /// `t_xmax = snapshot.current_xid` with [`HEAP_XMAX_LOCK_ONLY`] set and
+    /// `t_cid = snapshot.curcid`.
+    ///
+    /// Same 5-step protocol as delete/update: an INVALID/self/terminal
+    /// stamp is (re)acquired immediately under the page write latch; a
+    /// stamp by a still-active OTHER transaction registers the wait edge
+    /// under the latch, releases it, blocks in `wait_for`, and restarts.
+    ///
+    /// The lock-only stamp is NOT WAL-logged (see the module docs): it is a
+    /// transient concurrency marker, not a visibility fact. The lock is held
+    /// until the stamper's transaction ends — which is exactly what the next
+    /// locker's gate consults via the CLOG/active set.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::TupleConcurrentlyUpdated`] if the row version was
+    /// deleted or updated by a transaction that has since committed; in
+    /// legacy no-waiter mode that condition (and any in-progress holder) is
+    /// [`HeapError::TupleNotFound`] instead — see [`Self::row_lock_gate`].
+    pub fn lock_tuple(
+        &self,
+        tid: Tid,
+        snapshot: &Snapshot,
+        clog: &dyn ClogAccessor,
+    ) -> Result<()> {
+        let self_xid = snapshot.current_xid;
+        debug_assert!(
+            self_xid != TxnId::INVALID,
+            "lock_tuple with INVALID current_xid would stamp a no-op lock"
+        );
+        // §9.1 restart loop (steps 5d→1): identical shape to delete/update.
+        // Every wait implies the counterparty ended (progress), so the loop
+        // converges in practice; the counter turns a hypothetical livelock
+        // into a debug-build panic instead of a silent spin (P2-2).
+        let mut restarts = 0u32;
+        loop {
+            restarts += 1;
+            debug_assert!(
+                restarts < 10_000,
+                "lock_tuple restart loop failed to converge (xid {self_xid})"
+            );
+            let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
+            let gate = {
+                let page = as_page_mut(&mut guard);
+                self.row_lock_gate(page, tid, self_xid, clog, true)?
+            };
+            match gate {
+                RowLockGate::Proceed => {
+                    let page = as_page_mut(&mut guard);
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid)?;
+                    return Ok(());
+                }
+                RowLockGate::Wait(blocking) => {
+                    // Step 5b: release the latch BEFORE sleeping (the edge
+                    // is already registered, so no wakeup can be missed);
+                    // 5c: block; the loop restarts at step 1.
+                    drop(guard);
+                    self.wait_row_lock(self_xid, blocking)?;
+                }
+            }
+        }
+    }
+
+    /// Stamp the §9.1 lock-only mark (`t_xmax` + [`HEAP_XMAX_LOCK_ONLY`] +
+    /// `t_cid`) in place. The tuple stays visible to every snapshot — a
+    /// lock is not a delete — but the row-lock protocol treats the
+    /// non-INVALID `t_xmax` as "row locked" until the stamper ends.
+    ///
+    /// The `t_cid` overwrite is LOSSY: if the same statement first inserted
+    /// this row and then locked it (self-insert at `t_cid == curcid`,
+    /// re-locked at the same curcid), the row would read as written-by-
+    /// current-command and become invisible to the statement's own re-scan.
+    /// Unreachable today: the executor never locks a row it wrote in the
+    /// same statement (FOR UPDATE scans see only earlier-command rows), so
+    /// the overwritten `t_cid` is always from a completed command.
+    ///
+    /// TODO: revisit when subtransactions or EvalPlanQual land — both make
+    /// same-command lock-after-write reachable and need a non-lossy
+    /// cmin/cmax representation (see the Stage O trade-off entry in
+    /// docs/stage_spec.md).
+    fn stamp_lock_only(
+        page: &mut [u8; PAGE_SIZE],
+        tid: Tid,
+        locker: TxnId,
+        curcid: u32,
+    ) -> Result<()> {
+        let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
+        if lp.flags() != LpFlags::Normal {
             return Err(HeapError::TupleNotFound(tid));
         }
-        Ok(header)
+        let off = lp.off() as usize;
+        let mut header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
+        header.t_xmax = locker;
+        header.t_cid = curcid;
+        header.t_infomask |= HEAP_XMAX_LOCK_ONLY;
+        header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
+        Ok(())
+    }
+}
+
+/// The §9.1 gate's verdict for one tuple (see [`HeapAM::row_lock_gate`]).
+enum RowLockGate {
+    /// The caller may stamp the tuple now, still under the page latch.
+    Proceed,
+    /// `t_xmax` names a still-active OTHER transaction; the wait edge is
+    /// registered. The caller drops every latch, blocks in `wait_for`, and
+    /// restarts the protocol from step 1.
+    Wait(TxnId),
+}
+
+/// The `t_xmax` a visibility judgment should see: a [`HEAP_XMAX_LOCK_ONLY`]
+/// stamp is a row lock, NOT a delete, so it is masked to INVALID — a locked
+/// row stays live for everyone, subject to the normal `t_xmin` rules.
+/// Real delete/update stamps pass through unchanged.
+fn visibility_xmax(header: &TupleHeader) -> TxnId {
+    if header.t_infomask & HEAP_XMAX_LOCK_ONLY != 0 {
+        TxnId::INVALID
+    } else {
+        header.t_xmax
     }
 }
 
@@ -488,7 +787,16 @@ impl AccessMethod for HeapAM {
                     continue;
                 };
                 let (header, values) = decode_tuple(bytes, ctx.rel.columns)?;
-                if is_visible(header.t_xmin, header.t_xmax, header.t_cid, ctx.snapshot, clog) {
+                // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete:
+                // mask it off so a locked row stays visible (§9.1, M2c
+                // Stage P).
+                if is_visible(
+                    header.t_xmin,
+                    visibility_xmax(&header),
+                    header.t_cid,
+                    ctx.snapshot,
+                    clog,
+                ) {
                     out.push((
                         Tid {
                             page_id,
@@ -506,22 +814,43 @@ impl AccessMethod for HeapAM {
         let tid = ctx.tid;
         let xmax = ctx.snapshot.current_xid;
 
-        let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
-        let page = as_page_mut(&mut guard);
+        // §9.1 restart loop: each iteration re-pins the page and re-runs the
+        // gate from step 1; only a `Proceed` verdict falls through to the
+        // WAL + stamp, still under the latch (check+stamp is the protocol's
+        // "CAS"). Every wait implies the counterparty ended (progress), so
+        // the loop converges in practice; the counter turns a hypothetical
+        // livelock into a debug-build panic instead of a silent spin (P2-2).
+        let mut restarts = 0u32;
+        loop {
+            restarts += 1;
+            debug_assert!(
+                restarts < 10_000,
+                "delete restart loop failed to converge (xid {xmax})"
+            );
+            let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
+            let gate = {
+                let page = as_page_mut(&mut guard);
+                self.row_lock_gate(page, tid, xmax, ctx.clog, false)?
+            };
+            if let RowLockGate::Wait(blocking) = gate {
+                // Step 5b/5c: release the latch BEFORE sleeping (the edge
+                // is already registered, so the wakeup cannot be missed),
+                // then block; the loop restarts at step 1.
+                drop(guard);
+                self.wait_row_lock(xmax, blocking)?;
+                continue;
+            }
 
-        // Validate the target is a live tuple BEFORE writing WAL: a rejected
-        // delete must leave no HeapDelete record behind, or recovery would
-        // decode a poison record whose own stamp_deleted fails and aborts
-        // replay. This mirrors the pre-append check on the update path.
-        // Liveness is CLOG-aware (an aborted deleter's stamp does not count
-        // as a delete), not just `t_xmax == INVALID`.
-        Self::live_tuple_header(page, tid, ctx.clog)?;
-
-        let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
-        let lsn = self.wal_writer.append(rec)?;
-        Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid, false)?;
-        stamp_pd_lsn(page, lsn);
-        Ok(())
+            let page = as_page_mut(&mut guard);
+            // Validate-then-WAL discipline is unchanged (the gate ran first):
+            // a rejected delete leaves no HeapDelete record behind for
+            // recovery to choke on.
+            let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
+            let lsn = self.wal_writer.append(rec)?;
+            Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid, false)?;
+            stamp_pd_lsn(page, lsn);
+            return Ok(());
+        }
     }
 
     fn redo_handlers(&self) -> Vec<Box<dyn RedoHandler>> {
@@ -550,92 +879,152 @@ impl UpdatableAM for HeapAM {
         let new_tuple = Self::stamp_xmin(new_tuple, xmax)?;
         let needed = new_tuple.len() + LINE_POINTER_SIZE;
 
-        // Fast path: pin the old page, verify the target tuple is live, and
-        // check whether the new version fits alongside it (single latch,
-        // single page). Stamping the old tuple does not change slot_count, so
-        // the new slot is `slot_count` and add_tuple appends there.
-        let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
-        let old_has_room = {
-            let old_page = as_page_mut(&mut old_guard);
-            // Live = LP Normal AND not effectively deleted (CLOG-aware: an
-            // aborted deleter's stamp does not count).
-            Self::live_tuple_header(old_page, old_tid, clog)?;
-            SlottedPage::free_space(old_page) >= needed
-        };
+        // §9.1 restart loop: the gate (steps 1–5a) runs under the old page's
+        // write latch; on `Wait` EVERY latch is dropped before sleeping, and
+        // the whole path — including the room check and any chain extension
+        // — restarts from step 1 (the tuple's state may have changed
+        // arbitrarily while we slept). Convergence argument and the debug
+        // counter: same as delete/lock_tuple (P2-2).
+        let mut restarts = 0u32;
+        loop {
+            restarts += 1;
+            debug_assert!(
+                restarts < 10_000,
+                "update restart loop failed to converge (xid {xmax})"
+            );
+            // Fast path: pin the old page, run the gate, and check whether
+            // the new version fits alongside it (single latch, single page).
+            // Stamping the old tuple does not change slot_count, so the new
+            // slot is `slot_count` and add_tuple appends there.
+            let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
+            let gate = {
+                let old_page = as_page_mut(&mut old_guard);
+                self.row_lock_gate(old_page, old_tid, xmax, clog, false)?
+            };
+            if let RowLockGate::Wait(blocking) = gate {
+                drop(old_guard);
+                self.wait_row_lock(xmax, blocking)?;
+                continue;
+            }
+            let old_has_room = {
+                let old_page = as_page_mut(&mut old_guard);
+                SlottedPage::free_space(old_page) >= needed
+            };
 
-        if old_has_room {
-            let page_id = old_guard.page_id();
-            let old_page = as_page_mut(&mut old_guard);
-            let new_slot = SlottedPage::slot_count(old_page) as u16;
+            if old_has_room {
+                let page_id = old_guard.page_id();
+                let old_page = as_page_mut(&mut old_guard);
+                let new_slot = SlottedPage::slot_count(old_page) as u16;
+                let new_tid = Tid {
+                    page_id,
+                    slot_id: new_slot,
+                };
+                let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
+                let lsn = self.wal_writer.append(rec)?;
+                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
+                debug_assert_eq!(actual, new_slot);
+                stamp_pd_lsn(old_page, lsn);
+                if let Some(out) = out_tid {
+                    *out = new_tid;
+                }
+                return Ok(());
+            }
+
+            // Cross-page: the old page has no room. Drop its latch BEFORE
+            // acquiring the new page: chain extension pins the chain tail, and
+            // holding the old page's latch across that would invert the lock
+            // order (extend path: extend_lock → tail latch) and could deadlock
+            // when the old page IS the tail. The gate is re-run below after
+            // re-pinning, before any heap WAL record is written; a page
+            // allocated on behalf of an update that loses that race is simply
+            // left empty (still tracked in the page cache, reused by the next
+            // insert) — never a poison WAL record.
+            drop(old_guard);
+            let new_guard = self.acquire_page_with_room(&rel, needed, old_tid.page_id)?;
+            let new_page_id = new_guard.page_id();
+
+            // Two-latch acquisition follows a GLOBAL order — smaller PageId
+            // first (M2c Stage P review): two concurrent cross-page updates
+            // can pick each other's old page as their new page, and an
+            // unordered hold-and-wait is an AB/BA deadlock on buffer-pool
+            // latches, which have no timeout and are invisible to Stage R's
+            // (lock-manager-based) deadlock detector. When the old page is
+            // the smaller one, the new guard is dropped and both pages are
+            // re-latched in order; the new page's room is re-checked because
+            // a filler may have taken it in between (restart the whole
+            // protocol if so — the fast path above will re-evaluate).
+            let (mut old_guard, mut new_guard) = if old_tid.page_id < new_page_id {
+                drop(new_guard);
+                let old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
+                let new_guard = self.buffer_pool.pin_mut(new_page_id)?;
+                let new_has_room = {
+                    let new_page: &[u8; PAGE_SIZE] =
+                        new_guard.page().try_into().expect("frame is PAGE_SIZE");
+                    SlottedPage::free_space(new_page) >= needed
+                };
+                if !new_has_room {
+                    drop(new_guard);
+                    drop(old_guard);
+                    continue;
+                }
+                (old_guard, new_guard)
+            } else {
+                (self.buffer_pool.pin_mut(old_tid.page_id)?, new_guard)
+            };
+
+            // Re-run the gate under the old page's latch before writing WAL
+            // (a rejected update must leave no HeapUpdate record behind for
+            // recovery to choke on — same discipline as delete). The gate is
+            // CLOG-aware: a tuple whose committed deleter stamped it while
+            // this update dropped the latch is rejected, not overwritten; an
+            // in-progress holder sends us to sleep; an aborted stamp does not
+            // count.
+            let gate = {
+                let old_page = as_page_mut(&mut old_guard);
+                self.row_lock_gate(old_page, old_tid, xmax, clog, false)?
+            };
+            if let RowLockGate::Wait(blocking) = gate {
+                // Sleep holding NO latch: drop the new page's guard too — a
+                // blocked waiter must never hold a write latch.
+                drop(old_guard);
+                drop(new_guard);
+                self.wait_row_lock(xmax, blocking)?;
+                continue;
+            }
+
+            // The new slot is computed only now, under the final latching:
+            // in the re-ordered acquisition above the new page may have been
+            // dropped and re-pinned, so any earlier slot prediction is stale.
+            let new_slot = {
+                let new_page = as_page_mut(&mut new_guard);
+                SlottedPage::slot_count(new_page) as u16
+            };
             let new_tid = Tid {
-                page_id,
+                page_id: new_page_id,
                 slot_id: new_slot,
             };
+
             let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
             let lsn = self.wal_writer.append(rec)?;
-            Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
-            let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
-            debug_assert_eq!(actual, new_slot);
-            stamp_pd_lsn(old_page, lsn);
+
+            {
+                let old_page = as_page_mut(&mut old_guard);
+                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                stamp_pd_lsn(old_page, lsn);
+            }
+            {
+                let new_page = as_page_mut(&mut new_guard);
+                let actual = SlottedPage::add_tuple(new_page, &new_tuple)?;
+                debug_assert_eq!(actual, new_slot);
+                stamp_pd_lsn(new_page, lsn);
+            }
+
             if let Some(out) = out_tid {
                 *out = new_tid;
             }
             return Ok(());
         }
-
-        // Cross-page: the old page has no room. Drop its latch BEFORE
-        // acquiring the new page: chain extension pins the chain tail, and
-        // holding the old page's latch across that would invert the lock
-        // order (extend path: extend_lock → tail latch) and could deadlock
-        // when the old page IS the tail. The old tuple's liveness is
-        // re-verified below before any heap WAL record is written; a page
-        // allocated on behalf of an update that loses that race is simply
-        // left empty (still tracked in the page cache, reused by the next
-        // insert) — never a poison WAL record.
-        drop(old_guard);
-        let mut new_guard = self.acquire_page_with_room(&rel, needed, old_tid.page_id)?;
-        let new_page_id = new_guard.page_id();
-        let new_slot = {
-            let new_page = as_page_mut(&mut new_guard);
-            SlottedPage::slot_count(new_page) as u16
-        };
-        let new_tid = Tid {
-            page_id: new_page_id,
-            slot_id: new_slot,
-        };
-
-        // Re-pin the old page and re-verify the target is still live before
-        // writing WAL (a rejected update must leave no HeapUpdate record
-        // behind for recovery to choke on — same discipline as delete).
-        // Liveness is CLOG-aware: a tuple whose committed deleter (or
-        // still-in-progress deleter) stamped it while this update dropped the
-        // latch is rejected, not overwritten; an aborted deleter's stamp does
-        // not count.
-        let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
-        {
-            let old_page = as_page_mut(&mut old_guard);
-            Self::live_tuple_header(old_page, old_tid, clog)?;
-        }
-
-        let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
-        let lsn = self.wal_writer.append(rec)?;
-
-        {
-            let old_page = as_page_mut(&mut old_guard);
-            Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
-            stamp_pd_lsn(old_page, lsn);
-        }
-        {
-            let new_page = as_page_mut(&mut new_guard);
-            let actual = SlottedPage::add_tuple(new_page, &new_tuple)?;
-            debug_assert_eq!(actual, new_slot);
-            stamp_pd_lsn(new_page, lsn);
-        }
-
-        if let Some(out) = out_tid {
-            *out = new_tid;
-        }
-        Ok(())
     }
 }
 
@@ -711,7 +1100,10 @@ impl Vacuumable for HeapAM {
                     continue;
                 }
                 let xmax = header.t_xmax;
-                if xmax != TxnId::INVALID
+                // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete:
+                // the tuple is never dead because of it (§9.1, M2c Stage P).
+                if header.t_infomask & HEAP_XMAX_LOCK_ONLY == 0
+                    && xmax != TxnId::INVALID
                     && xmax.0 < oldest_xmin.0
                     && clog.get_state(xmax) == TxnState::Committed
                 {

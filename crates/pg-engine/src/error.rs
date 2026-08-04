@@ -57,6 +57,17 @@ pub enum EngineError {
     #[error("btree error: {0}")]
     BTree(#[from] pg_am_btree::BTreeError),
 
+    /// The table lock manager rejected an acquisition (M2c Stage P). Stage
+    /// P's `acquire` never actually fails — the variant exists so Stage R's
+    /// deadlock detector can abort a victim without an API change.
+    #[error("lock error: {0}")]
+    Lock(#[from] pg_txn::LockError),
+
+    /// The statement parses but its semantics are not implemented at this
+    /// stage (e.g. `SELECT ... FOR SHARE`, which needs multixact row locks).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// `create_index` named a (table, column) pair that already has an index.
     #[error("index on {0} already exists")]
     IndexExists(String),

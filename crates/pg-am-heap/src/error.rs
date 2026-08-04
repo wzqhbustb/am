@@ -44,6 +44,20 @@ pub enum HeapError {
     #[error("tuple not found at {0:?}")]
     TupleNotFound(pg_storage::types::Tid),
 
+    /// The tuple at the given TID was deleted or updated by another
+    /// transaction that has since COMMITTED (M2c Stage P, §9.1 step 3 of the
+    /// row-lock protocol). Distinct from [`HeapError::TupleNotFound`]: the
+    /// row DID exist when the caller's snapshot was taken, but the version
+    /// addressed is dead — SQL layers map this to "tuple concurrently
+    /// updated" (snapshot-isolation write conflict), not to "row does not
+    /// exist". Callers may retry with a fresh snapshot.
+    ///
+    /// Only produced when the AM has a row waiter installed; the legacy
+    /// no-waiter mode keeps reporting this condition as `TupleNotFound`
+    /// (see `HeapAM::row_lock_gate`).
+    #[error("tuple at {0:?} was concurrently updated or deleted")]
+    TupleConcurrentlyUpdated(pg_storage::types::Tid),
+
     /// A lower-level storage engine operation failed (buffer pool, WAL, page
     /// allocator).
     #[error("storage error: {0}")]

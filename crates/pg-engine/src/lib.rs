@@ -38,4 +38,7 @@ pub use error::{EngineError, Result};
 // API surface re-exports: callers of the programmatic API (tech-selection
 // §21) should not need to name the lower crates for the basic types.
 pub use pg_am_heap::tuple::{ColumnType, Datum};
+// So callers/tests can match `EngineError::Heap(HeapError::TupleConcurrentlyUpdated)`
+// (M2c Stage P) without depending on pg-am-heap directly.
+pub use pg_am_heap::HeapError;
 pub use pg_storage::types::{Oid, PageId, Tid};

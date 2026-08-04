@@ -13,8 +13,8 @@ pg-storage = { path = "../pg-storage" }
 # concurrency primitives
 parking_lot = "0.12"
 
-# TODO(Stage P): evaluate tokio::sync::Notify for lock manager wait/wake
-# (currently parking_lot::Condvar is the leading candidate)
+# Stage P resolved the wait/wake choice: parking_lot::Condvar (sync engine;
+# no tokio runtime in the storage/txn layers).
 
 # error types
 thiserror = "2"

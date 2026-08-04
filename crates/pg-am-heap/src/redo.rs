@@ -37,7 +37,7 @@
 
 use crate::error::HeapError;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
-use crate::tuple::{TupleHeader, HEAP_UPDATED, TUPLE_HEADER_SIZE};
+use crate::tuple::{TupleHeader, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::error::{Result, StorageError};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
@@ -238,6 +238,13 @@ fn stamp_deleted(
     if updated {
         header.t_infomask |= HEAP_UPDATED;
     }
+    // A replayed delete/update is a REAL xmax stamp: clear a lock-only bit
+    // that may sit on the flushed page image (M2c Stage P — lock-only
+    // stamps are not WAL-logged, so a page flushed while a FOR UPDATE lock
+    // was held can carry one; leaving it set would mask the replayed
+    // delete from visibility and resurrect the row). Mirrors the live
+    // path's `HeapAM::stamp_deleted`.
+    header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
     header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
     Ok(())
 }
@@ -249,5 +256,56 @@ fn heap_to_storage(e: HeapError) -> StorageError {
     match e {
         HeapError::Storage(s) => s,
         other => StorageError::MetadataCorrupted(format!("heap redo: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tuple::{encode_tuple, ColumnType, Datum};
+    use pg_storage::types::{PageId, TxnId};
+
+    /// T2 (M2c Stage P review): redo of a real delete/update must CLEAR a
+    /// lock-only bit found on the page image. A page flushed while a FOR
+    /// UPDATE lock was held carries `HEAP_XMAX_LOCK_ONLY` on disk (lock
+    /// stamps are not WAL-logged); replaying the real delete over it must
+    /// not leave the bit set, or the visibility mask would resurrect a
+    /// replayed-deleted tuple.
+    #[test]
+    fn redo_stamp_deleted_clears_lock_only() {
+        for updated in [false, true] {
+            let mut page = [0u8; PAGE_SIZE];
+            SlottedPage::init_with_special(&mut page, HEAP_SPECIAL_SIZE);
+            let mut header = TupleHeader::new(
+                TxnId(7),
+                TxnId(9), // the crashed locker's stamp
+                0,
+                [0; 16],
+                Tid {
+                    page_id: PageId(1),
+                    slot_id: 0,
+                },
+                0,
+            );
+            header.t_infomask = HEAP_XMAX_LOCK_ONLY;
+            let bytes = encode_tuple(header, &[ColumnType::Int4], &[Some(Datum::Int4(1))]).unwrap();
+            let slot = SlottedPage::add_tuple(&mut page, &bytes).unwrap();
+            let tid = Tid {
+                page_id: PageId(1),
+                slot_id: slot,
+            };
+
+            stamp_deleted(&mut page, tid, TxnId(10), updated).unwrap();
+
+            let bytes = SlottedPage::tuple(&page, slot).unwrap().unwrap();
+            let h = TupleHeader::read_from(&bytes[..TUPLE_HEADER_SIZE]).unwrap();
+            assert_eq!(h.t_xmax, TxnId(10));
+            assert_eq!(
+                h.t_infomask & HEAP_XMAX_LOCK_ONLY,
+                0,
+                "redo must clear LOCK_ONLY (updated={updated})"
+            );
+            assert_eq!(h.t_infomask & HEAP_UPDATED != 0, updated);
+        }
     }
 }
