@@ -164,9 +164,12 @@ fn in_progress_insert_is_invisible_to_others_but_visible_to_self() {
         .unwrap();
     assert!(rows.is_empty(), "in-progress insert must be invisible");
 
-    // The inserting transaction itself sees its own write.
+    // The inserting transaction itself sees its own write (the insert
+    // stamped t_cid=0; the scan uses curcid=1, so t_cid < curcid → visible
+    // as "written by an earlier command" — §7.2 / v2.3-Q4).
     let mut own_snap = Snapshot::everything();
     own_snap.current_xid = xid;
+    own_snap.curcid = 1;
     let rows = heap
         .scan(ScanContext {
             rel: rel(first_page),

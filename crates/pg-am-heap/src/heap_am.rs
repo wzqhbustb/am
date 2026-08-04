@@ -370,13 +370,14 @@ impl HeapAM {
         Ok(new_guard)
     }
 
-    /// Stamp `t_xmax` (and optionally the `HEAP_UPDATED` infomask bit) onto the
-    /// live tuple at `tid`'s slot, in place. TID stability is preserved: the
-    /// line pointer stays `Normal`.
+    /// Stamp `t_xmax`, `t_cid`, and optionally the `HEAP_UPDATED` infomask bit
+    /// onto the live tuple at `tid`'s slot, in place. TID stability is
+    /// preserved: the line pointer stays `Normal`.
     fn stamp_deleted(
         page: &mut [u8; PAGE_SIZE],
         tid: Tid,
         xmax: TxnId,
+        curcid: u32,
         updated: bool,
     ) -> Result<()> {
         let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
@@ -386,6 +387,7 @@ impl HeapAM {
         let off = lp.off() as usize;
         let mut header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
         header.t_xmax = xmax;
+        header.t_cid = curcid;
         if updated {
             header.t_infomask |= HEAP_UPDATED;
         }
@@ -486,7 +488,7 @@ impl AccessMethod for HeapAM {
                     continue;
                 };
                 let (header, values) = decode_tuple(bytes, ctx.rel.columns)?;
-                if is_visible(header.t_xmin, header.t_xmax, ctx.snapshot, clog) {
+                if is_visible(header.t_xmin, header.t_xmax, header.t_cid, ctx.snapshot, clog) {
                     out.push((
                         Tid {
                             page_id,
@@ -517,7 +519,7 @@ impl AccessMethod for HeapAM {
 
         let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
         let lsn = self.wal_writer.append(rec)?;
-        Self::stamp_deleted(page, tid, xmax, false)?;
+        Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid, false)?;
         stamp_pd_lsn(page, lsn);
         Ok(())
     }
@@ -571,7 +573,7 @@ impl UpdatableAM for HeapAM {
             };
             let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
             let lsn = self.wal_writer.append(rec)?;
-            Self::stamp_deleted(old_page, old_tid, xmax, true)?;
+            Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
             let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
             debug_assert_eq!(actual, new_slot);
             stamp_pd_lsn(old_page, lsn);
@@ -620,7 +622,7 @@ impl UpdatableAM for HeapAM {
 
         {
             let old_page = as_page_mut(&mut old_guard);
-            Self::stamp_deleted(old_page, old_tid, xmax, true)?;
+            Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
             stamp_pd_lsn(old_page, lsn);
         }
         {

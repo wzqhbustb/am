@@ -85,8 +85,10 @@
 //! by an internal lock, but DDL racing DML on the same table is **not**
 //! supported in M2a (no table locks yet — those arrive in M2c).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -104,14 +106,17 @@ use pg_catalog::system_tables::{
     RELKIND_INDEX, RELKIND_TABLE,
 };
 use pg_catalog::{Catalog, RelationRow, TypeOid};
+use pg_storage::buffer_pool::BufferPool;
 use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::recovery::AttProvider;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
-use pg_txn::{txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, Snapshot, TxnManager};
+use pg_storage::wal::WalWriter;
+use pg_txn::{is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, Snapshot, TxnManager};
 
 use crate::error::{EngineError, Result};
+use crate::sql::{self, CmpOp, Filter, Literal, OrderBy, SelectCols, Statement};
 
 /// `pg_class.relkind` marker written by [`Engine::drop_table`].
 ///
@@ -126,6 +131,37 @@ const RELKIND_DROPPED: &str = "d";
 /// v2.3-25): 8 frames = a 128K-XID window, covering 100 concurrent
 /// transactions with headroom.
 pub const DEFAULT_CLOG_BUFFER_FRAMES: usize = 8;
+
+/// Process-wide engine identity source (Stage O review): every [`Engine`]
+/// takes a unique instance ID at open, and [`TxnHandle`]s carry it so a
+/// handle created by one engine cannot be executed against another.
+static NEXT_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// What a transaction did to one index entry, for undo purposes (Stage O
+/// review: index maintenance is not MVCC-covered by heap headers, so the
+/// engine keeps an explicit per-transaction undo log).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexUndoOp {
+    /// The transaction inserted `(key, tid)`; abort removes it.
+    Inserted,
+    /// The transaction deleted `(key, tid)`; abort re-inserts it.
+    Deleted,
+}
+
+/// One reversible index maintenance op performed inside a transaction.
+/// An UPDATE contributes two entries (delete old key + insert new key).
+#[derive(Debug, Clone)]
+struct IndexUndo {
+    /// The index the op ran against (re-opened by OID + meta page on undo).
+    index: IndexEntry,
+    /// The encoded key bytes of the entry.
+    key: Vec<u8>,
+    /// The heap TID of the entry (the B+Tree delete API is (key, tid)
+    /// exact, so duplicates of the same key are undone individually).
+    tid: Tid,
+    /// What the transaction did.
+    op: IndexUndoOp,
+}
 
 /// Engine-level configuration.
 ///
@@ -176,7 +212,23 @@ pub struct ColumnDef {
 /// exists between the engine API and the AM.
 pub type Value = Option<Datum>;
 
-/// A scan filter (§21 M2a minimum: single-column equality).
+/// The outcome of an [`Engine::exec`] call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryResult {
+    /// A SELECT result set.
+    Rows {
+        /// Column names in the result.
+        columns: Vec<String>,
+        /// Rows, each a vector of values matching `columns`.
+        rows: Vec<Vec<Value>>,
+    },
+    /// The number of rows affected by an INSERT/UPDATE/DELETE.
+    Affected(usize),
+    /// DDL or txn-control statement succeeded.
+    Ok,
+}
+
+/// A scan filter (§21): single-column comparison.
 ///
 /// `None` on [`Engine::scan`] means a full scan.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +240,50 @@ pub enum Predicate {
         /// The value to compare against (type must match the column).
         value: Datum,
     },
+    /// Keep rows whose column `col_index` is less than `value`.
+    Lt {
+        /// 0-based column position in the table's schema.
+        col_index: usize,
+        /// The value to compare against (type must match the column).
+        value: Datum,
+    },
+    /// Keep rows whose column `col_index` is greater than `value`.
+    Gt {
+        /// 0-based column position in the table's schema.
+        col_index: usize,
+        /// The value to compare against (type must match the column).
+        value: Datum,
+    },
+}
+
+impl Predicate {
+    /// The 0-based column index this predicate filters on.
+    pub fn col_index(&self) -> usize {
+        match self {
+            Predicate::Eq { col_index, .. }
+            | Predicate::Lt { col_index, .. }
+            | Predicate::Gt { col_index, .. } => *col_index,
+        }
+    }
+
+    /// The comparison value.
+    pub fn value(&self) -> &Datum {
+        match self {
+            Predicate::Eq { value, .. }
+            | Predicate::Lt { value, .. }
+            | Predicate::Gt { value, .. } => value,
+        }
+    }
+
+    /// Whether `val` satisfies this predicate.
+    pub fn matches(&self, val: &Value) -> bool {
+        let Some(d) = val else { return false; };
+        match self {
+            Predicate::Eq { value, .. } => d == value,
+            Predicate::Lt { value, .. } => d < value,
+            Predicate::Gt { value, .. } => d > value,
+        }
+    }
 }
 
 /// One entry of the engine's in-memory table registry.
@@ -267,7 +363,170 @@ pub struct Engine {
     /// so there is no data race — the barrier exists purely for this
     /// durability ordering. (Serializing concurrent `Engine::checkpoint`
     /// calls is redundant with the coordinator's internal checkpoint lock.)
-    commit_barrier: RwLock<()>,
+    commit_barrier: Arc<RwLock<()>>,
+    /// This engine's identity (see `NEXT_ENGINE_INSTANCE_ID`).
+    instance_id: u64,
+    /// Per-transaction index undo log, keyed by XID (Stage O review: index
+    /// modifications are not transactional). Every index insert/delete a
+    /// transaction performs — explicit `TxnHandle` txns AND the auto-commit
+    /// path — is recorded here; abort reverse-applies the entries, commit
+    /// discards them. Without this, an aborted INSERT left a dangling
+    /// `(key, tid)` entry pointing at a dead tuple, and an aborted DELETE
+    /// lost the entry of a still-live row. Entries are always removed on
+    /// commit AND abort, so the map never leaks committed transactions.
+    index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
+}
+
+/// A handle to an explicit transaction (§21 M2b API).
+///
+/// Created by [`Engine::begin_txn`], consumed by [`TxnHandle::commit`] or
+/// [`TxnHandle::abort`]. The `Snapshot` is taken at creation time (SI) and
+/// `curcid` is advanced before each statement via [`Self::advance_curcid`].
+///
+/// A handle is bound to the [`Engine`] instance that created it (Stage O
+/// review): passing it to another engine's `exec` fails with
+/// [`EngineError::InvalidArgument`].
+///
+/// # No statement-level rollback (M2b)
+///
+/// There are no subtransactions in M2b: if a statement inside an explicit
+/// transaction fails mid-way, the rows it already wrote REMAIN in the
+/// transaction and the only safe operation is [`TxnHandle::abort`].
+///
+/// If dropped without calling `commit` or `abort`, the transaction is
+/// automatically aborted (best-effort) to prevent XID leaks in the active
+/// set — a leaked in-progress XID would make its writes invisible to every
+/// future snapshot.
+pub struct TxnHandle {
+    txn: Arc<TxnManager>,
+    barrier: Arc<RwLock<()>>,
+    xid: Option<TxnId>,
+    snapshot: RefCell<Snapshot>,
+    /// Identity of the creating engine (see `NEXT_ENGINE_INSTANCE_ID`).
+    instance_id: u64,
+    /// Shared with the engine: this txn's index maintenance ops, reversed
+    /// on abort and discarded on commit.
+    index_undo: Arc<Mutex<HashMap<TxnId, Vec<IndexUndo>>>>,
+    /// B+Tree construction pieces for applying the undo log.
+    buffer_pool: Arc<BufferPool>,
+    wal_writer: Arc<WalWriter>,
+}
+
+impl TxnHandle {
+    /// The transaction's XID.
+    pub fn xid(&self) -> TxnId {
+        self.xid.expect("xid accessed after commit/abort")
+    }
+
+    /// Advance the command counter before executing a new SQL statement
+    /// (Halloween protection, §7.2 / v2.3-Q4).
+    pub fn advance_curcid(&self) {
+        self.snapshot.borrow_mut().advance_curcid();
+    }
+
+    /// Commit this transaction. Consumes `self` so it cannot be reused.
+    ///
+    /// The transaction's index undo entries are discarded: its index
+    /// maintenance becomes durable with the commit.
+    pub fn commit(mut self) -> Result<()> {
+        let xid = self.xid.take().expect("commit called twice");
+        let _guard = self.barrier.read();
+        let result = self.txn.commit_txn(xid);
+        // Discard the undo log either way: on success the entries are
+        // durable; on failure the txn stays in-progress (its heap writes
+        // invisible) and the `index_lookup` visibility mask covers the
+        // leftover index entries.
+        self.index_undo.lock().remove(&xid);
+        result?;
+        Ok(())
+    }
+
+    /// Abort (roll back) this transaction. Consumes `self` so it cannot be
+    /// reused.
+    ///
+    /// The transaction's index maintenance is reverse-applied from the undo
+    /// log BEFORE the CLOG abort lands, so no snapshot can observe a heap
+    /// row whose index entry is already gone (or vice versa).
+    pub fn abort(mut self) -> Result<()> {
+        let xid = self.xid.take().expect("abort called twice");
+        let _guard = self.barrier.read();
+        apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+        self.txn.abort_txn(xid)?;
+        Ok(())
+    }
+}
+
+impl Drop for TxnHandle {
+    fn drop(&mut self) {
+        if let Some(xid) = self.xid.take() {
+            // Best-effort abort: the transaction was never explicitly
+            // committed or aborted. Aborting prevents the XID from
+            // lingering in the active set forever (which would make
+            // its writes invisible to all future snapshots).
+            //
+            // Takes the same commit-barrier read guard as `commit`/`abort`
+            // (Stage O review): a checkpoint holds the write guard, so the
+            // read guard simply waits it out — no deadlock, and the abort's
+            // `set_state` cannot race the checkpoint's CLOG flush.
+            let _guard = self.barrier.read();
+            apply_index_undo(&self.index_undo, &self.buffer_pool, &self.wal_writer, xid);
+            if let Err(e) = self.txn.abort_txn(xid) {
+                // Same reporting level as the auto-commit error path: a
+                // failed abort leaks the XID into the active set (its
+                // writes stay invisible to all future snapshots), so it
+                // must be loud even though Drop cannot propagate.
+                tracing::warn!(error = %e, xid = xid.0, "txn handle drop auto-abort failed");
+            }
+        }
+    }
+}
+
+/// Reverse-apply the per-transaction index undo log for `xid`, in reverse
+/// order of recording (Stage O review): `Inserted` entries are removed from
+/// the index, `Deleted` entries are re-inserted. The log slot is always
+/// removed, committed-or-not. Best-effort: a failed undo leaves the index
+/// inconsistent with the heap, so it is logged loudly rather than silently
+/// dropped, but abort itself must still proceed (heap MVCC via the CLOG is
+/// the primary consistency mechanism).
+///
+/// WAL semantics: the `index.delete()` / `index.insert()` calls below
+/// produce ordinary B+Tree WAL records stamped while transaction `xid` is
+/// aborting — i.e. the records logically belong to a transaction whose
+/// terminal state is ABORTED. That is harmless in M2b: btree redo is
+/// physical (page-image level), so on restart these records replay exactly
+/// like any committed transaction's, and the CLOG's aborted state for `xid`
+/// only governs HEAP tuple visibility, never index entry replay. Abort
+/// itself is not transactional (no undo-undo): if the process dies
+/// mid-undo, recovery replays the WAL prefix that did land, which is
+/// consistent because heap visibility never depends on index contents.
+fn apply_index_undo(
+    log: &Mutex<HashMap<TxnId, Vec<IndexUndo>>>,
+    buffer_pool: &Arc<BufferPool>,
+    wal_writer: &Arc<WalWriter>,
+    xid: TxnId,
+) {
+    let entries = log.lock().remove(&xid).unwrap_or_default();
+    let btree = BTreeAM::new(Arc::clone(buffer_pool), Arc::clone(wal_writer));
+    for undo in entries.into_iter().rev() {
+        let result = btree
+            .open_index(
+                undo.index.index_oid,
+                undo.index.meta_page,
+                undo.index.key_type,
+            )
+            .and_then(|mut index| match undo.op {
+                IndexUndoOp::Inserted => index.delete(&undo.key, undo.tid),
+                IndexUndoOp::Deleted => index.insert(&undo.key, undo.tid),
+            });
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                xid = xid.0,
+                index_oid = undo.index.index_oid.0,
+                "index undo failed; index may be inconsistent with the heap"
+            );
+        }
+    }
 }
 
 impl Engine {
@@ -348,7 +607,9 @@ impl Engine {
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
             ddl_lock: Mutex::new(()),
-            commit_barrier: RwLock::new(()),
+            commit_barrier: Arc::new(RwLock::new(())),
+            instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            index_undo: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -664,7 +925,7 @@ impl Engine {
             Some(Datum::Int8(0)),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
-        let header = tuple_header();
+        let header = tuple_header(snap.curcid);
         let new_tuple = encode_tuple(header, &columns, &class_row)?;
         self.ensure_catalog_room(&PG_CLASS, new_tuple.len())?;
         self.heap.update(UpdateContext {
@@ -754,9 +1015,10 @@ impl Engine {
         // Collect (key_bytes, tid) from a full heap scan (M2b: simple scan,
         // no ordering assumption on the source).
         let col_types = column_types(&entry);
+        let snap = self.txn.snapshot(TxnId::INVALID);
         let rows = self.heap.scan(ScanContext {
             rel: relation_desc(&entry, &col_types),
-            snapshot: &Snapshot::everything(),
+            snapshot: &snap,
             clog: self.clog.as_ref(),
         })?;
         let mut entries = Vec::with_capacity(rows.len());
@@ -909,7 +1171,7 @@ impl Engine {
         ];
         for (def, row) in &rows {
             let columns = def.column_types();
-            let tuple = encode_tuple(tuple_header(), &columns, row)?;
+            let tuple = encode_tuple(tuple_header(0), &columns, row)?;
             self.ensure_catalog_room(def, tuple.len())?;
         }
         Ok(())
@@ -918,15 +1180,62 @@ impl Engine {
     /// Point lookup through the index on `table(column)` (M2b Stage M wave
     /// 2): resolve the index in the registry, open its B+Tree from the meta
     /// page, encode `key`, and return the heap TID of the first matching
-    /// entry (or `None`).
+    /// entry whose heap tuple is VISIBLE under a fresh snapshot (or `None`).
     ///
-    /// Range scans and the SQL entry point are Stage O territory; the native
-    /// `pg_am_btree::BTreeIndex::range_scan` is available through
-    /// [`Engine::btree_index`] until then.
+    /// Visibility mask (Stage O review): B+Tree entries carry no MVCC
+    /// metadata, so a raw TID can point at an aborted or deleted heap
+    /// version (e.g. an entry whose undo was skipped, or a duplicate key
+    /// whose first version is dead). Every candidate TID is re-checked
+    /// against the heap tuple header through the §7.2 oracle; M2b indexes
+    /// are non-unique, so all duplicates of the key are walked and the
+    /// first visible one wins. The snapshot is auto-commit style: a fresh
+    /// SI snapshot per call, same as [`Engine::scan`].
+    ///
+    /// # WARNING
+    ///
+    /// Every call takes a NEW snapshot: a call made inside an explicit
+    /// transaction does NOT see that transaction's own uncommitted writes
+    /// (no read-your-writes), and two calls in the same transaction can
+    /// observe different database states. Callers building higher-level
+    /// transactional logic should NOT compose this API — use
+    /// [`Engine::exec`] with SQL instead, which routes SELECT through
+    /// `scan_inner` under the transaction snapshot.
     pub fn index_lookup(&self, table: &str, column: &str, key: &Datum) -> Result<Option<Tid>> {
+        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        snap.advance_curcid();
         let index = self.btree_index(table, column)?;
         let key_bytes = encode_key(key)?;
-        Ok(index.lookup(&key_bytes)?)
+        for tid in index.lookup_all(&key_bytes)? {
+            if self.heap_tuple_visible(&snap, tid)? {
+                return Ok(Some(tid));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the heap tuple at `tid` is visible under `snap` (the
+    /// `index_lookup` visibility mask): reads the tuple header directly
+    /// from its page and runs the §7.2 judgment against the engine's CLOG.
+    /// A slot that no longer holds a tuple reads as invisible.
+    ///
+    /// This checks visibility only, not that the tuple's key matches the
+    /// queried key. That is safe because heap slots are append-only
+    /// (HeapAM never reclaims slots), so a TID can never come to hold an
+    /// unrelated row; revisit if vacuum/slot reuse ever lands.
+    fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<bool> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
+            return Ok(false);
+        };
+        let header = TupleHeader::read_from(&bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE])?;
+        Ok(is_visible(
+            header.t_xmin,
+            header.t_xmax,
+            header.t_cid,
+            snap,
+            self.clog.as_ref(),
+        ))
     }
 
     /// Open the B+Tree handle for the index on `table(column)` (testing /
@@ -963,58 +1272,70 @@ impl Engine {
     /// insert runs first (it allocates the TID), then each index is updated
     /// (NULL keys are skipped, matching `create_index`).
     pub fn insert(&self, table: &str, values: &[Value]) -> Result<Tid> {
-        let entry = self.table_entry(table)?;
-        let col_types = column_types(&entry);
-        let tuple = encode_row(&entry, &col_types, values)?;
-        let indexes = self.indexes_of(&entry);
         self.auto_commit(|snap| {
-            let mut out_tid = Tid {
-                page_id: PageId::INVALID,
-                slot_id: 0,
-            };
-            self.heap.insert(InsertContext {
-                rel: relation_desc(&entry, &col_types),
-                snapshot: snap,
-                tuple: &tuple,
-                out_tid: Some(&mut out_tid),
-            })?;
-            for (idx, col_index) in &indexes {
-                if let Some(datum) = &values[*col_index] {
-                    self.open_btree(idx)?.insert(&encode_key(datum)?, out_tid)?;
-                }
-            }
-            Ok(out_tid)
+            let entry = self.table_entry(table)?;
+            self.insert_inner(snap, &entry, values)
         })
+    }
+
+    /// The shared insert path. Takes the registry `entry` from the caller
+    /// (Stage O review): SQL exec already holds it for
+    /// `build_insert_values`, so looking it up again here would be a
+    /// redundant recursive `registry.read()` per row.
+    fn insert_inner(&self, snap: &Snapshot, entry: &TableEntry, values: &[Value]) -> Result<Tid> {
+        let col_types = column_types(entry);
+        let tuple = encode_row(entry, &col_types, values, snap.curcid)?;
+        let indexes = self.indexes_of(entry);
+        let mut out_tid = Tid {
+            page_id: PageId::INVALID,
+            slot_id: 0,
+        };
+        self.heap.insert(InsertContext {
+            rel: relation_desc(entry, &col_types),
+            snapshot: snap,
+            tuple: &tuple,
+            out_tid: Some(&mut out_tid),
+        })?;
+        for (idx, col_index) in &indexes {
+            if let Some(datum) = &values[*col_index] {
+                let key = encode_key(datum)?;
+                self.open_btree(idx)?.insert(&key, out_tid)?;
+                self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+            }
+        }
+        Ok(out_tid)
     }
 
     /// Return every visible row of `table` as `(tid, values)`.
     ///
-    /// Scans with `Snapshot::everything()` against the engine's real CLOG:
-    /// committed rows are visible, aborted or in-progress writers are not.
-    /// `predicate` applies a single-column equality filter after visibility.
+    /// Scans with a real SI snapshot against the engine's CLOG: committed
+    /// rows are visible, aborted or in-progress writers are not.
+    /// `predicate` applies a single-column filter after visibility.
     pub fn scan(
         &self,
         table: &str,
         predicate: Option<Predicate>,
     ) -> Result<Vec<(Tid, Vec<Value>)>> {
+        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        snap.advance_curcid();
+        self.scan_inner(&snap, table, predicate.as_ref())
+    }
+
+    fn scan_inner(
+        &self,
+        snap: &Snapshot,
+        table: &str,
+        predicate: Option<&Predicate>,
+    ) -> Result<Vec<(Tid, Vec<Value>)>> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
-        if let Some(Predicate::Eq { col_index, .. }) = &predicate {
-            if *col_index >= entry.columns.len() {
-                return Err(EngineError::InvalidPredicate(format!(
-                    "table {table:?} has {} columns, predicate references column {col_index}",
-                    entry.columns.len()
-                )));
-            }
-        }
+        validate_predicate(table, &entry, predicate)?;
         let mut rows = self.heap.scan(ScanContext {
             rel: relation_desc(&entry, &col_types),
-            snapshot: &Snapshot::everything(),
+            snapshot: snap,
             clog: self.clog.as_ref(),
         })?;
-        if let Some(Predicate::Eq { col_index, value }) = predicate {
-            rows.retain(|(_, vals)| vals.get(col_index) == Some(&Some(value.clone())));
-        }
+        apply_predicate(&mut rows, predicate);
         Ok(rows)
     }
 
@@ -1027,39 +1348,51 @@ impl Engine {
     /// `(new_key, new_tid)` inserted, all in the same transaction. NULL keys
     /// are skipped on both sides.
     pub fn update(&self, table: &str, tid: Tid, values: &[Value]) -> Result<Tid> {
+        self.auto_commit(|snap| self.update_inner(snap, table, tid, values))
+    }
+
+    fn update_inner(
+        &self,
+        snap: &Snapshot,
+        table: &str,
+        tid: Tid,
+        values: &[Value],
+    ) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
-        let tuple = encode_row(&entry, &col_types, values)?;
+        let tuple = encode_row(&entry, &col_types, values, snap.curcid)?;
         let indexes = self.indexes_of(&entry);
         let old_values = if indexes.is_empty() {
             Vec::new()
         } else {
             self.read_row_by_tid(&entry, &col_types, tid)?
         };
-        self.auto_commit(|snap| {
-            let mut out_tid = Tid {
-                page_id: PageId::INVALID,
-                slot_id: 0,
-            };
-            self.heap.update(UpdateContext {
-                rel: relation_desc(&entry, &col_types),
-                snapshot: snap,
-                old_tid: tid,
-                new_tuple: &tuple,
-                out_tid: Some(&mut out_tid),
-                clog: self.clog.as_ref(),
-            })?;
-            for (idx, col_index) in &indexes {
-                let mut index = self.open_btree(idx)?;
-                if let Some(old_datum) = &old_values[*col_index] {
-                    index.delete(&encode_key(old_datum)?, tid)?;
-                }
-                if let Some(new_datum) = &values[*col_index] {
-                    index.insert(&encode_key(new_datum)?, out_tid)?;
-                }
+        let mut out_tid = Tid {
+            page_id: PageId::INVALID,
+            slot_id: 0,
+        };
+        self.heap.update(UpdateContext {
+            rel: relation_desc(&entry, &col_types),
+            snapshot: snap,
+            old_tid: tid,
+            new_tuple: &tuple,
+            out_tid: Some(&mut out_tid),
+            clog: self.clog.as_ref(),
+        })?;
+        for (idx, col_index) in &indexes {
+            let mut index = self.open_btree(idx)?;
+            if let Some(old_datum) = &old_values[*col_index] {
+                let key = encode_key(old_datum)?;
+                index.delete(&key, tid)?;
+                self.record_index_undo(snap.current_xid, idx, key, tid, IndexUndoOp::Deleted);
             }
-            Ok(out_tid)
-        })
+            if let Some(new_datum) = &values[*col_index] {
+                let key = encode_key(new_datum)?;
+                index.insert(&key, out_tid)?;
+                self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+            }
+        }
+        Ok(out_tid)
     }
 
     /// Delete the row at `tid` (logical delete: stamps `t_xmax`; single
@@ -1072,6 +1405,10 @@ impl Engine {
     /// a consistent index (its `EntryNotFound` would mean the index and the
     /// table already disagreed). NULL keys are skipped.
     pub fn delete(&self, table: &str, tid: Tid) -> Result<()> {
+        self.auto_commit(|snap| self.delete_inner(snap, table, tid))
+    }
+
+    fn delete_inner(&self, snap: &Snapshot, table: &str, tid: Tid) -> Result<()> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
         let indexes = self.indexes_of(&entry);
@@ -1080,20 +1417,20 @@ impl Engine {
         } else {
             self.read_row_by_tid(&entry, &col_types, tid)?
         };
-        self.auto_commit(|snap| {
-            self.heap.delete(DeleteContext {
-                rel: relation_desc(&entry, &col_types),
-                snapshot: snap,
-                tid,
-                clog: self.clog.as_ref(),
-            })?;
-            for (idx, col_index) in &indexes {
-                if let Some(old_datum) = &old_values[*col_index] {
-                    self.open_btree(idx)?.delete(&encode_key(old_datum)?, tid)?;
-                }
+        self.heap.delete(DeleteContext {
+            rel: relation_desc(&entry, &col_types),
+            snapshot: snap,
+            tid,
+            clog: self.clog.as_ref(),
+        })?;
+        for (idx, col_index) in &indexes {
+            if let Some(old_datum) = &old_values[*col_index] {
+                let key = encode_key(old_datum)?;
+                self.open_btree(idx)?.delete(&key, tid)?;
+                self.record_index_undo(snap.current_xid, idx, key, tid, IndexUndoOp::Deleted);
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Every index registered on `entry`'s table, joined with the position
@@ -1122,6 +1459,27 @@ impl Engine {
         Ok(btree.open_index(idx.index_oid, idx.meta_page, idx.key_type)?)
     }
 
+    /// Append one index maintenance op to the per-transaction undo log
+    /// (Stage O review; see the `index_undo` field docs). Keyed by the
+    /// snapshot's own XID, which is the auto-commit XID or the explicit
+    /// transaction's XID depending on the caller — both paths route their
+    /// abort through the same log.
+    fn record_index_undo(
+        &self,
+        xid: TxnId,
+        idx: &IndexEntry,
+        key: Vec<u8>,
+        tid: Tid,
+        op: IndexUndoOp,
+    ) {
+        self.index_undo.lock().entry(xid).or_default().push(IndexUndo {
+            index: idx.clone(),
+            key,
+            tid,
+            op,
+        });
+    }
+
     /// Read back the decoded values of the row at `tid` directly from its
     /// heap page (raw read, no visibility filter: DML uses this to recover
     /// the OLD key of a row the caller already addressed by TID, before the
@@ -1142,24 +1500,308 @@ impl Engine {
         Ok(values)
     }
 
-    /// Run `op` as a single auto-commit transaction (§21: M2a exposes no
-    /// `begin_txn`): begin, run, commit. On error the transaction is
-    /// aborted best-effort and the *original* error is returned.
-    fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
-        // Read-side of the commit/checkpoint barrier (see the field docs):
-        // statements run concurrently with each other, but `Engine::checkpoint`
-        // waits for every in-flight statement to finish commit/abort before
-        // its CLOG flush and redo-point advance.
+    /// Begin an explicit transaction, returning a [`TxnHandle`] for
+    /// commit/abort control (§21 M2b API). The snapshot is taken at this
+    /// point (SI isolation); `curcid` starts at 0 and is advanced by the
+    /// executor before each SQL statement.
+    pub fn begin_txn(&self) -> Result<TxnHandle> {
         let _barrier = self.commit_barrier.read();
         let xid = self.txn.begin_txn();
-        let mut snap = Snapshot::everything();
-        snap.current_xid = xid;
+        let snapshot = self.txn.snapshot(xid);
+        Ok(TxnHandle {
+            txn: Arc::clone(&self.txn),
+            barrier: Arc::clone(&self.commit_barrier),
+            xid: Some(xid),
+            snapshot: RefCell::new(snapshot),
+            instance_id: self.instance_id,
+            index_undo: Arc::clone(&self.index_undo),
+            buffer_pool: Arc::clone(self.storage.buffer_pool()),
+            wal_writer: Arc::clone(self.storage.wal_writer()),
+        })
+    }
+
+    /// Execute a SQL statement (§21 M2b API).
+    ///
+    /// `txn = None` runs in auto-commit mode; `txn = Some(h)` runs inside an
+    /// explicit transaction (use [`Engine::begin_txn`] to create one).
+    /// BEGIN/COMMIT/ROLLBACK as SQL text are rejected: transaction control
+    /// is programmatic only ([`Engine::begin_txn`], [`TxnHandle::commit`],
+    /// [`TxnHandle::abort`]).
+    ///
+    /// # No statement-level rollback (M2b)
+    ///
+    /// There are no subtransactions: if a statement inside an explicit
+    /// transaction fails mid-way, the rows it already wrote REMAIN in the
+    /// transaction, and the only safe follow-up is [`TxnHandle::abort`].
+    pub fn exec(&self, txn: Option<&TxnHandle>, sql: &str) -> Result<QueryResult> {
+        let stmt = sql::parse(sql)?;
+        match txn {
+            None => self.exec_auto(stmt),
+            Some(h) => self.exec_txn(h, stmt),
+        }
+    }
+
+    fn exec_auto(&self, stmt: Statement) -> Result<QueryResult> {
+        match stmt {
+            // Transaction control is programmatic only (Stage O review):
+            // auto-commit mode has no transaction to begin or end, so these
+            // must fail loudly instead of silently returning Ok.
+            Statement::Begin => Err(EngineError::InvalidArgument(
+                "BEGIN via exec is not supported; use Engine::begin_txn()".to_string(),
+            )),
+            Statement::Commit | Statement::Rollback => Err(EngineError::InvalidArgument(
+                "no transaction in progress".to_string(),
+            )),
+            Statement::CreateTable { name, columns } => {
+                let defs: Vec<ColumnDef> = columns
+                    .into_iter()
+                    .map(|c| ColumnDef {
+                        name: c.name,
+                        col_type: c.col_type,
+                    })
+                    .collect();
+                self.create_table(&name, &defs)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::CreateIndex { table, column } => {
+                self.create_index(&table, &column)?;
+                Ok(QueryResult::Ok)
+            }
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                let count = self.auto_commit(|snap| {
+                    let entry = self.table_entry(&table)?;
+                    let mut count = 0;
+                    for row in &rows {
+                        let values = build_insert_values(&entry, &columns, row)?;
+                        self.insert_inner(snap, &entry, &values)?;
+                        count += 1;
+                    }
+                    Ok(count)
+                })?;
+                Ok(QueryResult::Affected(count))
+            }
+            Statement::Select {
+                columns,
+                table,
+                filter,
+                order_by,
+                limit,
+            } => {
+                let mut snap = self.txn.snapshot(TxnId::INVALID);
+                snap.advance_curcid();
+                self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit)
+            }
+            Statement::Update {
+                table,
+                sets,
+                filter,
+            } => {
+                let count = self.auto_commit(|snap| {
+                    let entry = self.table_entry(&table)?;
+                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                    let rows = self.scan_inner(snap, &table, pred.as_ref())?;
+                    let mut count = 0;
+                    for (tid, old_values) in rows {
+                        let new_values = apply_sets(&entry, &old_values, &sets)?;
+                        self.update_inner(snap, &table, tid, &new_values)?;
+                        count += 1;
+                    }
+                    Ok(count)
+                })?;
+                Ok(QueryResult::Affected(count))
+            }
+            Statement::Delete { table, filter } => {
+                let count = self.auto_commit(|snap| {
+                    let entry = self.table_entry(&table)?;
+                    let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                    let rows = self.scan_inner(snap, &table, pred.as_ref())?;
+                    let mut count = 0;
+                    for (tid, _) in rows {
+                        self.delete_inner(snap, &table, tid)?;
+                        count += 1;
+                    }
+                    Ok(count)
+                })?;
+                Ok(QueryResult::Affected(count))
+            }
+        }
+    }
+
+    fn exec_txn(&self, handle: &TxnHandle, stmt: Statement) -> Result<QueryResult> {
+        // A handle is bound to its creating engine (Stage O review): using
+        // it against another instance would run statements against the wrong
+        // registry while writing through the original engine's txn manager.
+        if handle.instance_id != self.instance_id {
+            return Err(EngineError::InvalidArgument(
+                "transaction handle belongs to a different Engine instance".to_string(),
+            ));
+        }
+        handle.advance_curcid();
+        let snap = handle.snapshot.borrow();
+        match stmt {
+            Statement::Begin => Err(EngineError::InvalidArgument(
+                "nested BEGIN is not supported; already in an explicit transaction".to_string(),
+            )),
+            Statement::Commit => Err(EngineError::InvalidArgument(
+                "COMMIT via exec is not supported; call TxnHandle::commit() instead".to_string(),
+            )),
+            Statement::Rollback => Err(EngineError::InvalidArgument(
+                "ROLLBACK via exec is not supported; call TxnHandle::abort() instead".to_string(),
+            )),
+            Statement::CreateTable { .. } | Statement::CreateIndex { .. } => {
+                drop(snap);
+                Err(EngineError::InvalidArgument(
+                    "DDL inside explicit transactions is not supported in M2b; run DDL in auto-commit mode (exec(None, ...))".to_string(),
+                ))
+            }
+            Statement::Insert {
+                table,
+                columns,
+                rows,
+            } => {
+                let entry = self.table_entry(&table)?;
+                let mut count = 0;
+                for row in &rows {
+                    let values = build_insert_values(&entry, &columns, row)?;
+                    self.insert_inner(&snap, &entry, &values)?;
+                    count += 1;
+                }
+                Ok(QueryResult::Affected(count))
+            }
+            Statement::Select {
+                columns,
+                table,
+                filter,
+                order_by,
+                limit,
+            } => self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit),
+            Statement::Update {
+                table,
+                sets,
+                filter,
+            } => {
+                let entry = self.table_entry(&table)?;
+                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
+                let mut count = 0;
+                for (tid, old_values) in rows {
+                    let new_values = apply_sets(&entry, &old_values, &sets)?;
+                    self.update_inner(&snap, &table, tid, &new_values)?;
+                    count += 1;
+                }
+                Ok(QueryResult::Affected(count))
+            }
+            Statement::Delete { table, filter } => {
+                let entry = self.table_entry(&table)?;
+                let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+                let rows = self.scan_inner(&snap, &table, pred.as_ref())?;
+                let mut count = 0;
+                for (tid, _) in rows {
+                    self.delete_inner(&snap, &table, tid)?;
+                    count += 1;
+                }
+                Ok(QueryResult::Affected(count))
+            }
+        }
+    }
+
+    fn exec_select(
+        &self,
+        snap: &Snapshot,
+        columns: &SelectCols,
+        table: &str,
+        filter: &Option<Filter>,
+        order_by: &Option<OrderBy>,
+        limit: &Option<usize>,
+    ) -> Result<QueryResult> {
+        let entry = self.table_entry(table)?;
+        let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
+        let mut rows = self.scan_inner(snap, table, pred.as_ref())?;
+        if let Some(ob) = order_by {
+            let idx = entry
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&ob.column))
+                .ok_or_else(|| {
+                    EngineError::InvalidPredicate(format!("no column {:?} in table", ob.column))
+                })?;
+            rows.sort_by(|a, b| {
+                let av = a.1.get(idx);
+                let bv = b.1.get(idx);
+                let cmp = av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal);
+                if ob.desc {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            });
+        }
+        if let Some(n) = limit {
+            rows.truncate(*n);
+        }
+        let (col_names, projected) = match columns {
+            SelectCols::All => {
+                let names: Vec<String> = entry.columns.iter().map(|c| c.name.clone()).collect();
+                let rows: Vec<Vec<Value>> = rows.into_iter().map(|(_, v)| v).collect();
+                (names, rows)
+            }
+            SelectCols::Cols(cols) => {
+                let indices: Vec<usize> = cols
+                    .iter()
+                    .map(|name| {
+                        entry
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(|| {
+                                EngineError::InvalidPredicate(format!(
+                                    "no column {name:?} in table"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let rows: Vec<Vec<Value>> = rows
+                    .into_iter()
+                    .map(|(_, v)| indices.iter().map(|&i| v[i].clone()).collect())
+                    .collect();
+                (cols.clone(), rows)
+            }
+        };
+        Ok(QueryResult::Rows {
+            columns: col_names,
+            rows: projected,
+        })
+    }
+
+    /// Run `op` as a single auto-commit transaction (§21): begin, take a
+    /// real SI snapshot, advance curcid (Halloween protection), run, commit.
+    /// On error the transaction's index maintenance is reverse-applied from
+    /// the undo log (Stage O review) and the transaction is aborted
+    /// best-effort; the *original* error is returned.
+    fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
+        let _barrier = self.commit_barrier.read();
+        let xid = self.txn.begin_txn();
+        let mut snap = self.txn.snapshot(xid);
+        snap.advance_curcid();
         match op(&snap) {
             Ok(v) => {
-                self.txn.commit_txn(xid)?;
+                let result = self.txn.commit_txn(xid);
+                // Discard the undo log either way (see TxnHandle::commit).
+                self.index_undo.lock().remove(&xid);
+                result?;
                 Ok(v)
             }
             Err(e) => {
+                apply_index_undo(
+                    &self.index_undo,
+                    self.storage.buffer_pool(),
+                    self.storage.wal_writer(),
+                    xid,
+                );
                 if let Err(abort_err) = self.txn.abort_txn(xid) {
                     tracing::warn!(error = %abort_err, "auto-commit abort failed");
                 }
@@ -1179,7 +1821,7 @@ impl Engine {
         row: &[Value],
     ) -> Result<()> {
         let columns = def.column_types();
-        let tuple = encode_tuple(tuple_header(), &columns, row)?;
+        let tuple = encode_tuple(tuple_header(snap.curcid), &columns, row)?;
         self.ensure_catalog_room(def, tuple.len())?;
         self.heap.insert(InsertContext {
             rel: RelationDesc {
@@ -1318,9 +1960,10 @@ impl Engine {
 
 /// A tuple header for engine-encoded rows: every identity field is a
 /// placeholder — the AM stamps `t_xmin` with the writer's XID (Stage K),
-/// `t_xmax` starts INVALID, and `t_ctid` is not maintained by the AM
-/// (INVALID-ish self-reference placeholder, per the M2a contract).
-fn tuple_header() -> TupleHeader {
+/// `t_xmax` starts INVALID, `t_ctid` is not maintained by the AM
+/// (INVALID-ish self-reference placeholder), and `t_cid` is set to the
+/// statement's `curcid` (Stage O: Halloween protection, §7.2 / v2.3-Q4).
+fn tuple_header(curcid: u32) -> TupleHeader {
     TupleHeader::new(
         TxnId::INVALID,
         TxnId::INVALID,
@@ -1330,7 +1973,7 @@ fn tuple_header() -> TupleHeader {
             page_id: PageId::INVALID,
             slot_id: 0,
         },
-        0,
+        curcid,
     )
 }
 
@@ -1349,7 +1992,12 @@ fn relation_desc<'a>(entry: &TableEntry, col_types: &'a [ColumnType]) -> Relatio
 }
 
 /// Encode `values` as a heap tuple against the entry's schema.
-fn encode_row(entry: &TableEntry, col_types: &[ColumnType], values: &[Value]) -> Result<Vec<u8>> {
+fn encode_row(
+    entry: &TableEntry,
+    col_types: &[ColumnType],
+    values: &[Value],
+    curcid: u32,
+) -> Result<Vec<u8>> {
     if values.len() != entry.columns.len() {
         return Err(EngineError::InvalidArgument(format!(
             "table has {} columns but {} values given",
@@ -1357,7 +2005,31 @@ fn encode_row(entry: &TableEntry, col_types: &[ColumnType], values: &[Value]) ->
             values.len()
         )));
     }
-    Ok(encode_tuple(tuple_header(), col_types, values)?)
+    Ok(encode_tuple(tuple_header(curcid), col_types, values)?)
+}
+
+/// Check that a predicate's column index is in range for the table.
+fn validate_predicate(table: &str, entry: &TableEntry, predicate: Option<&Predicate>) -> Result<()> {
+    if let Some(p) = predicate {
+        if p.col_index() >= entry.columns.len() {
+            return Err(EngineError::InvalidPredicate(format!(
+                "table {table:?} has {} columns, predicate references column {}",
+                entry.columns.len(),
+                p.col_index()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Filter `rows` in place by the predicate (single-column comparison).
+fn apply_predicate(rows: &mut Vec<(Tid, Vec<Value>)>, predicate: Option<&Predicate>) {
+    if let Some(p) = predicate {
+        let col_index = p.col_index();
+        rows.retain(|(_, vals)| {
+            vals.get(col_index).is_some_and(|v| p.matches(v))
+        });
+    }
 }
 
 /// Map a codec column type to its built-in `pg_type` OID and `attlen`
@@ -1368,4 +2040,137 @@ fn type_oid_of(col_type: ColumnType) -> Result<(TypeOid, i32)> {
         .find(|t| t.column_type == col_type)
         .map(|t| (t.oid, t.len))
         .ok_or_else(|| EngineError::InvalidArgument(format!("no builtin type for {col_type:?}")))
+}
+
+/// Convert a SQL `Literal` to a heap `Value` (`Option<Datum>`) given the
+/// target column type.
+fn literal_to_value(lit: &Literal, col_type: ColumnType) -> Result<Value> {
+    match (lit, col_type) {
+        (Literal::Int(n), ColumnType::Int4) => Ok(Some(Datum::Int4(i32::try_from(*n).map_err(
+            |_| EngineError::InvalidArgument("integer literal out of range for INT4".to_string()),
+        )?))),
+        (Literal::Int(n), ColumnType::Int8) => Ok(Some(Datum::Int8(*n))),
+        (Literal::Int(n), ColumnType::Timestamptz) => Ok(Some(Datum::Timestamptz(*n))),
+        (Literal::Str(s), ColumnType::Text) => Ok(Some(Datum::Text(s.clone()))),
+        (Literal::Str(s), ColumnType::Bytea) => Ok(Some(Datum::Bytea(s.clone().into_bytes()))),
+        (Literal::Null, _) => Ok(None),
+        (l, t) => Err(EngineError::InvalidArgument(format!(
+            "literal {l:?} is not compatible with column type {t:?}"
+        ))),
+    }
+}
+
+/// Build the full `values` vector for an INSERT, matching the table schema.
+fn build_insert_values(
+    entry: &TableEntry,
+    columns: &Option<Vec<String>>,
+    row: &[Literal],
+) -> Result<Vec<Value>> {
+    let n = entry.columns.len();
+    let values = match columns {
+        Some(cols) => {
+            if cols.len() != row.len() {
+                return Err(EngineError::InvalidArgument(format!(
+                    "column list has {} entries but {} values given",
+                    cols.len(),
+                    row.len()
+                )));
+            }
+            let mut v = vec![None; n];
+            for (col_name, lit) in cols.iter().zip(row.iter()) {
+                let idx = entry
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| {
+                        EngineError::InvalidArgument(format!(
+                            "no column {col_name:?} in table"
+                        ))
+                    })?;
+                v[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
+            }
+            v
+        }
+        None => {
+            if row.len() != n {
+                return Err(EngineError::InvalidArgument(format!(
+                    "table has {n} columns but {} values given",
+                    row.len()
+                )));
+            }
+            row.iter()
+                .zip(entry.columns.iter())
+                .map(|(lit, col)| literal_to_value(lit, col.col_type))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    Ok(values)
+}
+
+/// Build a `Predicate` from a parsed `Filter`, resolving the column name
+/// to a 0-based index and converting the literal.
+fn filter_to_predicate(entry: &TableEntry, filter: &Filter) -> Result<Predicate> {
+    let col_index = entry
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(&filter.column))
+        .ok_or_else(|| {
+            EngineError::InvalidPredicate(format!("no column {:?} in table", filter.column))
+        })?;
+    let col_type = entry.columns[col_index].col_type;
+    let value = match &filter.value {
+        Literal::Int(n) => match col_type {
+            ColumnType::Int4 => Datum::Int4(i32::try_from(*n).map_err(|_| {
+                EngineError::InvalidArgument("integer literal out of range for INT4".to_string())
+            })?),
+            ColumnType::Int8 => Datum::Int8(*n),
+            ColumnType::Timestamptz => Datum::Timestamptz(*n),
+            _ => {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "column {:?} is not numeric",
+                    filter.column
+                )))
+            }
+        },
+        Literal::Str(s) => match col_type {
+            ColumnType::Text => Datum::Text(s.clone()),
+            _ => {
+                return Err(EngineError::InvalidPredicate(format!(
+                    "column {:?} is not text",
+                    filter.column
+                )))
+            }
+        },
+        Literal::Null => {
+            return Err(EngineError::InvalidPredicate(
+                "NULL in WHERE is not supported".to_string(),
+            ))
+        }
+    };
+    Ok(match filter.op {
+        CmpOp::Eq => Predicate::Eq { col_index, value },
+        CmpOp::Lt => Predicate::Lt { col_index, value },
+        CmpOp::Gt => Predicate::Gt { col_index, value },
+    })
+}
+
+/// Apply UPDATE SET assignments to an existing row, producing the full new
+/// values vector.
+fn apply_sets(
+    entry: &TableEntry,
+    old_values: &[Value],
+    sets: &[(String, Literal)],
+) -> Result<Vec<Value>> {
+    let mut new_values = old_values.to_vec();
+    for (col_name, lit) in sets {
+        let idx = entry
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| {
+                EngineError::InvalidArgument(format!("no column {col_name:?} in table"))
+            })?;
+        new_values[idx] = literal_to_value(lit, entry.columns[idx].col_type)?;
+    }
+    Ok(new_values)
 }

@@ -174,6 +174,14 @@ fn duplicate_keys_allowed_with_distinct_tids() {
     ));
     // Lookup returns the first entry with the key.
     assert_eq!(index.lookup(&k).unwrap(), Some(tid(0)));
+    // lookup_all returns every duplicate in (key, tid) order.
+    let all = index.lookup_all(&k).unwrap();
+    assert_eq!(all.len(), 500);
+    for (i, t) in all.iter().enumerate() {
+        assert_eq!(*t, tid(i as u64));
+    }
+    // lookup_all on a missing key is empty (not an error).
+    assert_eq!(index.lookup_all(&key(8)).unwrap(), Vec::<Tid>::new());
     // Range scan returns every duplicate in (key, tid) order.
     let rows = index.range_scan(Some(&k), None).unwrap();
     assert_eq!(rows.len(), 500);
@@ -370,4 +378,28 @@ fn stale_root_handle_cannot_fork_the_tree() {
     assert_eq!(a.root_page(), current_root);
     a.validate().unwrap();
     assert_all_present(&a, 3_000);
+}
+
+/// lookup_all must walk leaf siblings: one key with enough duplicates to
+/// span several leaf pages (~18 B per Int4 entry, ~450 per page, so 3000
+/// duplicates cover ~7 leaves) returns every TID, in (key, tid) order.
+#[test]
+fn lookup_all_spans_leaf_siblings() {
+    let (_tmp, _engine, mut index) = setup();
+    let k = key(7);
+    const DUPS: u64 = 3_000;
+    for i in 0..DUPS {
+        index.insert(&k, tid(i)).unwrap();
+    }
+    // Sanity: the tree did split (duplicates are not on one leaf).
+    assert!(index.tree_level() >= 1, "3000 duplicates must split leaves");
+    let all = index.lookup_all(&k).unwrap();
+    assert_eq!(all.len(), DUPS as usize);
+    for (i, t) in all.iter().enumerate() {
+        assert_eq!(*t, tid(i as u64), "duplicate {i} out of order or missing");
+    }
+    // Neighboring keys are untouched.
+    assert_eq!(index.lookup_all(&key(6)).unwrap(), Vec::<Tid>::new());
+    assert_eq!(index.lookup_all(&key(8)).unwrap(), Vec::<Tid>::new());
+    index.validate().unwrap();
 }

@@ -232,6 +232,26 @@ pub enum Datum {
     External(ToastPointer),
 }
 
+impl PartialOrd for Datum {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Datum::Int4(a), Datum::Int4(b)) => Some(a.cmp(b)),
+            (Datum::Int8(a), Datum::Int8(b)) => Some(a.cmp(b)),
+            (Datum::Timestamptz(a), Datum::Timestamptz(b)) => Some(a.cmp(b)),
+            (Datum::Uuid(a), Datum::Uuid(b)) => Some(a.cmp(b)),
+            (Datum::Text(a), Datum::Text(b)) => Some(a.cmp(b)),
+            (Datum::Bytea(a), Datum::Bytea(b)) => Some(a.cmp(b)),
+            // Cross-type comparisons return None: never triggered when
+            // comparing values of ONE column (they share a variant by
+            // construction); the engine's ORDER BY falls back to `Equal`
+            // via `unwrap_or(Equal)`, so a type mix-up sorts silently
+            // instead of failing — acceptable for the M2b subset, which
+            // never compares across column types.
+            _ => None,
+        }
+    }
+}
+
 impl Datum {
     /// The column type this datum is encoded for.
     fn column_type(&self) -> ColumnType {

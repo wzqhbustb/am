@@ -350,6 +350,57 @@ impl BTreeIndex {
         }
     }
 
+    /// Point lookup with duplicates: return the heap TIDs of **every**
+    /// entry with `key`, in `(key, tid)` order.
+    ///
+    /// M2b indexes are non-unique, so a key can map to several heap versions
+    /// (e.g. after an UPDATE leaves a dead version behind, or two rows share
+    /// a key). Callers that judge heap visibility per TID (the engine's
+    /// `index_lookup`) must see all of them, not just the first.
+    pub fn lookup_all(&self, key: &[u8]) -> Result<Vec<Tid>> {
+        let probe_tid = Tid {
+            page_id: PageId::INVALID,
+            slot_id: 0,
+        };
+        let (mut leaf, _, _) = self.descend_to_leaf(key, &probe_tid)?;
+        let mut slot = {
+            let guard = self.buffer_pool.pin(leaf)?;
+            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+            leaf_lower_bound(page, key, &probe_tid)? as u16
+        };
+        // Same walk as `lookup`, but collecting while the entry key matches
+        // and stopping at the first greater key (duplicates are adjacent in
+        // (key, tid) order, possibly spanning leaf siblings).
+        let mut out = Vec::new();
+        let mut hops = 0usize;
+        loop {
+            let guard = self.buffer_pool.pin(leaf)?;
+            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+            let count = SlottedPage::slot_count(page) as u16;
+            while slot < count {
+                let (k, tid) = page::decode_leaf_entry(entry_bytes(page, slot)?)?;
+                if k != key {
+                    return Ok(out);
+                }
+                out.push(tid);
+                slot += 1;
+            }
+            let next = BtreePage::next(page)?;
+            drop(guard);
+            if next == PageId::INVALID {
+                return Ok(out);
+            }
+            leaf = next;
+            slot = 0;
+            hops += 1;
+            if hops > MAX_CHAIN_HOPS {
+                return Err(BTreeError::Corrupted(
+                    "leaf sibling chain exceeds hop bound (cycle?)".to_string(),
+                ));
+            }
+        }
+    }
+
     /// Range scan over the leaf chain: every entry with
     /// `start <= key < end` (an open side is unbounded), in key order.
     ///

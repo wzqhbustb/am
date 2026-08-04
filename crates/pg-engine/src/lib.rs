@@ -27,10 +27,11 @@
 pub mod clog_snapshot_migrate;
 pub mod engine;
 pub mod error;
+pub mod sql;
 
 pub use engine::{
-    ColumnDef, Engine, EngineConfig, IndexEntry, Predicate, TableEntry, Value,
-    DEFAULT_CLOG_BUFFER_FRAMES,
+    ColumnDef, Engine, EngineConfig, IndexEntry, Predicate, QueryResult, TableEntry, TxnHandle,
+    Value, DEFAULT_CLOG_BUFFER_FRAMES,
 };
 pub use error::{EngineError, Result};
 

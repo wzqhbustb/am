@@ -37,3 +37,7 @@ criterion = "0.5"
 [[bench]]
 name = "m2a_100_threads"
 harness = false
+
+[[bench]]
+name = "m2b_perf"
+harness = false

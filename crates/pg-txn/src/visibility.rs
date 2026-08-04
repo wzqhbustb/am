@@ -148,53 +148,68 @@ impl VisibilityOracle for PgVisibilityOracle {
     }
 }
 
-/// Whether `xid` counts as committed *and* visible relative to `snap`.
+/// Decide whether a heap tuple is visible under `snap` (§7.2 full logic).
 ///
-/// A transaction is visible when it either is the snapshot's own transaction,
-/// or it completed before the snapshot (`< xmax`, not in `xip`) and the CLOG
-/// records it as committed.
-fn is_effectively_committed(xid: TxnId, snap: &Snapshot, clog: &dyn ClogAccessor) -> bool {
-    if xid == TxnId::INVALID {
-        return false;
-    }
-    if xid == snap.current_xid {
-        return true;
-    }
-    if xid >= snap.xmax {
-        return false;
-    }
-    if snap.xip.contains(&xid) {
-        return false;
-    }
-    clog.get_state(xid) == TxnState::Committed
-}
-
-/// Decide whether a heap tuple is visible under `snap` (M2a compatibility
-/// entry point).
-///
-/// Takes the raw `t_xmin` / `t_xmax` header fields rather than a
+/// Takes the raw `t_xmin` / `t_xmax` / `t_cid` header fields rather than a
 /// `pg_am_heap::TupleHeader` on purpose: `pg-am-heap` depends on `pg-txn`, so
 /// referencing its types here would create a dependency cycle.
 ///
-/// This is the pre-curcid judgment kept for the existing AM call shape
-/// (`is_visible(t_xmin, t_xmax, snap, clog)`). It is the `t_cid = 0`
-/// equivalence path of [`PgVisibilityOracle`] with one deliberate difference:
-/// the snapshot's own writes are always visible (`xmin == current_xid` short
-/// circuits to committed), matching M2a auto-commit where the writer's own
-/// snapshot must see its rows within the single statement. The full oracle
-/// would hide them under `t_cid == curcid == 0`, which is the M2b self-scan
-/// semantics — correct only once the executor advances `curcid` per statement
-/// and stamps real `t_cid`s. Wave 3 migrates the AM to the oracle; until then
-/// this function preserves the M2a behavior exactly.
-pub fn is_visible(t_xmin: TxnId, t_xmax: TxnId, snap: &Snapshot, clog: &dyn ClogAccessor) -> bool {
-    if !is_effectively_committed(t_xmin, snap, clog) {
-        return false;
+/// This is the `bool`-returning twin of [`PgVisibilityOracle::is_visible`],
+/// kept for the AM's `&dyn ClogAccessor` call shape (the oracle takes
+/// `Arc<dyn ClogAccessor>`).
+pub fn is_visible(
+    t_xmin: TxnId,
+    t_xmax: TxnId,
+    t_cid: u32,
+    snap: &Snapshot,
+    clog: &dyn ClogAccessor,
+) -> bool {
+    let self_xid = snap.current_xid;
+    let curcid = snap.curcid;
+
+    // §7.2 step 1 — xmin 判定.
+    if t_xmin == self_xid {
+        // 自己写的: visible only when written by an earlier command
+        // (`t_cid < curcid`); the current command's own writes do not
+        // participate in its own scan (UPDATE-loop avoidance, v2.3-3 / Q4).
+        if t_cid >= curcid {
+            return false;
+        }
+        // `t_cid < curcid`: fall through to the xmax 判定.
+    } else {
+        if t_xmin >= snap.xmax {
+            return false; // 未来事务
+        }
+        if snap.xip.contains(&t_xmin) {
+            return false; // 并发未提交
+        }
+        if clog.get_state(t_xmin) != TxnState::Committed {
+            return false; // 未提交/已回滚
+        }
     }
+    // → 到这里 xmin 已提交且早于快照 (or self, written by an earlier command).
+
+    // §7.2 step 2 — xmax 判定.
     if t_xmax == TxnId::INVALID {
+        return true; // 未被删除
+    }
+    if t_xmax == self_xid {
+        // 自己删的: deleted by an earlier command → invisible; deleted by
+        // the current command → still visible (DELETE ... RETURNING reads its
+        // own victim through the output channel).
+        return t_cid >= curcid;
+    }
+    if t_xmax >= snap.xmax {
+        return true; // 未来删除
+    }
+    if snap.xip.contains(&t_xmax) {
+        // 并发未提交删除 → M2b answers Visible (no lock-wait protocol, v2.3 P2-2).
         return true;
     }
-    // Deleted: invisible only if the deleting transaction is itself visible.
-    !is_effectively_committed(t_xmax, snap, clog)
+    if clog.get_state(t_xmax) != TxnState::Committed {
+        return true; // 删除未提交/已回滚
+    }
+    false
 }
 
 #[cfg(test)]
@@ -207,7 +222,7 @@ mod tests {
     fn everything_sees_live_tuple() {
         let snap = Snapshot::everything();
         let clog = NoOpClogAccessor;
-        assert!(is_visible(TxnId(5), TxnId::INVALID, &snap, &clog));
+        assert!(is_visible(TxnId(5), TxnId::INVALID, 0, &snap, &clog));
     }
 
     #[test]
@@ -215,17 +230,31 @@ mod tests {
         let snap = Snapshot::everything();
         let clog = NoOpClogAccessor;
         // NoOpClog treats the deleter as committed, so a set xmax hides the row.
-        assert!(!is_visible(TxnId(5), TxnId(6), &snap, &clog));
+        assert!(!is_visible(TxnId(5), TxnId(6), 0, &snap, &clog));
     }
 
     #[test]
-    fn own_insert_is_visible_even_if_uncommitted() {
+    fn own_insert_visible_when_written_by_earlier_command() {
         let mut snap = Snapshot::everything();
         snap.current_xid = TxnId(42);
+        snap.curcid = 1; // advanced past the insert command
         snap.xmax = TxnId(43);
         snap.xip = smallvec![TxnId(42)];
         let clog = NoOpClogAccessor;
-        assert!(is_visible(TxnId(42), TxnId::INVALID, &snap, &clog));
+        // t_cid=0 < curcid=1 → visible (written by an earlier command).
+        assert!(is_visible(TxnId(42), TxnId::INVALID, 0, &snap, &clog));
+    }
+
+    #[test]
+    fn own_insert_invisible_to_current_command() {
+        let mut snap = Snapshot::everything();
+        snap.current_xid = TxnId(42);
+        snap.curcid = 1; // the insert command itself
+        snap.xmax = TxnId(43);
+        snap.xip = smallvec![TxnId(42)];
+        let clog = NoOpClogAccessor;
+        // t_cid=1 == curcid=1 → invisible (current command's own write).
+        assert!(!is_visible(TxnId(42), TxnId::INVALID, 1, &snap, &clog));
     }
 
     #[test]
@@ -238,7 +267,7 @@ mod tests {
             curcid: 0,
         };
         let clog = NoOpClogAccessor;
-        assert!(!is_visible(TxnId(20), TxnId::INVALID, &snap, &clog));
+        assert!(!is_visible(TxnId(20), TxnId::INVALID, 0, &snap, &clog));
     }
 
     #[test]

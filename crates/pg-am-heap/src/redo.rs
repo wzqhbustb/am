@@ -211,6 +211,17 @@ fn stamp_pd_lsn(page: &mut [u8; PAGE_SIZE], lsn: Lsn) {
 
 /// Stamp `t_xmax` (and optionally `HEAP_UPDATED`) onto the tuple at `tid`'s
 /// slot, mirroring `HeapAM::stamp_deleted` for the redo path.
+///
+/// Accepted asymmetry (M2b trade-off): the live delete/update path stamps
+/// BOTH `t_xmax` and the deleting command's `t_cid`, but redo restores only
+/// `t_xmax` — the WAL delete/update record does not carry the command id.
+/// This is benign because `t_cid` only matters to the deleting transaction
+/// itself (same-txn "own delete" visibility, §7.2), and a transaction whose
+/// delete is being replayed by definition did not survive crash recovery:
+/// no post-recovery snapshot ever carries that XID as `current_xid`, so the
+/// stale `t_cid` is never consulted. Revisit when subtransactions or
+/// statement-level rollback arrive (they reintroduce same-XID
+/// command-id-sensitive visibility after recovery-adjacent aborts).
 fn stamp_deleted(
     page: &mut [u8; PAGE_SIZE],
     tid: Tid,
