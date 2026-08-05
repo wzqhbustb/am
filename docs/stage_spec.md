@@ -324,3 +324,92 @@ Agent 场景长事务多读，SI 避免语句间视图漂移；M2b 实现上 aut
 - 锁管理器、行锁 xmax 协议、B+Tree 并发、HOT update、ARIES Undo/CLR → **M2c（Stage P–T）**
 
 ---
+
+## Stage P：LockManager 表锁 + 行锁 xmax 协议 + SELECT FOR UPDATE
+
+**状态**：✅ 完成（M2c 开篇，534 测试全绿；未提交）
+**工期**：预估 5–7 天
+**验收**：`lock_manager` 8/8（4×4 全矩阵）；`row_lock_wait_wake` 8/8；100 线程并发 UPDATE 同一行终值精确无 lost update；无冲突 UPDATE ~11.2K TPS（30K 未达——per-commit fsync 物理上限，与 M2a 无锁基线 11.6K 持平，证明锁路径零额外开销；bench 头部如实声明）
+
+### 交付内容
+
+1. **表级 LockManager（`pg-txn/lock_manager.rs`）**
+   - 4 模式 grant 矩阵（§9.2）；键为 `pg_storage::Oid`（遵守"pg-txn 不依赖 pg-catalog"硬约束）
+   - `LockEntry` = granted 集 + FIFO wait 队列；`can_grant` 三道闸门：已持同级或更强 → 幂等放行 / 队列非空且非队头 → 必等（**反饿死**：兼容模式也不许插队）/ 与其他持有者无冲突
+   - 升级原地 max 强度；冲突升级保留旧授权排队（与 PG 一致，互升死锁归 Stage R）
+   - `release_all(xid)` 清授权 + 清队列项（防死 XID 队头毒化）+ 顺序预授权兼容连续队头；2PL：持锁到事务结束，只升不降
+   - `table_lock_state()` 内省快照 = Stage R 表锁半边 wait-for 图的输入
+
+2. **行锁等待设施（`pg-txn/manager.rs`）**
+   - `row_wait_registry: Mutex<HashMap<Xid, Xid>>`（waiter → waiting_on）+ Condvar
+   - `wait_for(self, blocking)`：谓词直查 active set（不依赖注册边），吸收虚假唤醒，醒来自清边；self-wait 报错；锁序 registry→active（唯一合法嵌套方向，已注释）
+   - `end_txn`：commit/abort 共用尾部，`set_state → active 移除 → notify_all` 严格序（广播必在 CLOG 置位之后，被唤醒者重读 CLOG 必见终态）
+   - `RowWaiter` 窄 trait 供 heap 层注入（比传整个 TxnManager 窄，便于测试）
+
+3. **commit barrier 下沉 TxnManager**（兑现 Stage L/N 的 M2c 计划）
+   - `commit_txn/abort_txn` 内部对整个硬序持 barrier 读守卫；checkpoint "Phase 0" 持写守卫覆盖临界段（begin_lsn 捕获 → ATT/DPT 采样 → CLOG flush → WAL 回收），范围与下沉前逐点相同
+   - pg-storage 侧沿用 AttProvider/ClogFlush 模式：`set_commit_barrier` 共享 `Arc<RwLock<()>>`
+   - pg-engine 删除自有 barrier 字段及全部守卫点；`txn_manager()` 后门的 checkpoint UB 按构造消除（残余：裸调 commit 不释放表锁，已文档化）
+
+4. **行锁 5 步 xmax 协议（`pg-am-heap/heap_am.rs`）**
+   - `row_lock_gate` 在页写 latch 下判定：INVALID/self → Proceed；Committed → `TupleConcurrentlyUpdated`（新错误，与 TupleNotFound 明确区分）；Aborted → Proceed；InProgress → **latch 内注册等待边**后返回 Wait（5a 先于 5b，绝不丢唤醒）
+   - delete/update/lock_tuple 改 restart 循环：Wait 时 drop 全部 latch → `wait_row_lock` → 重回步骤 1（"CAS"由页 latch 天然提供，无需原子指令）
+   - 崩溃豁免：InProgress 且不在活跃集 → 重读一次 CLOG（happens-before 经 active mutex 传递闭合）后才认定崩溃覆盖——修掉了实现期发现的"CLOG 置位与活跃集移除之间的误判窗口"真 bug
+   - 未安装 RowWaiter 时完全保留 M2b 旧行为（heap_abort_visibility 等既有测试原样通过）
+
+5. **HEAP_XMAX_LOCK_ONLY + SELECT FOR UPDATE**
+   - `HEAP_XMAX_LOCK_ONLY = 0x1000`（PG 同构）：xmax 置位但非删除——全部 t_xmax 读者（scan/live gate/vacuum 扫描/redo/engine 掩码）逐一核对正确屏蔽；真删除章清 LOCK_ONLY（live + redo 两侧）
+   - `lock_tuple`：同一 5 步协议盖 lock-only 章，**不写 WAL**（与 PG 一致；带锁章页面落盘后崩溃，恢复出死 XID 锁章，读者屏蔽、写者经崩溃豁免覆盖，无永久阻塞）
+   - parser：`FOR UPDATE` / `FOR SHARE` 子句（LIMIT 后、Eof 前）；exec：filter/ORDER BY/LIMIT 之后、投影之前逐行加锁（与 PG 一致只锁返回行）；FOR SHARE 报 `Unsupported`（multixact 占位）；auto-commit FOR UPDATE 锁随语句结束释放
+
+6. **表锁接线（pg-engine）**
+   - 全路径覆盖：exec 各臂 + 公共 DML/DDL；SELECT→AccessShare、DML+FOR UPDATE→RowExclusive、CREATE INDEX→Exclusive（整个 build 单事务化）、CREATE/DROP TABLE→AccessExclusive
+   - 释放点：auto_commit 成功/失败双路径 + TxnHandle commit/abort/Drop 五处全核对
+   - `lock_table_entry` helper：取锁成功后**重验 registry**（name→OID 一致），配合 drop_table"事务内摘除 registry 先于 commit 放锁"的排序，关闭 TOCTOU
+
+7. **Review 修复清单**（三路对抗审查后）
+   - **create_index 快照在 Exclusive 锁等待前获取 → 索引永久缺行**（高）：闭包内取锁后重取快照，测试补 `index_lookup(id=2)` 断言（修复前必红）
+   - **跨页 UPDATE 双 latch AB/BA 死锁**（中）：两个 latch 一律按 PageId 升序获取，重 pin 后重查空间 + `new_slot` 最终持锁后计算
+   - **table_entry → lock_table TOCTOU**（中）：向已 drop 表的已释放页写入；修复见 6
+   - **自真实删除章被补 LOCK_ONLY 复活行**（中）：gate 加 `for_lock` 细分——自 LOCK_ONLY 重锁幂等放行，自真实删除章上锁报错
+   - 文档类：wait_for 无超时语义、锁序注释、stamp_lock_only 的 t_cid 有损性、FOR UPDATE 值序加锁死锁面、auto_commit panic 策略
+
+### 设计理由
+
+**1. 为什么"CAS"不需要原子指令？**
+页 write latch 使"读 xmax → 判定 → 盖戳"天然原子。§9.1 的 CAS 语义由 latch 串行化提供，等待路径只需保证"注册先于放 latch"。这与跨页 update 既有的"放 latch → 重验"结构同形，改动面最小。
+
+**2. 为什么锁章不写 WAL？**
+锁是纯内存语义：崩溃后事务不存在，锁无需恢复。带锁章页面落盘后崩溃，恢复出的死 XID 锁章对读者被 LOCK_ONLY 屏蔽、对写者经崩溃豁免覆盖——WAL-less 既正确又省去 FOR UPDATE 的写放大。XID 64 位单调无复用，排除"陈旧锁章撞上复用 XID"。
+
+**3. 为什么 barrier 下沉用共享 `Arc<RwLock<()>>` 而非 trait+guard 对象？**
+与 `set_att_provider`/`set_clog_flush` 的 setter 模式一致且最简单；guard 对象方案卡在生命周期上，收益只是类型层面的抽象。
+
+**4. 为什么 FIFO 公平队列？**
+无公平性则 AccessExclusive（DDL）在持续读流下饿死；代价是兼容模式也不许插队（并发 AccessShare 吞吐略降），M2c 规模下正确性优先。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage P) | 取舍理由 |
+|---|---|---|---|
+| 死锁 | wait-for graph + 100ms 检测 + victim abort | **无检测无超时**，锁环 = 挂起 | 归 Stage R；等待边结构（`wait_edges`/`table_lock_state`）已按可消费形状预留 |
+| 行锁等待唤醒 | 锁队列按序授予 | 唤醒后与全新写者**平等竞争**盖戳，可饥饿 | 与 PG 行为一致；公平队列留待需要时 |
+| 并发更新冲突 | EvalPlanQual 重查（RC）/ could-not-serialize 报错（RR+） | 无 EPQ，`TupleConcurrentlyUpdated` 由调用方新快照重试 | 等价 PG RR 语义；EPQ 是执行器工作，后续 stage |
+| FOR SHARE | multixact 共享锁 | **解析后报 Unsupported** | multixact 是独立子系统，占位归后续 |
+| 锁章持久化 | LOCK_ONLY 不写 WAL | 同 PG | 无取舍 |
+| 表锁自省 | pg_locks 视图 | `table_lock_state()` 程序化 API | 系统表形态归 Phase 6 |
+| 升级死锁 | 检测器兜底 | 存在且不处理（同 PG 语义，无检测器） | Stage R |
+| 快照读 | 普通 SELECT 不需要表锁以上的东西 | 同；但 `Engine::scan`/`index_lookup`（无所属 XID 的裸 API）连 AccessShare 都不取 | 无 XID 无法 key 锁；DDL 竞态缺口已文档化 |
+
+### 已知残留与后续归队
+
+- **任何行锁/表锁等待环 = 永久挂起**（无检测无超时）→ **Stage R 死锁检测**（接口已预留：`wait_edges` + `table_lock_state`）
+- 无冲突 UPDATE 30K TPS 未达（~11.2K，fsync 物理上限；group commit 批窗口/ramdisk 可证锁路径非瓶颈）→ 性能归 Phase 7b
+- 唤醒后盖戳无公平性，高竞争下个别事务可饥饿 → 需要时再做
+- `lock_tuple` 覆盖 `t_cid` 有损（同语句自插后自锁使行对本语句不可见；当前 executor 不重扫，不可达）→ 子事务/EPQ 到来时重审
+- 闭包 panic 跳过 `release_all`（锁 + XID 泄漏，进程级故障策略）→ 已文档化，或后续 catch_unwind
+- 裸 `txn_manager()` commit 不释放表锁 → 已文档化；Stage R 落地前考虑守卫包装
+- B+Tree 并发（latch coupling + Blink 读写路径 + loom）→ **Stage Q**
+- 跨页 UPDATE 空间复查重启无上界（实践中对手有进展必终止）→ 观察项
+
+---
