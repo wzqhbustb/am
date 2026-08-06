@@ -45,3 +45,7 @@ harness = false
 [[bench]]
 name = "m2c_locks"
 harness = false
+
+[[bench]]
+name = "m2c_btree_tps"
+harness = false

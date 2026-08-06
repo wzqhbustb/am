@@ -413,3 +413,100 @@ Agent 场景长事务多读，SI 避免语句间视图漂移；M2b 实现上 aut
 - 跨页 UPDATE 空间复查重启无上界（实践中对手有进展必终止）→ 观察项
 
 ---
+
+## Stage Q：B+Tree 并发（latch coupling + Blink）+ loom
+
+**状态**：✅ 完成（549 测试全绿；未提交）
+**工期**：预估 7–10 天
+**验收**：`btree_concurrent` 8/8（含 100 线程 smoke + 小池驱逐风暴 + watchdog 防死锁）；loom 2 模型 20,393 个交错全绿（`LOOM_MAX_PREEMPTIONS=3` 命令通过，模型 1 自钳 2 档已披露）；soak smoke（60s × 32 写 + 4 扫，release）无 miss；TPS 对照臂证明 latch 非瓶颈（见下）
+
+### 交付内容
+
+1. **Latch 拓扑铁律**（index.rs 模块文档：死锁自由的根基）
+   - 只向 **DOWN**（root→leaf）与 **RIGHT**（左→右兄弟）获取 latch；绝不向上；持有任何 latch 时绝不向左（左跳一律 drop-then-acquire）
+   - Split 按 left→right 持双页；父页绝不在持有子页 latch 时新获取；pessimistic pass 全程持 root 写 latch ⇒ 在线 split 彼此完全串行，读者与乐观叶子插入仍并发
+
+2. **读路径真 crabbing**
+   - `descend_to_leaf_guard`：持父读 latch pin 子页再放父（修掉 Stage M"先放父再拿子"的并发窗口）
+   - 耦合右跳：持当前页 pin 右兄弟再放当前页；空右孪生（Prepare 未 Copy）跳过语义保留；`MAX_CHAIN_HOPS` 保留
+   - 读/扫路径全部消费下降返回的叶 guard（消除 drop-再-pin 窗口）
+
+3. **写路径 optimistic**
+   - 读耦合下降 → `pin_leaf_for_write` 在写 latch 下**重验证叶子归属**（并发 split 挪走 key 区间则耦合右跳重 pin；左边界被抬高则 drop 后左跳）→ 去重 + 插入同一 latch 持有期完成（无重复洞）
+   - 无 upgrade API（parking_lot 未暴露，且 drop-and-re-pin 的重验证本就不可避免）
+
+4. **写路径 pessimistic + 空间预留**
+   - 叶满 → 放全部 latch → `refresh_root_from_meta` → `descend_write_path` 从根耦合写 latch 下行，每层重验证（ROOT 旗校验、SPLIT_INCOMPLETE → Retry、右属 → Retry）
+   - **空间预留**：`reserve_split_page` 在触碰 split 对之前分配右页，失败 → 释放重启（不裸抛 Err）
+   - 三步 WAL 协议逐字节保留（Prepare/Copy/Commit 公有包装 + `*_on_guards` 内部实现）；flush-right-before-release-left 纪律不变；`split_commit_guarded` 沿已持有路径上行 Commit，WAL 记录与 Stage M 同序同内容
+   - 重试预算 `MAX_INSERT_RESTARTS=256`；错误文案区分三种耗尽原因（并发风暴瞬态 / post-crash 不完整 split / stale 内部分隔键间隙）
+
+5. **loom 模型检查**（pg-storage `sync` cfg 别名层）
+   - `not(loom)` = 原样 re-export parking_lot（零成本 no-op）；`loom` = loom 原语薄包装（~40+ 调用点零改动）；**Arc 刻意不别名**（`Arc<dyn Trait>` 协变在 stable 不可行，且引用计数非竞争面）
+   - loom 下 stub：WAL 后台 worker 不启动、flush_to 内联无 fsync、flush_frame 状态迁移（保留 meta→content 嵌套调度点）、setup fsync no-op（macOS F_FULLFSYNC 是探索速度杀手）；**真实 latch 编排全部在模型中运行**
+   - 模型 1（2 写 1 读线性一致）：6,551 交错全绿（自钳 2 档，测试头披露）；模型 2（2 写竞争 split + root 提升）：13,842 交错满 3 档全绿
+
+6. **并发测试与 bench**
+   - `btree_concurrent.rs` 8 个：disjoint inserts 逐 key 点查、split 风暴精确计数、并发 scan no-miss（先快照 committed 集再扫描，竞态安全）、重复键 lookup_all、root 分裂竞赛、分配失败注入重启、**小池驱逐风暴**（16 帧强制 split+CLOCK 驱逐交织）、1h soak（`#[ignore]`，env 可调）
+   - 全部带 watchdog（死锁回归 = 测试失败而非挂起）
+   - `m2c_btree_tps.rs`：auto-commit 100T ≈ 6.6K TPS；**single-txn 对照臂 100T ≈ 13.5K TPS**（摊掉 per-commit fsync，超 m2a 无索引基线）——证明 15K 未达由 fsync/组提交路径主导，**非 B+Tree latch 竞争**
+
+7. **Review 修复清单**（三轮对抗审查后）
+   - **delete 的 WAL 记录写错页面**（高，确定 bug）：`pin_leaf_for_write` hop 后 WAL 仍写下降时的旧 PageId → redo 静默丢删除或误删无辜条目；修复为 `guard.page_id()` 重绑定 + 并发 split 中删除 + 崩溃恢复测试
+   - **内部层左跳跨父边界 → cascade 把 downlink 插进错误父页**（高，潜在）：cascade 用栈中父页前先验证其确实持有指向 left 的 downlink（不满足响亮报错）；写路径内部层左跳改 Retry；场景入 Known limitations
+   - **cascade 中途分配失败 → 子树永久楔死**（中）：`BufferPoolFull` 折叠进重试预算；边界入文档
+   - **split_copy 的 flush(st.right) 驱逐窗口冒泡 PageNotFound**（中）：视为成功（当时注释声称"驱逐器必先完成 WAL-before-data 刷盘才摘页表项"——终审发现该顺序描述与实际相反，见下条终审修复）
+   - **flush() 干净页快路径破坏 split_copy 耐久契约**（高，第三轮）：并发 flusher 清 dirty 但 fsync 在途时第二个 flush 早退 → 掉电可致 left-past/right-missing 不可恢复（checkpoint 变体可静默陈旧）；修复 `FrameMeta.flushing` + Condvar——并发 flush 等待在途 flush 完成耐久决策后才返回
+   - **evict_frame 摘页表项先于刷盘，PageNotFound 容忍失效**（高，终审阻断项）：驱逐顺序原为 ①置 evicting → ②摘映射 → ③flush_frame，窗口 [摘映射, fsync 完成] 内 split_copy 拿到 PageNotFound 提前放行 → 掉电可致 redo Commit downlink 指向空右页（索引静默丢 key）。修复 `evict_frame` 改为**先 flush_frame 后摘映射**（`evicting` 已拒新 pin，映射留着无碍）；flush 失败时清 `evicting` 保留映射传播错误——**顺带修复 Stage N 遗留的"flush 失败帧永久泄漏"**（旧顺序下失败即丢映射、脏内容永久不可达）。与 H1 的 flush_done 握手组合后：split_copy 的 flush 要么找到映射并等待在途驱逐刷盘完成、要么在驱逐者刷盘完成后才见 PageNotFound，两条路径都耐久
+   - **根分裂复用 freelist 回收页无 FPI → 恢复后根页损坏**（高，第三轮）：回收页磁盘上是前任内容（`pd_upper != 0`），redo 的 `init_if_fresh` 失效；修复 `create_new_root` 补 `log_page_init`（与 `create` 同模式）
+   - **分裂点按条数不按字节 + 不感知待插 entry → PageFull 楔死**（高，第三轮）：新增 `choose_split_slot` 按 PG `_bt_findsplitloc` 思路把 pending entry 字节纳入切点约束（含存在性论证）；父页 downlink 路径同理；side-choice 统一 `entry_cmp` 全序
+   - **(key,child) tie 的页号单调假设被 freelist 复用打破**（中，第三轮）：right-ownership 命中时先查父页 downlink 存在性，有则耦合右跳（写楔死降级为多一跳）；insert 叶满一律升级悲观；validate 仅在分隔键相等时容忍乱序
+   - **validate 用 handle 缓存 root → 静态树误报**（中，第三轮）：抽 `root_from_meta` 只读函数，open/refresh/validate 共用
+   - **undo 重插继承 insert 虚假失败面**（中，第三轮）：`insert_with_budget` 参数化预算，undo 走独立大预算（1<<20），失败日志升 error
+   - 测试类：注入钩子改 thread-local 防并行消耗、loom 桩补调度点、loom 注释修正、TPS 归因对照臂、**m2c_index_concurrent E2E**（索引表 + 并发 DML + 随机 abort + split + 周期 checkpoint + validate/对拍）、并发 flush 单测、混合大小 key 楔死场景、freelist 乱序写路径、回收页根分裂崩溃恢复
+
+8. **CI 与工程化**（设计终审后）
+   - CI 修复：`--all-features` 会启用 loom 致全部非模型测试 panic（提交必红）——pg-storage/pg-am-btree test 步骤改默认 features；新增 loom job（`LOOM_MAX_PREEMPTIONS=2`）+ parking_lot grep 守卫
+   - `SPLIT_ALLOC_FAILURES` 注入钩子 feature 门控（`test-hooks`，默认关闭，dev-dep 自引用供测试）
+   - MSRV 1.86 + `--all-features` 编译 loom 0.7 本机实证通过
+
+### 设计理由
+
+**1. 为什么读路径必须改成真 crabbing（而不是沿用"先放父再拿子"？**
+单线程下放父拿子无妨；并发下 parent split 可在窗口内插入，下降会走错子树。crabbing 的代价是父子 latch 短暂重叠（DOWN 序，无死锁面），换来每一层决策都在 latch 保护下。
+
+**2. 为什么乐观写不做 latch upgrade？**
+parking_lot 未暴露 upgrade；更根本的是 drop-and-re-pin 之后**无论如何都要重验证**（叶子可能已被 split）——upgrade 省下的只是锁转换，省不掉重验证，引入新 API 得不偿失。
+
+**3. 为什么 pessimistic 全路径写 latch 而不是"安全节点"优化？**
+spec（§13.2）就是从根全路径 X latch；split 是稀有路径（乐观路径承担绝大多数插入），串行化 split 换取协议推演的简单性。root 写 latch 同时天然串行化 root 提升，代际校验得以保持简单。
+
+**4. 为什么 loom 层不别名 Arc？**
+loom 的 `Arc` 在 stable 上无法做 `Arc<dyn Trait>` 协变，强行别名会级联到全部下游 crate；引用计数不是竞争面，排除它让 cfg 层收敛在 pg-storage 一个 crate 内。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL (nbtree) | pg_rust (Stage Q) | 取舍理由 |
+|---|---|---|---|
+| 读并发 | latch coupling（同） | 同（crabbing + Blink 右跳） | 一致 |
+| 写路径 | 乐观叶写 + 悲观重走（同） | 同（悲观为**全路径** X latch；PG 有"安全节点"提前释放优化） | 简单优先；split 稀有，性能归 Phase 7b |
+| 模型检查 | 无 | loom 2 模型 2 万+ 交错 | PG 无此实践；覆盖 loom 能力边界（多级级联 split 未覆盖，由压力测试兜底） |
+| 页合并/压实 | vacuum 触发 merge | **不做**；1-entry 页死空间仅 split 可回收（M2b 既有边界，审查中实测踩到） | 归 M2c+/Stage S |
+| 未完成 split 收尾 | 无 CLR（PG 靠 _bt_finish_split 在线收尾） | **不做**（SPLIT_INCOMPLETE 在线拒二次分裂；cascade 中途失败 = 子树写不可用） | 归 Stage S（CLR） |
+| 并发 TPS | — | 15K 未达（auto-commit 6.6K，fsync 主导；对照臂 13.5K 证明 latch 非瓶颈） | 硬件 fsync 天花板；batch commit 归 Phase 7b |
+| validate | amcheck（可在线，带锁等级） | **静止态检查**（并发写入期 SPLIT_INCOMPLETE 非腐败） | M2c 语义差异已文档化 |
+
+### 已知残留与后续归队
+
+- loom 模型未覆盖多级树的父页递归 split（状态空间限制；由线程压力测试覆盖）→ 需要时专项模型
+- 1h soak 未实际执行（60s smoke 通过；命令已文档化 `BTREE_SOAK_SECS=3600`）
+- stale 内部分隔键间隙（内部最左子被 delete 抬高 + probe 落间隙）→ 预算耗尽响亮 Unsupported，不自愈 → Known limitation，根治归 Stage S（CLR/分隔键维护）
+- validate 的盲区：同父页下相等分隔键的两个子树被对调时不报警（无代码路径能产生；查找经链 hop 自愈）→ 接受
+- commit barrier 写 guard 覆盖整个 checkpoint（commit 停顿随 split 脏页增多拉长；文档已对齐，收窄归 Phase 7b）
+- CLOG 全局单锁（命中也写锁 + 锁内 I/O）；allocation_lock 下等组提交 fsync → 均归 Phase 7b 性能项
+- 1-entry 页死空间压实（page compaction）→ 排入 M2c+ 路线图
+- 死锁检测（表锁 × 行锁 × 页 latch 三层等待）→ **Stage R**
+- CI：已加 loom job（`LOOM_MAX_PREEMPTIONS=2`，模型 1 自钳披露）与 parking_lot grep 守卫；1h soak 不进 CI → 需要时 nightly
+- `SPLIT_ALLOC_FAILURES` 注入钩子已 feature 门控（`test-hooks`，默认关闭，dev-dep 自引用供测试）
+
+---

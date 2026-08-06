@@ -4,8 +4,9 @@
 //! OID allocator can share one counter without exposing raw atomics — and
 //! the memory-ordering choices behind them — across the crate boundary.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::Oid;
 

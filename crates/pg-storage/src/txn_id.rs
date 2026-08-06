@@ -8,8 +8,9 @@
 //! `pg-storage` cannot depend on `pg-txn`, so the clock lives here and the
 //! transaction manager drives it, exactly as the catalog drives `OidCounter`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::TxnId;
 

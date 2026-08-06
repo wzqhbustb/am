@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use pg_storage::sync::Mutex;
 
 use pg_storage::clog::NoOpClogAccessor;
 use pg_storage::config::StorageConfig;

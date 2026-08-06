@@ -239,6 +239,10 @@ impl WalSegmentManager {
         if current_len != segment_size {
             preallocate_file(&file, segment_size)?;
         }
+        // Skipped under cfg(loom): model builds do not check crash
+        // durability, and a real fsync per setup dominates
+        // interleaving-exploration time (see `crate::sync` docs).
+        #[cfg(not(loom))]
         file.sync_all().map_err(StorageError::Io)?;
         Ok(file)
     }

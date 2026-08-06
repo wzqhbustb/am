@@ -9,12 +9,12 @@
 //! checkpoints are supported. Automatic checkpoints run on a dedicated thread
 //! until `shutdown` is called or the coordinator is dropped.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::{Mutex, RwLock};
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::buffer_pool::BufferPool;

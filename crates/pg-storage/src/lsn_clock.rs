@@ -4,7 +4,7 @@
 //! WAL stream. It is intended to be used by the WAL writer thread to allocate
 //! LSNs; other threads can read the current LSN via [`LsnClock::current`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{Lsn, LSN_ALIGNMENT};
 

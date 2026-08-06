@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::analysis;

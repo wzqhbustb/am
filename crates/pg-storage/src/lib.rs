@@ -11,6 +11,12 @@
 //! `pd_lsn` ([`mod@page`]), the commit-status abstraction ([`clog`]), and the
 //! redo-dispatch registry used by recovery ([`recovery`]).
 //!
+//! M2c Stage Q adds the [`sync`] alias layer: production builds re-export
+//! `parking_lot` / `std::sync::atomic` unchanged, while `--features loom`
+//! (test-only model builds) swaps in loom's instrumented primitives so
+//! exhaustive interleaving models can drive the real buffer-pool/WAL latch
+//! choreography. See the [`sync`] module docs for what is stubbed under loom.
+//!
 //! It intentionally does **not** expose a generic "File Manager" abstraction.
 //! File-management responsibilities live inside the components that own the
 //! crash-safety invariants.
@@ -34,6 +40,7 @@ pub mod page_allocator;
 pub mod positioned_file;
 pub mod recovery;
 pub mod superblock;
+pub mod sync;
 pub mod txn_id;
 pub mod types;
 pub mod wal;

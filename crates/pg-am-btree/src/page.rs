@@ -175,6 +175,15 @@ impl BtreePage {
     }
 
     /// `btpo_prev` (left sibling); [`PageId::INVALID`] means none.
+    ///
+    /// Stale by design: a split links `left.next = right` but does NOT
+    /// update the old right neighbor's `btpo_prev` back-pointer, so after
+    /// several splits `prev` can point at a page that is no longer the
+    /// immediate left neighbor. The write path only ever follows `prev`
+    /// to re-check ownership from the candidate's first key (a dominated
+    /// probe keeps walking until the chain confirms the position), so a
+    /// stale `prev` costs extra hops, never correctness — `btpo_next` /
+    /// first-key comparisons are the ground truth, never this pointer.
     pub fn prev(page: &[u8; PAGE_SIZE]) -> Result<PageId> {
         let header = Self::checked_header(page)?;
         let off = header.pd_special as usize;

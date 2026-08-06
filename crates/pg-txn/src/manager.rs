@@ -35,11 +35,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 use thiserror::Error;
 
 use pg_storage::clog::{ClogAccessor, TxnState};
+// The barrier crosses the crate boundary into pg-storage's checkpoint
+// coordinator, so it must be the aliased type: identical to
+// `parking_lot::RwLock` in production builds, loom-instrumented under
+// `--cfg loom` (Stage Q; see pg_storage::sync).
+use pg_storage::sync::RwLock;
 use pg_storage::error::Result;
 use pg_storage::txn_id::TxnIdClock;
 use pg_storage::types::{Lsn, TxnId};
@@ -144,13 +149,20 @@ pub struct TxnManager {
     /// Commit/checkpoint barrier (M2c Stage P: sunk down from pg-engine,
     /// where it was introduced in Stage L). `commit_txn` / `abort_txn` hold
     /// a READ guard for their whole hard order; the checkpoint coordinator
-    /// in pg-storage takes the WRITE guard across the checkpoint critical
-    /// section (ATT sampling + CLOG flush, via `set_commit_barrier`). This
-    /// closes the "neither snapshot nor replay" window by construction: a
-    /// commit durable before the checkpoint's `begin_lsn` has finished its
+    /// in pg-storage takes the WRITE guard (via `set_commit_barrier`).
+    /// This closes the "neither snapshot nor replay" window by construction:
+    /// a commit durable before the checkpoint's `begin_lsn` has finished its
     /// `clog.set_state` before the checkpoint's CLOG flush runs (its bit is
     /// fsynced), and a commit starting after lands past `begin_lsn` (replay
     /// rebuilds it).
+    ///
+    /// Note on scope: the coordinator currently holds the WRITE guard
+    /// across the WHOLE checkpoint (all dirty-page flushes), not merely the
+    /// ATT-sampling + CLOG-flush critical section — correct but
+    /// conservative, since commits stall for the full flush duration on
+    /// this hardware. Narrowing the guard to the critical section is a
+    /// planned Phase 7b optimization; the implementation is intentionally
+    /// left as-is for now.
     commit_barrier: Arc<RwLock<()>>,
     /// Row-lock wait registry (§9.1 step 5a): waiter XID → the XID it is
     /// blocked on. Paired with `row_wait_cv`; waiters clear their own entry

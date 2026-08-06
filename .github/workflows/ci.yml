@@ -57,7 +57,40 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ${{ matrix.crate }} --all-features
+      # Stage Q: pg-storage's `loom` feature swaps sync primitives for loom's
+      # instrumented ones, which PANIC outside `loom::model` — so the two
+      # loom-aware crates must be tested with default features. Running their
+      # test suites with --all-features makes every non-model test panic.
+      - name: Test (default features — loom-gated crates)
+        if: matrix.crate == 'pg-storage' || matrix.crate == 'pg-am-btree'
+        run: cargo test -p ${{ matrix.crate }}
+      - name: Test (all features)
+        if: matrix.crate != 'pg-storage' && matrix.crate != 'pg-am-btree'
+        run: cargo test -p ${{ matrix.crate }} --all-features
+
+  loom:
+    name: Loom model tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The linearizable-reads model self-clamps to preemption bound 2 (see
+      # the disclosure comment in btree_loom.rs); the split model runs the
+      # full bound. Budget ~5 min on a runner.
+      - run: cargo test -p pg-am-btree --features loom --test btree_loom
+        env:
+          LOOM_MAX_PREEMPTIONS: 2
+      # Guard the sync-alias rule (crates/pg-storage/src/sync.rs docs): any
+      # lock in the buffer-pool/WAL latch choreography must go through the
+      # crate::sync aliases so loom can schedule it; direct parking_lot
+      # imports anywhere else in pg-storage/src are a bug.
+      - name: Guard sync-alias rule
+        run: |
+          if git grep "use parking_lot" -- crates/pg-storage/src | grep -v sync.rs; then
+            echo "::error::direct parking_lot import outside sync.rs (see crates/pg-storage/src/sync.rs docs)"
+            exit 1
+          fi
 
   doc:
     name: Doc (${{ matrix.crate }})

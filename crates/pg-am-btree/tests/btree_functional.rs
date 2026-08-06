@@ -333,9 +333,12 @@ fn second_split_of_incomplete_page_is_rejected() {
 }
 
 /// P2-1 regression: a handle whose cached root was promoted by ANOTHER
-/// handle must not fork the tree — the root-split branch revalidates
-/// against the meta page and fails loudly instead of creating a second
-/// root and overwriting the meta record.
+/// handle must not fork the tree. Stage Q changed the mechanism: the
+/// pessimistic write path re-reads the meta page on every pass and verifies
+/// the `ROOT` flag under the root's write latch, so a stale handle now
+/// refreshes inline and keeps inserting into the one shared tree, instead
+/// of failing loudly for the caller to reopen. What must NOT happen is
+/// unchanged: no second root, no unreachable half-tree.
 #[test]
 fn stale_root_handle_cannot_fork_the_tree() {
     let (_tmp, _engine, mut a) = setup();
@@ -354,30 +357,29 @@ fn stale_root_handle_cannot_fork_the_tree() {
     let current_root = a.root_page();
     assert_ne!(b.root_page(), current_root, "B still caches the old root");
 
-    // B keeps inserting into the OLD root leaf (now a regular leftmost
-    // leaf; duplicate keys with fresh TIDs land on it) until it splits.
-    // The split's Commit must detect the staleness via the meta page.
-    let mut err = None;
+    // B keeps inserting into the OLD root leaf's key range (duplicate keys
+    // with fresh TIDs land on it). B's stale root is refreshed inline; every
+    // insert must succeed and land in A's tree — and B must trigger further
+    // splits of that leaf without forking anything.
     for i in 0..10_000u64 {
-        match b.insert(&key(i as i32 % 500), tid(5_000_000 + i)) {
-            Ok(()) => {}
-            Err(e) => {
-                err = Some(e);
-                break;
-            }
+        b.insert(&key(i as i32 % 500), tid(5_000_000 + i)).unwrap();
+    }
+
+    // One consistent tree: a freshly opened handle (authoritative root from
+    // the meta page) validates the structure and finds all of A's keys.
+    let fresh = am.open_index(REL_OID, meta_page, ColumnType::Int4).unwrap();
+    fresh.validate().unwrap();
+    assert_all_present(&fresh, 3_000);
+    // And all of B's entries landed in the same tree.
+    for k in [0i32, 250, 499] {
+        let all = fresh.lookup_all(&key(k)).unwrap();
+        for i in (0..10_000u64).filter(|i| (*i as i32 % 500) == k) {
+            assert!(
+                all.contains(&tid(5_000_000 + i)),
+                "B's entry (key {k}, tid {i}) is missing from the shared tree"
+            );
         }
     }
-    let err = err.expect("B's split of the stale root must fail");
-    assert!(
-        matches!(err, BTreeError::Unsupported(_)),
-        "expected stale-root Unsupported, got {err:?}"
-    );
-
-    // A's tree is untouched: meta still points at A's root, everything
-    // validates, all of A's keys are present.
-    assert_eq!(a.root_page(), current_root);
-    a.validate().unwrap();
-    assert_all_present(&a, 3_000);
 }
 
 /// lookup_all must walk leaf siblings: one key with enough duplicates to
@@ -402,4 +404,154 @@ fn lookup_all_spans_leaf_siblings() {
     assert_eq!(index.lookup_all(&key(6)).unwrap(), Vec::<Tid>::new());
     assert_eq!(index.lookup_all(&key(8)).unwrap(), Vec::<Tid>::new());
     index.validate().unwrap();
+}
+
+/// Stage Q review (H3): the split point must account for the pending
+/// entry's BYTE size and landing half — a count-based median overloads the
+/// receiving half when entry sizes are skewed, wedging the insert with
+/// `PageFull` AFTER Copy was WAL-logged (permanent SPLIT_INCOMPLETE).
+///
+/// Build one leaf holding ~100 tiny keys + 2 near-limit keys (their bytes
+/// leave < one big entry of free space), then insert more big keys: the
+/// count-median split would put 51 tiny + 2 big on the right and the
+/// pending big would not fit. The byte/pending-aware split moves the split
+/// point so every insert succeeds and the tree validates.
+#[test]
+fn mixed_size_keys_split_point_accounts_for_pending_bytes() {
+    let (_tmp, _engine, mut index) = {
+        let tmp = TempDir::new().unwrap();
+        let config = StorageConfig::new(tmp.path());
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        let am = BTreeAM::new(
+            Arc::clone(engine.buffer_pool()),
+            Arc::clone(engine.wal_writer()),
+        );
+        let index = am
+            .create_index(REL_OID, pg_am_heap::tuple::ColumnType::Text)
+            .unwrap();
+        (tmp, engine, index)
+    };
+
+    const SMALL: u64 = 100;
+    const BIGS: u64 = 8;
+    let small_key = |i: u64| format!("a{i:04}").into_bytes();
+    // Near the 1/3-page key bound: 2698 key bytes + 10 tid + 4 lp = 2712.
+    let big_key = |i: u64| {
+        let mut k = format!("b{i:04}").into_bytes();
+        k.resize(pg_am_btree::MAX_INDEX_KEY_BYTES, b'x');
+        k
+    };
+
+    let mut n = 0u64;
+    for i in 0..SMALL {
+        index.insert(&small_key(i), tid(n)).unwrap();
+        n += 1;
+    }
+    // Every one of these would have wedged on the count-median split point.
+    for i in 0..BIGS {
+        index.insert(&big_key(i), tid(n)).unwrap();
+        n += 1;
+    }
+
+    for i in 0..SMALL {
+        assert!(index.lookup(&small_key(i)).unwrap().is_some());
+    }
+    for i in 0..BIGS {
+        assert!(index.lookup(&big_key(i)).unwrap().is_some());
+    }
+    index.validate().unwrap();
+}
+
+/// Stage Q review (M1): internal entries are ordered by (key,
+/// child_page_id), and freelist reuse can hand a split twin a SMALLER page
+/// id than its left sibling — flipping the tie order of duplicate
+/// separators so `find_child` picks a page that no longer owns the probe.
+/// The write descent must hop right when the parent provably holds the
+/// twin's downlink, not restart into a deterministic wedge.
+///
+/// Construction: promote the root first, then free two sacrificial pages
+/// (freelist LIFO [5, 6]); identical "dup" keys force every separator to
+/// be "dup"; the next splits pop twins 6 then 5 — the NEWEST twin (5) has
+/// a smaller page id than its left sibling (6), so the root's tie order is
+/// [("dup",5),("dup",6)] and `find_child("dup")` returns 6 although the
+/// newest entries live on 5.
+#[test]
+fn freelist_recycled_page_id_disorder_write_path_succeeds() {
+    let (_tmp, engine, mut index) = {
+        let tmp = TempDir::new().unwrap();
+        let config = StorageConfig::new(tmp.path());
+        let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+        let am = BTreeAM::new(
+            Arc::clone(engine.buffer_pool()),
+            Arc::clone(engine.wal_writer()),
+        );
+        let index = am
+            .create_index(REL_OID, pg_am_heap::tuple::ColumnType::Text)
+            .unwrap();
+        (tmp, engine, index)
+    };
+
+    let k = b"dup".to_vec();
+    // Phase 1: fill the root leaf until the root is promoted (twin=3,
+    // root=4 with fresh ids).
+    let mut n = 0u64;
+    while index.tree_level() == 0 {
+        index.insert(&k, tid(n)).unwrap();
+        n += 1;
+    }
+
+    // Two sacrificial pages, allocated BEFORE freeing (freeing between the
+    // two allocations would hand the same id back): ids 5 and 6, freelist
+    // (LIFO) [5, 6] — the next split's twin pops 6, the one after pops 5,
+    // so the NEWEST twin (5) has a SMALLER page id than its left sibling
+    // (6), flipping the (key, child) tie order of their duplicate "dup"
+    // separators in the root.
+    let v1 = engine.buffer_pool().new_page().unwrap().page_id();
+    let v2 = engine.buffer_pool().new_page().unwrap().page_id();
+    {
+        let mut allocator = engine.page_allocator().lock();
+        allocator.free_page(v1).unwrap();
+        allocator.free_page(v2).unwrap();
+    }
+
+    // Phase 2: ~17 B per entry, ~480 per leaf — 900 more duplicates force
+    // both recycled-id splits AND fill the newest (small-id) twin to
+    // overflowing, so inserts into its key range must right-hop onto it
+    // from the tie-winning larger-id sibling (the M1 wedge).
+    const PHASE2: u64 = 900;
+    for _ in 0..PHASE2 {
+        index.insert(&k, tid(n)).unwrap();
+        n += 1;
+    }
+
+    let all = index.lookup_all(&k).unwrap();
+    assert_eq!(all.len(), n as usize, "every duplicate must be present");
+    for (i, t) in all.iter().enumerate() {
+        assert_eq!(*t, tid(i as u64));
+    }
+    index.validate().unwrap();
+}
+
+/// Stage Q review (M2): `validate` must re-read the authoritative root
+/// from the meta page — a handle whose cached root was promoted by ANOTHER
+/// handle must still validate the whole (healthy) tree, not a subtree.
+#[test]
+fn validate_uses_meta_root_not_cached_root() {
+    let (_tmp, _engine, a) = setup();
+    let am = BTreeAM::new(
+        Arc::clone(_engine.buffer_pool()),
+        Arc::clone(_engine.wal_writer()),
+    );
+    let meta_page = a.meta_page();
+    let mut b = am.open_index(REL_OID, meta_page, ColumnType::Int4).unwrap();
+
+    // B promotes the root; A's cached root is now demoted.
+    for i in 0..3_000i32 {
+        b.insert(&key(i), tid(i as u64)).unwrap();
+    }
+    assert!(b.tree_level() >= 1);
+    assert_ne!(a.root_page(), b.root_page(), "A still caches the old root");
+
+    // A's validate must see the whole tree via the meta root and pass.
+    a.validate().unwrap();
 }

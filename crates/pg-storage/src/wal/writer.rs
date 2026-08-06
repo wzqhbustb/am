@@ -6,10 +6,12 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+#[cfg(not(loom))]
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use crate::sync::{Condvar, Mutex};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
@@ -40,6 +42,7 @@ struct WriterState {
     /// batch/timeout thresholds (which would add up to `timeout_ms` of latency
     /// to every synchronous commit — or hang forever if the thresholds are
     /// configured out of reach).
+    #[cfg_attr(loom, allow(dead_code))] // only read by the worker / real flush_to
     flush_requested: bool,
     shutdown: bool,
     last_error: Option<String>,
@@ -172,18 +175,24 @@ impl WalWriter {
         }));
         let cond = Arc::new(Condvar::new());
 
+        // The background group-commit worker cannot run inside a loom model
+        // (loom only schedules threads it spawned); under `cfg(loom)` there
+        // is no worker and `flush_to` completes synchronously inline.
+        #[cfg(not(loom))]
         let handle = {
             let inner = Arc::clone(&inner);
             let cond = Arc::clone(&cond);
             let config = config.clone();
-            thread::spawn(move || Self::worker(inner, cond, config))
+            Some(thread::spawn(move || Self::worker(inner, cond, config)))
         };
+        #[cfg(loom)]
+        let handle: Option<JoinHandle<()>> = None;
 
         Ok(Self {
             inner,
             cond,
             config: config.clone(),
-            handle: Some(handle),
+            handle,
         })
     }
 
@@ -378,6 +387,7 @@ impl WalWriter {
     }
 
     /// Block until all records with LSN `<= lsn` have been fsynced.
+    #[cfg(not(loom))]
     pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
         let mut state = self.inner.lock();
         Self::check_error(&state)?;
@@ -411,6 +421,24 @@ impl WalWriter {
             self.cond.notify_one();
             self.cond.wait(&mut state);
         }
+        Ok(())
+    }
+
+    /// `cfg(loom)` variant of [`Self::flush_to`]: with no background worker
+    /// inside a loom model, durability is marked **inline and without any
+    /// fsync** — the record bytes are already in the segment file (append
+    /// writes them synchronously), and loom models check latch choreography,
+    /// not crash durability. This is the stub called out in the `crate::sync`
+    /// module docs.
+    #[cfg(loom)]
+    pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
+        let mut state = self.inner.lock();
+        Self::check_error(&state)?;
+        if lsn > state.lsn_clock.current() {
+            return Err(StorageError::LsnNotAvailable(lsn));
+        }
+        state.synced_lsn = state.synced_lsn.max(lsn);
+        state.pending = 0;
         Ok(())
     }
 
@@ -529,6 +557,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[cfg(not(loom))]
     fn worker(inner: Arc<Mutex<WriterState>>, cond: Arc<Condvar>, config: StorageConfig) {
         let timeout = Duration::from_millis(config.wal_group_commit_timeout_ms);
 

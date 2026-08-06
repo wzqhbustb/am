@@ -24,7 +24,8 @@
 //!   metadata is locked by an evictor, the hit falls back to the allocation path
 //!   instead of blocking.
 //! - **Eviction / allocation path**: `allocation_lock` → `try_lock(Frame::meta)`
-//!   → `page_table[shard]` → `Frame::content`.
+//!   → (dirty victim: the flush path's `Frame::meta` → `Frame::content.read`)
+//!   → `page_table[shard]` (mapping removed only after the victim is durable).
 //! - **Flush path**: `Frame::meta` (clear dirty) → `Frame::content.read` →
 //!   (on I/O error only) `Frame::meta` (restore dirty). This follows the same
 //!   meta-before-content order as eviction. The nested re-acquisition of
@@ -46,10 +47,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, StorageError};
@@ -99,6 +100,16 @@ struct FrameMeta {
     /// True if this frame is in the process of being evicted. New pins must
     /// reject the frame even if `page_id` still matches.
     evicting: bool,
+    /// True while a `flush_frame` call is between claiming the dirty epoch
+    /// (dirty cleared) and completing the durability decision (fsync done,
+    /// or the group-fsync coalescing check confirmed coverage). A second
+    /// flush caller that observes a CLEAN page while this is set must NOT
+    /// return early: the first flush's write/fsync may still be in flight,
+    /// and a caller with a durability contract (B+Tree `split_copy`'s
+    /// right-page flush) would otherwise release its left-page latch before
+    /// the right page is truly durable (Stage Q review H1). Waiters block
+    /// on [`BufferPool::flush_done`].
+    flushing: bool,
 }
 
 impl Default for FrameMeta {
@@ -112,6 +123,7 @@ impl Default for FrameMeta {
             first_dirty_lsn: Lsn::INVALID,
             needs_fpi: false,
             evicting: false,
+            flushing: false,
         }
     }
 }
@@ -152,11 +164,18 @@ pub struct BufferPool {
     checkpoint_lsn: AtomicU64,
     /// Monotonically increasing generation bumped after each `write_all_at` in
     /// `flush_frame`. Used together with `synced_gen` for group-fsync coalescing.
+    #[cfg_attr(loom, allow(dead_code))] // only read by the real `flush_frame`
     flush_gen: AtomicU64,
     /// Generation value as of the most recent completed `sync_all`. Writers
     /// whose `flush_gen` ≤ `synced_gen` can skip their own fsync because a
     /// later sync already covered their write.
+    #[cfg_attr(loom, allow(dead_code))] // only read by the real `flush_frame`
     synced_gen: AtomicU64,
+    /// Signalled when a frame's `flushing` flag clears (see
+    /// [`FrameMeta::flushing`]): concurrent flush callers with a durability
+    /// contract wait here for the in-flight flush to complete.
+    #[cfg_attr(loom, allow(dead_code))] // only waited on by the real `flush_frame`
+    flush_done: Condvar,
 }
 
 impl BufferPool {
@@ -195,6 +214,7 @@ impl BufferPool {
             checkpoint_lsn: AtomicU64::new(Lsn::INVALID.0),
             flush_gen: AtomicU64::new(0),
             synced_gen: AtomicU64::new(0),
+            flush_done: Condvar::new(),
         })
     }
 
@@ -610,24 +630,40 @@ impl BufferPool {
                 continue;
             }
 
-            // Mark the frame as evicting so new pins reject it even if the
-            // page table entry is still visible.
+            // Mark the frame as evicting so new pins reject it even though
+            // the page table entry is still visible.
             let old_page_id = meta.page_id;
             let dirty = meta.dirty;
             meta.evicting = true;
             drop(meta);
 
-            // Remove the old mapping from the page table.
+            // Flush BEFORE removing the page-table mapping (Stage Q final
+            // review): the mapping must survive until the dirty content is
+            // durable. A concurrent `flush(page)` with a durability
+            // contract (B+Tree split_copy's right page) then either finds
+            // the mapping and waits out THIS flush via the H1 flush_done
+            // handshake, or observes PageNotFound only after this flush has
+            // completed — never in the window between mapping removal and
+            // fsync. Keeping the mapping meanwhile is harmless: `evicting`
+            // rejects new pins.
+            if dirty && old_page_id != PageId::INVALID {
+                if let Err(e) = self.flush_frame(FrameId(hand)) {
+                    // On I/O failure keep the frame usable: clear `evicting`
+                    // and leave the mapping in place, so the page is NOT
+                    // leaked with its dirty content (previously the mapping
+                    // was dropped before the flush and a failed flush
+                    // leaked the frame for good — Stage N leftover).
+                    self.frames[hand].meta.lock().evicting = false;
+                    return Err(e);
+                }
+            }
+
+            // Remove the old mapping from the page table (only now is the
+            // old tenant durable or clean).
             if old_page_id != PageId::INVALID {
                 let shard_idx = self.shard_index(old_page_id);
                 let mut shard = self.page_table[shard_idx].lock();
                 shard.remove(&old_page_id);
-            }
-
-            // Flush if dirty. This reads the frame metadata again; `evicting`
-            // prevents new pins from succeeding.
-            if dirty && old_page_id != PageId::INVALID {
-                self.flush_frame(FrameId(hand))?;
             }
 
             // Reset metadata. The content will be initialized by the caller.
@@ -679,12 +715,29 @@ impl BufferPool {
     /// observes `synced_gen >= its_gen` knows a concurrent fsync — one that
     /// started after this thread's `write_all_at` returned — already made the
     /// write durable, so it can skip its own syscall.
+    /// **In-flight flush tracking (Stage Q review H1)**: claiming the dirty
+    /// epoch sets `meta.flushing`; it clears only AFTER the durability
+    /// decision (fsync completed, or group-fsync coalescing confirmed a
+    /// covering sync). A concurrent caller that finds the page clean must
+    /// first wait out any in-flight flush — otherwise `split_copy`'s
+    /// right-page flush could return while another flusher's write/fsync is
+    /// still in flight, releasing the left-page latch before the right page
+    /// is truly durable (a power loss then exposes the unrecoverable
+    /// left-past-copy / right-missing state to redo).
+    #[cfg(not(loom))]
     fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
         let (page_id, saved_first_dirty_lsn) = {
             let mut meta = self.frames[frame_id.0].meta.lock();
+            // Wait out an in-flight flush BEFORE judging cleanliness: the
+            // dirty flag was cleared at claim time, so "clean" can still
+            // mean "another flusher's write/fsync is in progress".
+            while meta.flushing {
+                self.flush_done.wait(&mut meta);
+            }
             if !meta.dirty || meta.page_id == PageId::INVALID {
                 return Ok(());
             }
+            meta.flushing = true;
             meta.dirty = false;
             // Clear the rec_lsn atomically with the dirty flag (§11.1): the
             // dirty epoch this flush makes durable ends here. A guard that
@@ -711,6 +764,8 @@ impl BufferPool {
                 let mut meta = self.frames[frame_id.0].meta.lock();
                 meta.dirty = true;
                 restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
+                meta.flushing = false;
+                self.flush_done.notify_all();
                 return Err(e);
             }
         }
@@ -720,6 +775,8 @@ impl BufferPool {
             let mut meta = self.frames[frame_id.0].meta.lock();
             meta.dirty = true;
             restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
+            meta.flushing = false;
+            self.flush_done.notify_all();
             return Err(e);
         }
         let my_gen = self.flush_gen.fetch_add(1, Ordering::AcqRel) + 1;
@@ -746,11 +803,64 @@ impl BufferPool {
                 let mut meta = self.frames[frame_id.0].meta.lock();
                 meta.dirty = true;
                 restore_first_dirty_lsn(&mut meta.first_dirty_lsn, saved_first_dirty_lsn);
+                meta.flushing = false;
+                self.flush_done.notify_all();
                 return Err(e);
             }
             self.synced_gen.fetch_max(covered_gen, Ordering::AcqRel);
         }
 
+        // The durability decision is complete (fsync done or coverage
+        // confirmed): only NOW may waiters observe the page as flushed.
+        {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            meta.flushing = false;
+            self.flush_done.notify_all();
+        }
+        Ok(())
+    }
+
+    /// `cfg(loom)` variant of [`Self::flush_frame`]: performs only the
+    /// dirty / rec_lsn / needs_fpi / flushing state transitions and skips
+    /// the WAL flush, the data-file write, and the fsync. Loom models must
+    /// size the pool so no eviction happens — an evicted page reloaded from
+    /// disk would read zeros, since nothing is ever written in a model
+    /// build. See the `crate::sync` module docs.
+    ///
+    /// The `flushing` claim/clear is mirrored for state parity, but the
+    /// production condvar WAIT is not: model builds have a single flusher
+    /// (no eviction, no checkpoint, and B+Tree splits serialize on the root
+    /// latch), so a second flush can never observe `flushing` set — assert
+    /// that instead of adding a condvar wait loom's wrapper omits.
+    #[cfg(loom)]
+    fn flush_frame(&self, frame_id: FrameId) -> Result<()> {
+        {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            debug_assert!(
+                !meta.flushing,
+                "concurrent flush in a loom model (models have a single flusher)"
+            );
+            if !meta.dirty || meta.page_id == PageId::INVALID {
+                return Ok(());
+            }
+            meta.flushing = true;
+            meta.dirty = false;
+            meta.first_dirty_lsn = Lsn::INVALID;
+        }
+        // Scheduling-point parity with the real path (Stage Q review): the
+        // real `flush_frame` holds `content.read` across the WAL flush and
+        // data write, and re-locks `meta` (for `needs_fpi`) WHILE content
+        // is still held. Mirror that exact lock sequence here — without
+        // touching any data — so loom explores interleavings through the
+        // same content → meta nesting instead of silently dropping that
+        // dimension of the schedule space.
+        let content = self.frames[frame_id.0].content.read();
+        {
+            let mut meta = self.frames[frame_id.0].meta.lock();
+            meta.needs_fpi = true;
+            meta.flushing = false;
+        }
+        drop(content);
         Ok(())
     }
 
@@ -773,6 +883,7 @@ impl BufferPool {
 /// "already on disk", silently skipping redo. A `saved` of
 /// [`Lsn::INVALID`] (dirty page whose writer never stamped a WAL LSN)
 /// restores nothing.
+#[cfg_attr(loom, allow(dead_code))] // only called by the real `flush_frame`
 fn restore_first_dirty_lsn(current: &mut Lsn, saved: Lsn) {
     if saved.is_valid() && (*current == Lsn::INVALID || saved < *current) {
         *current = saved;
@@ -1687,6 +1798,64 @@ mod tests {
                     buf[OFFSET]
                 );
             }
+        }
+    }
+
+    /// Stage Q review H1: a flush caller that observes a clean page must
+    /// wait out an IN-FLIGHT concurrent flush instead of returning early —
+    /// the loser's return only proves "already durable", never "someone
+    /// else is still writing". Asserts no error, the in-flight flag clears,
+    /// and the latest bytes are durable after both flushers return.
+    #[test]
+    fn concurrent_flush_waits_for_in_flight_flush() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let tmp = TempDir::new().unwrap();
+        let (_, _, pool) = setup(&tmp);
+        let pool = Arc::new(pool);
+
+        let page_id = pool.new_page().unwrap().page_id();
+        const OFFSET: usize = PAGE_HEADER_SIZE;
+
+        for round in 0..20u8 {
+            // Dirty the page with this round's value.
+            {
+                let mut guard = pool.pin_mut(page_id).unwrap();
+                guard.page_mut()[OFFSET] = round;
+            }
+
+            // Two racing flushers: one claims the epoch, the other finds
+            // the page clean-but-flushing and must WAIT (the pre-H1 fast
+            // path returned immediately on `!dirty`).
+            let barrier = Arc::new(Barrier::new(2));
+            let spawn_flusher = || {
+                let pool = Arc::clone(&pool);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    pool.flush(page_id).unwrap();
+                })
+            };
+            let f1 = spawn_flusher();
+            let f2 = spawn_flusher();
+            f1.join().unwrap();
+            f2.join().unwrap();
+
+            // Both returned: the frame must be clean, not mid-flush, and
+            // the durable bytes must be this round's.
+            let frame_id = {
+                let shard = pool.page_table[pool.shard_index(page_id)].lock();
+                *shard.get(&page_id).expect("page must stay resident")
+            };
+            let meta = pool.frames[frame_id.0].meta.lock();
+            assert!(!meta.flushing, "round {round}: flush left mid-flight");
+            assert!(!meta.dirty, "round {round}: frame still dirty");
+            drop(meta);
+            let mut buf = [0u8; PAGE_SIZE];
+            let offset = (page_id.0 - 1) * PAGE_SIZE as u64;
+            pool.data_file.read_exact_at(&mut buf, offset).unwrap();
+            assert_eq!(buf[OFFSET], round, "round {round}: stale bytes on disk");
         }
     }
 

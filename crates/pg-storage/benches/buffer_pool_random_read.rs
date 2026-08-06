@@ -18,7 +18,7 @@ const BATCH_SIZE: usize = 10000; // pin ops per iteration
 
 fn setup() -> (
     tempfile::TempDir,
-    Arc<parking_lot::Mutex<PageAllocator>>,
+    Arc<pg_storage::sync::Mutex<PageAllocator>>,
     Arc<WalWriter>,
     BufferPool,
 ) {
@@ -33,7 +33,7 @@ fn setup() -> (
     config.wal_group_commit_batch_size = 1;
 
     let wal = Arc::new(WalWriter::open(tmp.path(), &config).unwrap());
-    let allocator = Arc::new(parking_lot::Mutex::new(
+    let allocator = Arc::new(pg_storage::sync::Mutex::new(
         PageAllocator::open(tmp.path(), &config, Arc::clone(&wal)).unwrap(),
     ));
     let pool = BufferPool::open(

@@ -75,6 +75,9 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     // crash is safely overwritten here.
     let mut file = File::create(&tmp).map_err(StorageError::Io)?;
     file.write_all(contents).map_err(StorageError::Io)?;
+    // Skipped under cfg(loom): model builds do not check crash durability,
+    // and a real fsync per setup dominates interleaving-exploration time.
+    #[cfg(not(loom))]
     file.sync_all().map_err(StorageError::Io)?;
     drop(file);
 
@@ -98,15 +101,20 @@ pub fn preallocate_file(file: &File, new_size: u64) -> Result<()> {
 
 /// Fsync a directory so that directory metadata operations (e.g., rename)
 /// are durable.
-#[cfg(unix)]
+///
+/// Under `cfg(loom)` this is a no-op: loom models check latch choreography,
+/// not crash durability, and a real directory fsync per setup makes
+/// thousands of interleavings prohibitively slow (see `crate::sync` docs).
+#[cfg(all(unix, not(loom)))]
 pub fn sync_dir(path: &Path) -> Result<()> {
     let dir = File::open(path).map_err(StorageError::Io)?;
     dir.sync_all().map_err(StorageError::Io)?;
     Ok(())
 }
 
-/// On non-Unix platforms directory fsync is a no-op in M1.
-#[cfg(not(unix))]
+/// On non-Unix platforms (and in loom model builds) directory fsync is a
+/// no-op.
+#[cfg(any(not(unix), loom))]
 pub fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }

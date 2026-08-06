@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use crate::buffer_pool::BufferPool;
 use crate::clog::ClogAccessor;

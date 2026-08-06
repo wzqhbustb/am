@@ -27,7 +27,7 @@ fn setup(thread_count: usize) -> (tempfile::TempDir, Arc<BufferPool>) {
     config.wal_group_commit_batch_size = thread_count;
 
     let wal = Arc::new(WalWriter::open(tmp.path(), &config).unwrap());
-    let allocator = Arc::new(parking_lot::Mutex::new(
+    let allocator = Arc::new(pg_storage::sync::Mutex::new(
         PageAllocator::open(tmp.path(), &config, Arc::clone(&wal)).unwrap(),
     ));
     let pool = Arc::new(

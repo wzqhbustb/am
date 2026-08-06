@@ -31,9 +31,17 @@ bincode = { version = "2.0.1", features = ["serde"] }
 # logging / tracing
 tracing = "0.1"
 
+# deterministic concurrency modeling (Stage Q); only enabled via the `loom`
+# feature, which also turns on `--cfg loom` for this crate (see build.rs)
+loom = { version = "0.7", optional = true }
+
 [features]
 default = []
 page-size-16k = []
+# Model-test build: swap parking_lot/std sync primitives for loom's
+# instrumented ones (crate::sync) so exhaustive interleaving models can drive
+# the real latch choreography. Test-only; never enable in production builds.
+loom = ["dep:loom"]
 
 [dev-dependencies]
 # property-based testing

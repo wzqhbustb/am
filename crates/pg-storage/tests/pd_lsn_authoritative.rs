@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use pg_storage::sync::Mutex;
 
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::config::StorageConfig;

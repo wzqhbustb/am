@@ -20,7 +20,29 @@ pg-txn = { path = "../pg-txn" }
 # error types
 thiserror = "2"
 
+# loom runtime for the Stage Q model tests (enabled by the `loom` feature;
+# kept as a normal optional dependency because dev-dependencies cannot be
+# optional — the feature is test-only and never enabled in production builds)
+loom = { version = "0.7", optional = true }
+
+[features]
+# Deterministic model tests (Stage Q): swaps pg-storage's sync primitives for
+# loom's instrumented ones (pg-storage/loom sets --cfg loom there) and pulls
+# in the loom runtime for tests/btree_loom.rs. Test-only.
+loom = ["pg-storage/loom", "dep:loom"]
+
+# Fault-injection hooks for tests (SPLIT_ALLOC_FAILURES in `index`). Off by
+# default so production builds carry no injection surface; enabled for the
+# crate's own integration tests through the self-referencing dev-dependency
+# below (cargo unifies the feature onto the lib when compiling tests).
+test-hooks = []
+
 [dev-dependencies]
+# Self-reference that turns on `test-hooks` for test builds only (see the
+# [features] note). The lib seen by tests/ has the injection points; the lib
+# seen by downstream production crates does not.
+pg-am-btree = { path = ".", features = ["test-hooks"] }
+
 # property-based testing
 # Pinned to ~1.4 to avoid proptest 1.5+ -> rand 0.9 -> getrandom 0.3 -> wasip2,
 # which requires Rust 1.87. This keeps the workspace MSRV at 1.86.
@@ -34,9 +56,20 @@ tempfile = "3"
 # pg-engine's normal dependency on this crate
 pg-engine = { path = "../pg-engine" }
 
+# tracing subscriber for tests / examples
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# tracing (subscriber install for LOOM_LOG iteration counting in btree_loom)
+tracing = "0.1"
+
 # benchmarks (pinned like pg-engine's)
 criterion = "0.5"
 
 [[bench]]
 name = "create_index"
 harness = false
+
+[[test]]
+name = "btree_loom"
+path = "tests/btree_loom.rs"
+required-features = ["loom"]

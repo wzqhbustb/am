@@ -523,6 +523,15 @@ impl Drop for TxnHandle {
 /// itself is not transactional (no undo-undo): if the process dies
 /// mid-undo, recovery replays the WAL prefix that did land, which is
 /// consistent because heap visibility never depends on index contents.
+///
+/// Restart budget (Stage Q review M3): the `Deleted` re-insert goes through
+/// [`BTreeIndex::insert_with_budget`] with [`UNDO_INSERT_RESTART_BUDGET`]
+/// instead of the online insert's 256. Undo runs on the abort path (no
+/// client waiting), and a spurious budget exhaustion during a split storm
+/// or a stale separator gap would permanently drop a LIVE row's index
+/// entry (heap visibility only masks the opposite direction of
+/// inconsistency). A genuine post-crash wedge still terminates — the
+/// budget is large, not infinite — and is reported at ERROR level.
 fn apply_index_undo(
     log: &Mutex<HashMap<TxnId, Vec<IndexUndo>>>,
     buffer_pool: &Arc<BufferPool>,
@@ -540,18 +549,29 @@ fn apply_index_undo(
             )
             .and_then(|mut index| match undo.op {
                 IndexUndoOp::Inserted => index.delete(&undo.key, undo.tid),
-                IndexUndoOp::Deleted => index.insert(&undo.key, undo.tid),
+                IndexUndoOp::Deleted => {
+                    index.insert_with_budget(&undo.key, undo.tid, UNDO_INSERT_RESTART_BUDGET)
+                }
             });
         if let Err(e) = result {
-            tracing::warn!(
+            tracing::error!(
                 error = %e,
                 xid = xid.0,
                 index_oid = undo.index.index_oid.0,
-                "index undo failed; index may be inconsistent with the heap"
+                "index undo failed after full retry budget; index is likely \
+                 inconsistent with the heap (a live row may have lost its \
+                 index entry) — rebuild the index"
             );
         }
     }
 }
+
+/// Restart budget for abort-time index-undo re-inserts (see
+/// [`apply_index_undo`]): ~1M passes, versus the online insert's 256.
+/// Each pass is a full descent (~µs), so even a pathological split storm
+/// bounds the abort path at seconds, while a genuinely wedged tree still
+/// terminates and is logged at ERROR level.
+const UNDO_INSERT_RESTART_BUDGET: usize = 1 << 20;
 
 impl Engine {
     /// Open (or create) a database at `data_dir`, assembling all layers.
