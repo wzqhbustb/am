@@ -29,33 +29,40 @@
 //! (max strength); re-acquiring with the same or a weaker mode is a no-op.
 //! An upgrade that must wait keeps the old grant while queued (same as PG):
 //! the requester's old mode still counts as granted, so two transactions
-//! upgrading the same table lock in opposite directions can deadlock. That
-//! is accepted for Stage P — Stage R's deadlock detector will consume the
-//! wait state exposed here ([`LockManager::table_lock_state`]) to break it.
+//! upgrading the same table lock in opposite directions can deadlock; Stage
+//! R's detector ([`crate::deadlock`]) consumes the wait state exposed here
+//! ([`LockManager::table_lock_states`]) to break such cycles.
 //!
 //! # Deadlock scope
 //!
-//! Deadlock *detection* is Stage R and not implemented here. What Stage P
-//! guarantees is only that waiting never holds the global lock-manager mutex
-//! while blocked: [`parking_lot::Condvar::wait`] releases the mutex for the
-//! duration of the sleep, so a classic A-holds-t1-wants-t2 / B-holds-t2-
-//! wants-t1 cycle wedges the two transactions, never the lock manager.
+//! Deadlock *detection* is Stage R ([`crate::deadlock`]): the detector
+//! snapshots [`LockManager::table_lock_states`] together with the row-lock
+//! registry, finds wait-for cycles, and marks a victim; a waiting
+//! [`LockManager::acquire`] then observes its own victim flag, drops its
+//! queue entry, and returns [`LockError::DeadlockVictim`]. What Stage P
+//! established (and Stage R preserves) is that waiting never holds the
+//! global lock-manager mutex while blocked: [`parking_lot::Condvar::wait`]
+//! releases the mutex for the duration of the sleep, so a cycle wedges only
+//! the participating transactions until the detector breaks it.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 
 use pg_storage::types::{Oid, TxnId};
 
+use crate::deadlock::DeadlockVictims;
+
 /// Errors from the table lock manager.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LockError {
-    /// Reserved for Stage R's deadlock detector: a wait that would close a
-    /// cycle in the wait-for graph is aborted with this error. Stage P never
-    /// produces it (no detection yet), but the variant fixes the error type
-    /// so the row-lock 5-step protocol (§9.1) and Stage R can land without
-    /// signature churn.
+    /// The deadlock detector (M2c Stage R, §9.3) chose this transaction as
+    /// the victim of a wait-for cycle and interrupted its table-lock wait.
+    /// The waiter's queue entry is already removed; its GRANTED locks are
+    /// kept (2PL) and are released by the caller's abort path
+    /// ([`LockManager::release_all`]).
     #[error("deadlock detected: transaction {0} chosen as victim")]
     DeadlockVictim(TxnId),
 }
@@ -197,9 +204,10 @@ pub struct TableLockState {
 /// Table-level lock manager: `HashMap<Oid, LockEntry>` behind a single
 /// mutex, with one condvar shared by all waiters.
 ///
-/// Depends only on `pg-storage` types (`Oid`, `TxnId`) — never on
-/// `pg-catalog` (tech-selection §一 dependency rule).
-#[derive(Debug, Default)]
+/// Depends only on `pg-storage` types (`Oid`, `TxnId`) and the Stage R
+/// victim registry — never on `pg-catalog` (tech-selection §一 dependency
+/// rule).
+#[derive(Debug)]
 pub struct LockManager {
     entries: Mutex<HashMap<Oid, LockEntry>>,
     /// Shared by waiters of every table. Wakeups are `notify_all`: a woken
@@ -208,12 +216,57 @@ pub struct LockManager {
     /// avoid cross-table wakeups but is not worth the extra map at M2c
     /// concurrency levels.
     condvar: Condvar,
+    /// Deadlock-victim flags (M2c Stage R): shared with the `TxnManager`
+    /// and the `DeadlockDetector` via [`Self::with_deadlock_victims`]. Leaf
+    /// mutex — taken only while holding `entries` (entries → victims), and
+    /// the detector never holds it while taking `entries` (mark first, then
+    /// lock-and-notify), so no inversion is possible.
+    deadlock_victims: Arc<DeadlockVictims>,
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LockManager {
-    /// Create an empty lock manager.
+    /// Create an empty lock manager with a private, never-marked victim
+    /// registry (Stage P behavior: waits are never interrupted) until
+    /// [`Self::with_deadlock_victims`] installs the shared one.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            condvar: Condvar::new(),
+            deadlock_victims: Arc::new(DeadlockVictims::new()),
+        }
+    }
+
+    /// Install the shared deadlock-victim registry (M2c Stage R). Builder
+    /// style: call before the manager is wrapped in an `Arc` and shared.
+    /// The engine passes the SAME registry to the `TxnManager` and the
+    /// `DeadlockDetector`, so a mark by the detector is visible to both
+    /// wait loops.
+    pub fn with_deadlock_victims(mut self, victims: Arc<DeadlockVictims>) -> Self {
+        self.deadlock_victims = victims;
+        self
+    }
+
+    /// The shared victim registry (identity-checked by
+    /// `DeadlockDetector::start`'s debug assertion).
+    pub fn deadlock_victims(&self) -> Arc<DeadlockVictims> {
+        Arc::clone(&self.deadlock_victims)
+    }
+
+    /// Broadcast to ALL lock waiters without a grant change (M2c Stage R):
+    /// the deadlock detector calls this after marking a victim so a waiter
+    /// parked in [`Self::acquire`] re-checks its victim flag. Delivered
+    /// under the entries mutex, matching `release_all`'s wakeup discipline
+    /// — waiters check their predicates and sleep atomically with respect
+    /// to this mutex, so the mark cannot be missed.
+    pub fn notify_waiters(&self) {
+        let _entries = self.entries.lock();
+        self.condvar.notify_all();
     }
 
     /// Acquire `mode` on `table` for `xid`, blocking in FIFO order until the
@@ -226,15 +279,50 @@ impl LockManager {
     ///
     /// Never blocks while holding the internal mutex — `Condvar::wait`
     /// releases it — so two transactions deadlocked against each other wedge
-    /// only themselves (Stage R will detect the cycle).
+    /// only themselves until Stage R's detector breaks the cycle.
+    ///
+    /// # Victim interruption (M2c Stage R)
+    ///
+    /// The deadlock-victim flag is checked FIRST on every iteration, under
+    /// the entries mutex: the detector marks the victim and then notifies
+    /// under the same mutex ([`Self::notify_waiters`]), so a mark can never
+    /// slip between the check and the sleep. On a hit the waiter consumes
+    /// the flag, drops its queue entry, re-grants any newly compatible
+    /// heads, and returns [`LockError::DeadlockVictim`]. A mark consumed on
+    /// an acquisition that could have been granted immediately still fails:
+    /// once chosen, the victim's current statement is dead — its granted
+    /// locks remain held (2PL) until the caller's abort releases them.
     ///
     /// # Errors
     ///
-    /// Stage P never fails: the `LockError` return type exists so Stage R's
-    /// deadlock detector can abort a victim's wait without an API change.
+    /// [`LockError::DeadlockVictim`] when the deadlock detector chose `xid`
+    /// to break a wait-for cycle. Without a detector wired in, `acquire`
+    /// never fails.
     pub fn acquire(&self, xid: TxnId, table: Oid, mode: LockMode) -> LockResult<()> {
         let mut entries = self.entries.lock();
         loop {
+            if self.deadlock_victims.take(xid) {
+                // Victim cleanup: drop the queued request, re-grant heads
+                // that became compatible, and wake everyone so re-granted
+                // waiters proceed. The victim's GRANTED locks stay (2PL);
+                // the abort path's `release_all` drops them. `get_mut`, not
+                // `entry().or_default()`: a victim interrupted before it ever
+                // queued on this table has nothing to clean, and creating an
+                // empty entry here would leak it (only `release_all` prunes
+                // empty entries).
+                let became_empty = if let Some(entry) = entries.get_mut(&table) {
+                    entry.wait_queue.retain(|w| w.xid != xid);
+                    entry.regrant_heads();
+                    entry.granted.is_empty() && entry.wait_queue.is_empty()
+                } else {
+                    false
+                };
+                if became_empty {
+                    entries.remove(&table);
+                }
+                self.condvar.notify_all();
+                return Err(LockError::DeadlockVictim(xid));
+            }
             let entry = entries.entry(table).or_default();
             if entry.can_grant(xid, mode) {
                 entry.grant(xid, mode);
@@ -248,12 +336,15 @@ impl LockManager {
     /// Non-blocking acquire: returns `Ok(true)` if the lock was granted
     /// (immediately, following the same FIFO and upgrade rules as
     /// [`Self::acquire`]), `Ok(false)` if it would have had to wait. Never
-    /// enqueues: a failed `try_acquire` leaves no trace.
+    /// enqueues: a failed `try_acquire` leaves no trace — in particular it
+    /// must not insert an empty `LockEntry` (only `release_all` prunes
+    /// them), so grantability is checked through `get` first and the entry
+    /// is created only when the grant is actually recorded.
     pub fn try_acquire(&self, xid: TxnId, table: Oid, mode: LockMode) -> LockResult<bool> {
         let mut entries = self.entries.lock();
-        let entry = entries.entry(table).or_default();
-        if entry.can_grant(xid, mode) {
-            entry.grant(xid, mode);
+        let grantable = entries.get(&table).is_none_or(|e| e.can_grant(xid, mode));
+        if grantable {
+            entries.entry(table).or_default().grant(xid, mode);
             Ok(true)
         } else {
             Ok(false)
@@ -316,6 +407,37 @@ impl LockManager {
                 waiters: entry.wait_queue.iter().map(|w| (w.xid, w.mode)).collect(),
             }
         })
+    }
+
+    /// Snapshot of every CONTENDED table's lock state (sorted by table
+    /// OID) — the table-lock half of Stage R's wait-for graph. Tables whose
+    /// wait queue is empty are skipped: they contribute no wait-for edges
+    /// (edges go from waiters to conflicting holders), and the filter keeps
+    /// the per-tick clone cost proportional to the number of contended
+    /// tables rather than the total number of locked tables. The entries
+    /// mutex is held only for the clone and released immediately, so the
+    /// detector's tick never blocks `acquire` / `release_all` for more than
+    /// one map scan.
+    pub fn table_lock_states(&self) -> Vec<(Oid, TableLockState)> {
+        let entries = self.entries.lock();
+        let mut states: Vec<(Oid, TableLockState)> = entries
+            .iter()
+            .filter(|(_, entry)| !entry.wait_queue.is_empty())
+            .map(|(&table, entry)| {
+                let mut granted: Vec<(TxnId, LockMode)> =
+                    entry.granted.iter().map(|(&x, &m)| (x, m)).collect();
+                granted.sort_unstable();
+                (
+                    table,
+                    TableLockState {
+                        granted,
+                        waiters: entry.wait_queue.iter().map(|w| (w.xid, w.mode)).collect(),
+                    },
+                )
+            })
+            .collect();
+        states.sort_unstable_by_key(|(table, _)| *table);
+        states
     }
 }
 

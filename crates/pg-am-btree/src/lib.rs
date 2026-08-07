@@ -30,7 +30,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod am;
-mod bulkload;
+pub mod bulkload;
 pub mod error;
 pub mod index;
 pub mod key;

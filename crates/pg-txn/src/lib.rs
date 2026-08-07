@@ -37,7 +37,19 @@
 //! through the narrow [`manager::RowWaiter`] trait (register + wait), which
 //! [`TxnManager`] implements. The commit/checkpoint barrier is sunk into
 //! [`TxnManager`] itself, so commits are serialized against checkpoint CLOG
-//! flushes by construction. Deadlock *detection* is Stage R.
+//! flushes by construction.
+//!
+//! # M2c scope (Stage R)
+//!
+//! Stage R adds deadlock detection (tech-selection §9.3):
+//! [`deadlock::DeadlockDetector`] runs a 100ms background scan over the
+//! wait-for graph (row edges from `TxnManager::wait_edges`, table edges from
+//! `LockManager::table_lock_states`), picks the youngest transaction of each
+//! cycle as victim, and marks it in the shared [`deadlock::DeadlockVictims`]
+//! registry. Both wait loops — `TxnManager::wait_for` and
+//! `LockManager::acquire` — consume the mark and fail with
+//! [`TxnError::DeadlockVictim`] / [`LockError::DeadlockVictim`], which the
+//! caller's abort path turns into a full rollback.
 
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -45,6 +57,7 @@
 pub mod clog_buffer;
 pub mod clog_file;
 pub mod clog_mem;
+pub mod deadlock;
 pub mod lock_manager;
 pub mod manager;
 pub mod redo;
@@ -53,6 +66,7 @@ pub mod visibility;
 
 pub use clog_buffer::ClogBuffer;
 pub use clog_mem::InMemoryClogAccessor;
+pub use deadlock::{DeadlockDetector, DeadlockVictims, DEFAULT_DEADLOCK_INTERVAL};
 pub use lock_manager::{LockError, LockManager, LockMode, TableLockState};
 pub use manager::{CommitWal, RowWaiter, TxnError, TxnManager};
 pub use pg_storage::clog::{ClogAccessor, TxnState};

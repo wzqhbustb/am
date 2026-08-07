@@ -57,9 +57,11 @@ pub enum EngineError {
     #[error("btree error: {0}")]
     BTree(#[from] pg_am_btree::BTreeError),
 
-    /// The table lock manager rejected an acquisition (M2c Stage P). Stage
-    /// P's `acquire` never actually fails — the variant exists so Stage R's
-    /// deadlock detector can abort a victim without an API change.
+    /// The table lock manager rejected an acquisition: the deadlock
+    /// detector (M2c Stage R, §9.3) chose this transaction as the victim of
+    /// a wait-for cycle. The current statement fails with this error; the
+    /// caller must abort the transaction (auto-commit does so for any
+    /// statement failure).
     #[error("lock error: {0}")]
     Lock(#[from] pg_txn::LockError),
 

@@ -72,7 +72,7 @@ struct BuiltPage {
 /// Bulk-load `entries` into a brand-new index for `rel_oid`, returning the
 /// open handle. See the module docs for the packing, WAL and crash
 /// semantics.
-pub(crate) fn build(
+pub fn build(
     buffer_pool: &Arc<BufferPool>,
     wal_writer: &Arc<WalWriter>,
     rel_oid: Oid,

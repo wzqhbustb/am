@@ -58,6 +58,15 @@ pub enum HeapError {
     #[error("tuple at {0:?} was concurrently updated or deleted")]
     TupleConcurrentlyUpdated(pg_storage::types::Tid),
 
+    /// The deadlock detector (M2c Stage R, tech-selection §9.3) interrupted
+    /// this transaction's row-lock wait: it was chosen as the victim of a
+    /// wait-for cycle. The current statement fails; the caller must abort
+    /// the transaction (auto-commit does so on any statement error). Like
+    /// PostgreSQL's `deadlock detected`, the error is safe to retry as a
+    /// fresh transaction.
+    #[error("deadlock detected")]
+    DeadlockVictim,
+
     /// A lower-level storage engine operation failed (buffer pool, WAL, page
     /// allocator).
     #[error("storage error: {0}")]

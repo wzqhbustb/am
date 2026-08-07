@@ -51,6 +51,7 @@ use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::writer::WalWriter;
 
+use crate::deadlock::DeadlockVictims;
 use crate::snapshot::Snapshot;
 
 /// The two WAL operations the commit path needs: stage a record and fsync it.
@@ -84,6 +85,13 @@ pub enum TxnError {
     /// read from a tuple's `t_xmax`.
     #[error("transaction {0} cannot wait on itself")]
     SelfWait(TxnId),
+    /// The deadlock detector (M2c Stage R, §9.3) chose this transaction as
+    /// the victim of a wait-for cycle and interrupted its row-lock wait.
+    /// The waiter's registry edge is already cleared; the caller's current
+    /// statement fails and the transaction must be aborted (PG semantics:
+    /// the error is retryable as a whole, the statement is not).
+    #[error("deadlock detected: transaction {0} chosen as victim")]
+    DeadlockVictim(TxnId),
 }
 
 /// The row-lock wait capability the heap AM's §9.1 5-step protocol needs
@@ -171,6 +179,13 @@ pub struct TxnManager {
     /// Broadcast on every commit/abort (see [`Self::end_txn`]) so row-lock
     /// waiters re-check whether their blocking XID left the active set.
     row_wait_cv: Condvar,
+    /// Deadlock-victim flags (M2c Stage R): shared with the engine's
+    /// `LockManager` and the `DeadlockDetector` via
+    /// [`Self::with_deadlock_victims`]. A manager built without one gets a
+    /// private, never-marked registry, which preserves the Stage P
+    /// "waits are never interrupted" behavior. Leaf lock — see the
+    /// lock-order note on [`Self::wait_for`].
+    deadlock_victims: Arc<DeadlockVictims>,
 }
 
 impl TxnManager {
@@ -188,7 +203,34 @@ impl TxnManager {
             commit_barrier: Arc::new(RwLock::new(())),
             row_wait_registry: Mutex::new(HashMap::new()),
             row_wait_cv: Condvar::new(),
+            deadlock_victims: Arc::new(DeadlockVictims::new()),
         }
+    }
+
+    /// Install the shared deadlock-victim registry (M2c Stage R). Builder
+    /// style: call before the manager is wrapped in an `Arc` and shared.
+    /// The engine passes the SAME registry to the `LockManager` and the
+    /// `DeadlockDetector`, so a mark by the detector is visible to both
+    /// wait loops.
+    pub fn with_deadlock_victims(mut self, victims: Arc<DeadlockVictims>) -> Self {
+        self.deadlock_victims = victims;
+        self
+    }
+
+    /// The victim registry this manager checks in [`Self::wait_for`].
+    pub fn deadlock_victims(&self) -> Arc<DeadlockVictims> {
+        Arc::clone(&self.deadlock_victims)
+    }
+
+    /// Broadcast to row-lock waiters WITHOUT a state change (M2c Stage R):
+    /// the deadlock detector calls this after marking a victim so a waiter
+    /// parked in [`Self::wait_for`] re-checks its victim flag. The notify
+    /// is delivered under the registry mutex, matching `end_txn`'s wakeup
+    /// discipline — a waiter checks its predicates and sleeps atomically
+    /// with respect to this mutex, so the mark cannot be missed.
+    pub fn notify_row_waiters(&self) {
+        let _registry = self.row_wait_registry.lock();
+        self.row_wait_cv.notify_all();
     }
 
     /// The commit/checkpoint barrier (M2c Stage P). The engine installs
@@ -315,11 +357,18 @@ impl TxnManager {
     ///
     /// # Lock order
     ///
-    /// The active-set and registry mutexes are taken SEQUENTIALLY here,
-    /// never nested; the only nested direction anywhere in this manager is
-    /// registry → active (inside [`Self::wait_for`]), so no inversion is
-    /// possible.
+    /// All mutexes here are taken SEQUENTIALLY, never nested; the only
+    /// nested directions anywhere in this manager are registry → active and
+    /// registry → deadlock-victims (both inside [`Self::wait_for`]). The
+    /// victims mutex is a LEAF (taken alone above, and never held while
+    /// acquiring anything else anywhere), so no inversion is possible.
     fn end_txn(&self, xid: TxnId, state: TxnState) {
+        // Stage R hygiene: drop a stale victim flag for the ending XID
+        // (the detector may have marked it after its last wait completed).
+        // Leaf mutex taken alone — no lock-order interaction. A mark that
+        // lands AFTER this clear is pruned by the detector's next tick
+        // (the XID is no longer active).
+        self.deadlock_victims.clear(xid);
         self.clog.set_state(xid, state);
         // Active-set removal AFTER the CLOG bit; see the commit_txn doc on
         // the step 3/4 ordering argument.
@@ -364,7 +413,8 @@ impl TxnManager {
     /// Returns immediately when `blocking_xid` is already terminated
     /// (committed/aborted XIDs are removed from the active set by
     /// [`Self::end_txn`]). Spurious wakeups are handled by looping on the
-    /// predicate; the only wakeup source is `end_txn`'s broadcast.
+    /// predicate; the wakeup sources are `end_txn`'s broadcast and the
+    /// deadlock detector's [`Self::notify_row_waiters`] (Stage R).
     ///
     /// While blocked this holds NO `TxnManager` lock except the registry
     /// mutex the condvar releases — the active set, CLOG, and WAL stay
@@ -373,40 +423,53 @@ impl TxnManager {
     ///
     /// # Lock order
     ///
-    /// The only legal nesting is registry → active (this function holds the
-    /// registry mutex and takes the active mutex inside it). `end_txn`
-    /// takes the two sequentially, never nested, so it cannot invert the
-    /// order.
+    /// The only legal nestings are registry → active and registry →
+    /// deadlock-victims (this function holds the registry mutex and takes
+    /// those two inside it). The victims mutex is a LEAF: nothing is ever
+    /// acquired while holding it, and the detector never holds it while
+    /// taking the registry mutex (mark first, then lock-and-notify), so no
+    /// inversion is possible. `end_txn` takes its locks sequentially,
+    /// never nested.
     ///
-    /// # Non-returning waits
+    /// # Interruption by the deadlock detector (M2c Stage R)
     ///
-    /// There is no timeout and no interruption: if the blocking
-    /// transaction's commit/abort never completes — e.g. its WAL fsync
-    /// failed and the process is tearing down (the WAL writer marks itself
-    /// shut down on fsync failure) — this wait never returns. That is a
-    /// process-level failure policy, not a liveness bug: the waiter's own
-    /// transaction cannot make meaningful progress in a tearing-down
-    /// process either.
+    /// The victim flag is checked FIRST on every iteration, under the
+    /// registry mutex: the detector marks the flag and then notifies under
+    /// the same mutex, so a mark can never slip between the check and the
+    /// sleep. On a hit the waiter consumes the flag (`take`), clears its
+    /// own registry edge (same cleanup as a normal wake), and returns
+    /// [`TxnError::DeadlockVictim`]. If the blocking XID terminated in the
+    /// same instant the mark landed, the victim error wins — semantically
+    /// safe (retryable), and it keeps the flag from leaking into the
+    /// transaction's NEXT wait.
     ///
-    /// TODO(Stage R): the deadlock detector must be able to break a wait —
-    /// a victim selected for abort is typically blocked inside this
-    /// function. Add an interruption/timeout channel (e.g. a victim flag
-    /// checked alongside the predicate, or `wait_timeout` with re-check)
-    /// when the detector lands.
+    /// A wait that is never ended by commit/abort NOR interrupted by the
+    /// detector still never returns (e.g. the blocking transaction's WAL
+    /// fsync failed and the process is tearing down — a process-level
+    /// failure policy, not a liveness bug).
     ///
     /// On success the waiter's registry edge is cleared (§9.1: waiters
     /// clear their own entries on wake).
     ///
     /// # Errors
     ///
-    /// [`TxnError::SelfWait`] if `self_xid == blocking_xid` — a transaction
-    /// waiting on itself is a caller bug, not a schedulable state.
+    /// - [`TxnError::SelfWait`] if `self_xid == blocking_xid` — a
+    ///   transaction waiting on itself is a caller bug, not a schedulable
+    ///   state.
+    /// - [`TxnError::DeadlockVictim`] if the detector chose this
+    ///   transaction to break a wait-for cycle.
     pub fn wait_for(&self, self_xid: TxnId, blocking_xid: TxnId) -> std::result::Result<(), TxnError> {
         if self_xid == blocking_xid {
             return Err(TxnError::SelfWait(self_xid));
         }
         let mut registry = self.row_wait_registry.lock();
         loop {
+            // Victim check FIRST, under the registry mutex (see the doc
+            // above for the missed-wakeup argument).
+            if self.deadlock_victims.take(self_xid) {
+                registry.remove(&self_xid);
+                return Err(TxnError::DeadlockVictim(self_xid));
+            }
             // Predicate: the blocking XID has left the active set. Checked
             // while holding the registry mutex; `end_txn` notifies under
             // the same mutex after removing the XID, so no wakeup is lost.

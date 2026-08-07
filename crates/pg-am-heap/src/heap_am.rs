@@ -583,6 +583,10 @@ impl HeapAM {
     /// §9.1 steps 5b–5c: block until `blocking_xid` ends. The caller must
     /// have dropped every page latch already; the wait edge was registered
     /// by [`Self::row_lock_gate`] while the latch was still held.
+    ///
+    /// A [`TxnError::DeadlockVictim`] interruption (M2c Stage R) maps to
+    /// [`HeapError::DeadlockVictim`] so the SQL layer can tell a
+    /// detector-chosen abort from an internal wait failure.
     fn wait_row_lock(&self, self_xid: TxnId, blocking_xid: TxnId) -> Result<()> {
         let waiter = self
             .row_waiter
@@ -594,9 +598,15 @@ impl HeapAM {
                 // Unreachable through the gate (it never returns
                 // `Wait(self_xid)`), but a failed wait must not leak the
                 // registered edge — Stage R's deadlock detector reads the
-                // registry as the wait-for graph.
+                // registry as the wait-for graph. (Idempotent: `wait_for`
+                // already cleared the edge on its own error paths.)
                 waiter.unregister_row_wait(self_xid);
-                HeapError::InvalidArgument(format!("row-lock wait failed: {e}"))
+                match e {
+                    pg_txn::TxnError::DeadlockVictim(_) => HeapError::DeadlockVictim,
+                    other => {
+                        HeapError::InvalidArgument(format!("row-lock wait failed: {other}"))
+                    }
+                }
             })
     }
 

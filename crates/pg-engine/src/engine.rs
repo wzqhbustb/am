@@ -95,10 +95,24 @@
 //!   (CREATE INDEX), or `AccessExclusive` (CREATE/DROP TABLE) after table
 //!   resolution; locks are keyed by XID and released at commit/abort (2PL).
 //!
-//! DDL is additionally serialized by an internal lock. Deadlock DETECTION
-//! is Stage R: a table-lock cycle (e.g. two transactions upgrading
-//! `AccessShare` → `RowExclusive` on the same table) wedges the
-//! participants. The snapshot-only read APIs (`scan`, `index_lookup`) and
+//! DDL is additionally serialized by an internal lock. Deadlock detection
+//! is M2c Stage R (tech-selection §9.3): [`Engine::open`] starts one
+//! `DeadlockDetector` per engine (tick interval from
+//! [`EngineConfig::deadlock_detector_interval`], default 100ms), which scans
+//! the wait-for graph — row edges from `TxnManager::wait_edges`, table edges
+//! from `LockManager::table_lock_states` — and breaks each cycle by marking
+//! its youngest transaction (max XID) in a victim registry shared by both
+//! wait loops. A victim parked in `wait_for` / `LockManager::acquire` wakes
+//! with a deadlock error: the current statement fails, and the caller must
+//! abort the transaction (PG semantics — there is no enforced "aborted
+//! state" in M2c, the same caller discipline as the no-statement-level-
+//! rollback rule). Because the detector's two wait-graph sources cannot be
+//! snapshotted atomically, a cycle can dissolve between the detector's
+//! re-verification and its mark, delivering a DeadlockVictim error to a
+//! transaction whose deadlock no longer exists — rare, and consistent with
+//! what PG can surface under `deadlock_timeout` races; the error is always
+//! safe to retry as a fresh transaction after the abort. The snapshot-only
+//! read APIs (`scan`, `index_lookup`) and
 //! plain auto-commit SELECT take no table lock (they own no transaction),
 //! so a `DROP TABLE` racing them can still produce `TableNotFound` —
 //! unchanged from M2b.
@@ -108,6 +122,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 
@@ -132,8 +147,8 @@ use pg_storage::recovery::AttProvider;
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::WalWriter;
 use pg_txn::{
-    is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, LockManager, LockMode,
-    RowWaiter, Snapshot, TxnManager,
+    is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, DeadlockDetector,
+    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, TxnManager,
 };
 
 use crate::error::{EngineError, Result};
@@ -206,6 +221,15 @@ pub struct EngineConfig {
     /// value outside [4, 1024] — an invalid configuration must fail loudly
     /// at startup, not degrade at runtime.
     pub clog_buffer_frames: usize,
+    /// Deadlock detector tick interval (M2c Stage R, tech-selection §9.3):
+    /// the background scan of the wait-for graph runs this often. Default
+    /// 100ms, which bounds detection latency at ~one tick (acceptance:
+    /// ≤200ms). Tests may lower it to keep the suite fast; setting it too
+    /// low wastes CPU on empty-graph scans (each tick is µs-scale, so even
+    /// the 100ms default is far under the 1% CPU budget). Zero is clamped
+    /// to a 1ms floor by `DeadlockDetector::start` — a free-running scan
+    /// buys no observable latency and would busy-loop a core.
+    pub deadlock_detector_interval: Duration,
 }
 
 impl EngineConfig {
@@ -214,6 +238,7 @@ impl EngineConfig {
         Self {
             storage: StorageConfig::new(data_dir),
             clog_buffer_frames: DEFAULT_CLOG_BUFFER_FRAMES,
+            deadlock_detector_interval: pg_txn::DEFAULT_DEADLOCK_INTERVAL,
         }
     }
 }
@@ -363,10 +388,17 @@ pub struct Engine {
     /// TABLE take `AccessExclusive`. Locks key by XID and are held to
     /// transaction end (2PL — released only by `release_all` at
     /// commit/abort, never mid-transaction). Always the blocking `acquire`:
-    /// there is no NOWAIT and no deadlock detection yet (Stage R consumes
-    /// `table_lock_state` + `TxnManager::wait_edges`), so a table-lock cycle
-    /// wedges only the participating transactions.
+    /// there is no NOWAIT; a table-lock cycle is broken by the deadlock
+    /// detector (Stage R), which shares the victim registry with this
+    /// manager (wired at open).
     lock_manager: Arc<LockManager>,
+    /// Deadlock detector (M2c Stage R, tech-selection §9.3): background
+    /// thread scanning the wait-for graph every
+    /// [`EngineConfig::deadlock_detector_interval`], aborting the youngest
+    /// transaction of each cycle. One per engine; stopped by
+    /// [`Engine::shutdown`] (and by `Drop`, so an engine dropped without
+    /// shutdown never leaves an orphaned thread).
+    deadlock_detector: DeadlockDetector,
     /// Name → table. Rebuilt from the catalog at open; kept in sync by DDL.
     registry: RwLock<HashMap<String, TableEntry>>,
     /// All live indexes (M2b Stage M wave 2). Rebuilt at open by scanning
@@ -621,12 +653,22 @@ impl Engine {
         //     The manager comes FIRST: the heap AM's §9.1 row-lock protocol
         //     (M2c Stage P) needs its wait capability installed before the
         //     AM is shared.
+        //
+        // The deadlock-victim registry (M2c Stage R) is created here so the
+        // SAME Arc is shared by the TxnManager (row-lock waits), the
+        // LockManager (table-lock waits), and the DeadlockDetector (which
+        // marks). A victim flag set by the detector is thus visible to
+        // whichever wait loop the victim is parked in.
+        let victims = Arc::new(DeadlockVictims::new());
         let wal: Arc<dyn CommitWal> = Arc::clone(storage.wal_writer()) as Arc<dyn CommitWal>;
-        let txn = Arc::new(TxnManager::new(
-            storage.txn_id_clock(),
-            wal,
-            Arc::clone(&clog) as Arc<dyn ClogAccessor>,
-        ));
+        let txn = Arc::new(
+            TxnManager::new(
+                storage.txn_id_clock(),
+                wal,
+                Arc::clone(&clog) as Arc<dyn ClogAccessor>,
+            )
+            .with_deadlock_victims(Arc::clone(&victims)),
+        );
         let mut heap = HeapAM::new(
             Arc::clone(storage.buffer_pool()),
             Arc::clone(storage.wal_writer()),
@@ -660,13 +702,26 @@ impl Engine {
         let registry = Self::build_registry(&catalog)?;
         let indexes = Self::build_index_registry(&catalog, &heap, clog.as_ref())?;
 
+        // 8. Lock manager (sharing the victim registry) and the deadlock
+        //    detector thread (M2c Stage R, §9.3). Started LAST, once both
+        //    managers exist; one detector per engine instance.
+        let lock_manager =
+            Arc::new(LockManager::new().with_deadlock_victims(Arc::clone(&victims)));
+        let deadlock_detector = DeadlockDetector::start(
+            Arc::clone(&txn),
+            Arc::clone(&lock_manager),
+            victims,
+            config.deadlock_detector_interval,
+        );
+
         Ok(Self {
             storage,
             catalog,
             heap,
             txn,
             clog,
-            lock_manager: Arc::new(LockManager::new()),
+            lock_manager,
+            deadlock_detector,
             registry: RwLock::new(registry),
             indexes: RwLock::new(indexes),
             ddl_lock: Mutex::new(()),
@@ -827,8 +882,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Gracefully shut down background threads (checkpointer, WAL writer).
+    /// Gracefully shut down background threads (deadlock detector,
+    /// checkpointer, WAL writer).
     pub fn shutdown(&self) {
+        // Stop the detector FIRST (M2c Stage R): it only reads the two
+        // managers, but stopping it here guarantees no tick can mark a
+        // victim while storage is tearing down underneath a wait loop.
+        self.deadlock_detector.stop();
         self.storage.shutdown();
     }
 
@@ -1908,9 +1968,8 @@ impl Engine {
     ///
     /// Locks are taken in the final RESULT order (i.e. ORDER BY's value
     /// order when sorting, not storage/scan order). Two transactions
-    /// locking overlapping row sets in different value orders widen the
-    /// deadlock surface; Stage P accepts this (Stage R's detector consumes
-    /// the row-wait registry to break cycles).
+    /// locking overlapping row sets in different value orders can deadlock;
+    /// Stage R's detector breaks such cycles (youngest victim aborted).
     #[allow(clippy::too_many_arguments)] // mirrors the parsed Select AST fields
     fn exec_select(
         &self,
@@ -2148,10 +2207,9 @@ impl Engine {
     /// commit/abort; 2PL, no downgrade). Re-acquisition upgrades in place,
     /// so calling this per statement is cheap and idempotent.
     ///
-    /// Always the blocking `acquire`: Stage P has no NOWAIT and no deadlock
-    /// detector (Stage R), so a table-lock cycle — e.g. two transactions
-    /// upgrading `AccessShare` → `RowExclusive` on the same table — wedges
-    /// the participants instead of erroring.
+    /// Always the blocking `acquire`: there is no NOWAIT; a table-lock
+    /// cycle is broken by the Stage R deadlock detector, which aborts the
+    /// youngest participant with `LockError::DeadlockVictim`.
     fn lock_table(&self, xid: TxnId, entry: &TableEntry, mode: LockMode) -> Result<()> {
         self.lock_oid(xid, entry.oid, mode)
     }

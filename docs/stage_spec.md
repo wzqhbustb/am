@@ -510,3 +510,72 @@ loom 的 `Arc` 在 stable 上无法做 `Arc<dyn Trait>` 协变，强行别名会
 - `SPLIT_ALLOC_FAILURES` 注入钩子已 feature 门控（`test-hooks`，默认关闭，dev-dep 自引用供测试）
 
 ---
+
+## Stage R：死锁检测
+
+**状态**：✅ 完成（M2c，工作区测试全绿；未提交）
+**工期**：预估 3–5 天
+**验收**：`deadlock_detection` 11/11（2/3/4 事务环 + 行锁环 + 混合环 + 共享 victim 双环 + churn soak）；检测延迟实测 99–106ms（≤200ms）；tick p99 ≈ 204–229µs（≤5ms）；检测线程 busy/wall ≈ 0.05–0.07%（<1%）
+
+### 交付内容
+
+1. **DeadlockDetector（`pg-txn/deadlock.rs`）**
+   - 后台线程 100ms tick（`EngineConfig.deadlock_detector_interval` 可配）：快照双源 → 迭代式三色 DFS 找环（确定性按 XID 排序）→ 环内 max XID 为最年轻 victim → **撕裂快照复核**（重读双源，环上每边仍在且 victim 仍 active）→ mark + 双 condvar 广播
+   - tick 整体 `catch_unwind` + panic 计数（线程不死）；tick 耗时环形缓冲供性能验收；`stop()` 幂等、Drop 兜底 join、stop flag + notify 即时唤醒（shutdown 不等一个 tick）
+   - **硬边策略**：行边 = `wait_edges()`；表边 = 等待者 → 所有模式冲突的持有者；FIFO 排队顺序不产生边（PG soft-edge 队列重排超出 M2c，模块文档记录了该盲区与"硬边足以发现纯冲突环"的论证）
+
+2. **Victim 中断通道**（兑现 Stage P 的 TODO）
+   - `DeadlockVictims`（`Mutex<HashSet<Xid>>` 共享注册表，**叶锁**：合法嵌套只有 registry→victims 与 entries→victims）
+   - `wait_for`：每轮迭代在 registry 锁内**先查 victim flag**——命中则消费 flag、清自己的等待边、返回 `TxnError::DeadlockVictim`
+   - `LockManager::acquire`：同构——命中则消费、摘出等待队列、`regrant_heads`（不授予与 victim 仍持有锁冲突的请求）+ 广播，返回 `LockError::DeadlockVictim`；已授予锁保留（2PL），由调用方 abort 路径 `release_all`
+   - 标记幂等：`end_txn` 清 stale flag；tick 开头清理已结束 XID 的残留 flag（覆盖 mark-晚于-clear 竞态）
+   - 错误管线：`TxnError::DeadlockVictim` → `HeapError::DeadlockVictim`("deadlock detected")→ EngineError；显式事务语义同 PG——当前语句失败，调用方必须 abort
+
+3. **引擎接线**
+   - `Engine::open`：创建共享 victims 注册表 → TxnManager/LockManager 各装一份 → 最后启动检测器；`shutdown` 先停检测器再停 storage
+   - auto-commit 路径的 deadlock 错误走既有"语句失败 → index undo → abort → release_all"通用通道，零新机制
+
+4. **Review 修复清单**（三轮对抗审查，未发现高危）
+   - `end_txn` 锁序注释补 registry→victims 嵌套（文档与代码矛盾）
+   - victim 消费路径与 `try_acquire` 的 `entry().or_default()` 空 LockEntry 泄漏（改 `get_mut`）
+   - 检测器性能：`table_lock_states` 跳过无等待者的表（克隆成本从总锁数降到竞争锁数）；同一 tick 的 re-verify 复用单次快照
+   - 性能测试抖动修复：CPU 预算断言改按生产 100ms interval 实测 40 tick（原 10ms 加速口径余量太薄）
+   - engine 模块文档补"虚假 DeadlockVictim 可能性"说明
+   - `interval=0` 忙循环（第三轮）：`start` 入口钳制到 1ms 下限 + 测试钉住
+   - Torn-snapshot 文档扩写（第三轮）：复核快照自身亦撕裂（never-coexisted 混合环可通过复核），误标概率非零但语义安全
+   - `start` 的 `Arc::ptr_eq` 防呆断言（设计终审建议）：三处共享同一 victims 注册表从文档承诺变开发期断言
+   - 测试补强（第三轮）：共享 victim 双环（钉住 is_marked 跳过分支）、churn soak-lite（8 线程 3 秒，实测 477 次 victim abort、panic=0、终态全排空）
+
+### 设计理由
+
+**1. 为什么 victim 标记制而非检测器直接 abort？**
+victim 通常正阻塞在 wait 里，第三方线程直接拆它的事务会与 victim 自身执行并发。标记 + 唤醒 + victim 自报错（PG 同款形态）让所有清理（index undo、CLOG、release_all）走已有的调用方 abort 路径，零新机制。
+
+**2. 为什么周期 tick 而非 PG 的惰性触发（deadlock_timeout 后阻塞者自查）？**
+我们的等待图是双源（row_wait_registry + LockManager），让被阻塞事务自己合并快照会污染 hot path；周期 tick 换取 ≤200ms 的检测延迟（agent 场景敏感），成本被验收约束在 CPU <1%（实测 0.07%）。
+
+**3. 为什么复核后仍接受残余误杀？**
+双源快照非原子：复核通过到 mark 落地之间环可能消散且 victim 已合法拿锁继续运行——其下一次 wait 会虚假失败。语义上安全（可重试错误）、概率极低、与 PG 在 deadlock_timeout 竞争下的可观察行为一致；用`end_txn` 清理 + tick 开头清理把残留窗口压到最小。
+
+**4. 为什么 FIFO 排队不产生边？**
+环只能由 hold-and-wait 构成；排在前面的等待者本身不持有锁，等待者→等待者的边不构成死锁。PG 的 soft-edge 队列重排会破坏我们的反饿死公平性承诺，明确不做。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage R) | 取舍理由 |
+|---|---|---|---|
+| 触发 | 惰性（`deadlock_timeout` 默认 1s，阻塞者自查） | **周期 tick（100ms 后台线程）** | 检测延迟 ≤200ms vs 1s 级；成本常开但被验收约束 |
+| 等待图数据源 | 统一锁表（XID 虚拟锁入同一锁表），大锁下一致快照 | 双源（row_wait_registry + LockManager），非原子快照 + 复核 | 行锁等待不进锁管理器是 Stage P 的热路径取舍 |
+| 边类型 | 硬边 + 软边，软环尝试队列重排 | **仅硬边** | 软环罕见；重排破坏 FIFO 反饿死承诺 |
+| Victim 选择 | 触发检测的进程自己 | **环内最年轻（最大 XID)** | 保护老事务；代价是跨线程标记竞态（幂等 + 清理兜底） |
+| 检测成本 | 无死锁时零成本 | 常开（实测 0.07% CPU，p99 204µs） | 快照只克隆受竞争的表 |
+
+### 已知残留与后续归队
+
+- 虚假 DeadlockVictim 残余窗口（复核→mark 间隙）→ 接受，语义安全，已文档化
+- 软边环（纯 FIFO 排队构成）不检测 → 观察项，Stage T 压测若出现再议
+- `lock_timeout` / NOWAIT / SKIP LOCKED 无（wait_for 无超时参数）→ Phase 6 协议层需求出现时评估"XID 虚拟锁统一进 LockManager"的重构
+- pg-txn 无 tracing 依赖，tick panic 只计数不告警 → 可观测性归 Phase 7a
+- SQL 层表达不出纯表锁环（显式事务内 DDL 被拒，AS/RE 互不冲突）→ engine 级表锁环测试用原始 XID 驱动，已注明
+
+---

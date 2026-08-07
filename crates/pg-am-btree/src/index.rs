@@ -33,7 +33,7 @@
 //!   ownership of the probe is **re-validated under the write latch** — a
 //!   concurrent split may have moved the key range right, in which case the
 //!   right twin is latched in chain order (coupled, left before right) and
-//!   the check repeats, bounded by [`MAX_CHAIN_HOPS`]. If the entry fits,
+//!   the check repeats, bounded by `MAX_CHAIN_HOPS`. If the entry fits,
 //!   it is WAL-logged and applied under that single leaf latch. There is
 //!   deliberately **no latch-upgrade API**: the buffer pool does not expose
 //!   `parking_lot` upgrades, and re-validation after a drop-and-re-pin is
@@ -67,7 +67,7 @@
 //! a probe that sorts right of the latched page's range, an internal-level
 //! left hop (see the known limitation below), or allocation pressure even
 //! MID-cascade — drops all latches and restarts the whole insert, bounded
-//! by [`MAX_INSERT_RESTARTS`]. In a live tree every restart is caused by a
+//! by `MAX_INSERT_RESTARTS`. In a live tree every restart is caused by a
 //! concurrent split that completes shortly after, so a few attempts
 //! suffice. A tree that still refuses after the budget carries a
 //! *post-crash* incomplete split (a `SPLIT_INCOMPLETE` page whose Commit
@@ -108,7 +108,7 @@
 //!   point was the median slot regardless of entry sizes, which could
 //!   leave the receiving half without room for the pending entry AFTER
 //!   Copy was WAL-logged (a permanent `SPLIT_INCOMPLETE`). The split point
-//!   is now byte/pending-aware ([`choose_split_slot`]), and the downlink
+//!   is now byte/pending-aware (`choose_split_slot`), and the downlink
 //!   side choices use the same full `(key, trailer)` comparison.
 //!
 //! # Descent and Blink right hops
@@ -566,7 +566,7 @@ impl BTreeIndex {
     /// Lookups/range scans probe with `tid = Tid::INVALID` (the minimum);
     /// inserts/deletes probe with the entry's real TID.
     ///
-    /// This is the PageId view of [`BTreeIndex::descend_to_leaf_guard`] for
+    /// This is the PageId view of `BTreeIndex::descend_to_leaf_guard` for
     /// callers (insert, validate) that re-latch the leaf themselves.
     pub fn descend_to_leaf(&self, key: &[u8], tid: &Tid) -> Result<(PageId, Vec<PageId>, bool)> {
         let (guard, path, hopped) = self.descend_to_leaf_guard(key, tid)?;
@@ -600,7 +600,7 @@ impl BTreeIndex {
         self.descend_to_leaf_guard_from(self.root_page, key, tid)
     }
 
-    /// [`BTreeIndex::descend_to_leaf_guard`] starting from an explicit root
+    /// `BTreeIndex::descend_to_leaf_guard` starting from an explicit root
     /// (used by `validate`, which re-reads the authoritative root from the
     /// meta page instead of trusting the handle's cache — review M2).
     fn descend_to_leaf_guard_from<'a>(
@@ -756,7 +756,7 @@ impl BTreeIndex {
     /// applied under that single latch. When the leaf has no room, the
     /// insert escalates to a pessimistic pass (full-path write latches,
     /// split with a pre-reserved right page). Structural surprises restart
-    /// the whole insert, bounded by [`MAX_INSERT_RESTARTS`].
+    /// the whole insert, bounded by `MAX_INSERT_RESTARTS`.
     pub fn insert(&mut self, key: &[u8], tid: Tid) -> Result<()> {
         self.insert_with_budget(key, tid, MAX_INSERT_RESTARTS)
     }
@@ -1359,7 +1359,7 @@ impl BTreeIndex {
     /// `pending` is the entry whose insert triggered the split (the leaf
     /// entry, or the downlink for a cascading parent split). With `None`
     /// the split point is the median slot (exact Stage M behavior); with
-    /// `Some` it is chosen byte-aware by [`choose_split_slot`] so the
+    /// `Some` it is chosen byte-aware by `choose_split_slot` so the
     /// pending entry provably fits its landing half.
     fn split_prepare_on_guards(
         &self,
@@ -1984,7 +1984,7 @@ fn leaf_insert_slot(page: &[u8; PAGE_SIZE], key: &[u8], tid: &Tid) -> Result<u16
 }
 
 /// Count one whole-insert restart; fail with [`BTreeError::Unsupported`]
-/// once `max_restarts` is exhausted (see [`MAX_INSERT_RESTARTS`] and the
+/// once `max_restarts` is exhausted (see `MAX_INSERT_RESTARTS` and the
 /// module doc's restart section).
 fn restart_or_fail(restarts: &mut usize, max_restarts: usize) -> Result<()> {
     *restarts += 1;
