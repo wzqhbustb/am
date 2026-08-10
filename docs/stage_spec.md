@@ -579,3 +579,80 @@ victim 通常正阻塞在 wait 里，第三方线程直接拆它的事务会与 
 - SQL 层表达不出纯表锁环（显式事务内 DDL 被拒，AS/RE 互不冲突）→ engine 级表锁环测试用原始 XID 驱动，已注明
 
 ---
+
+## Stage S：HOT update + ARIES Undo（B+Tree CLR）+ Multixact 简版
+
+**状态**：✅ 完成（M2c，工作区测试全绿；未提交）
+**工期**：预估 7–10 天
+**验收**：`btree_undo_clr` 4/4 + `btree_split_crash` 5/5 + `hot_update` 4/4 + `m2c_locks` + `m2c_index_concurrent`（并发 DML 抓出 HOT 链递归读锁死锁，见设计理由 6）全绿；`m2b_crash_rounds` 25 轮（CI 口径）全绿，每轮携带 B+Tree leaf/root split、HOT/非 HOT update、`FOR SHARE`；`cargo test --workspace` 57 个测试二进制 + `cargo clippy --workspace --all-targets -- -D warnings` 全绿
+
+### 交付内容
+
+三条互相独立的轨道 + 一条把三者压进同一个崩溃流的集成验收。
+
+1. **Multixact 简版（`FOR SHARE`）**
+   - `HEAP_XMAX_IS_SHARE = 0x4000`（`t_infomask`），始终与 `HEAP_XMAX_LOCK_ONLY` 同时置位：共享锁与排他锁的区分不引入独立 multixact 段，完整 multixact 推迟 Phase 6
+   - `lock_tuple_share` 走与 `lock_tuple` 同构的 §9.1 restart 门；LOCK_ONLY 位在可见性判定中屏蔽 `t_xmax`，被共享锁定的行照常可见
+   - SQL 侧 `SELECT ... FOR SHARE`；`m2c_locks::for_share_locks_row_and_stays_visible` 钉住
+
+2. **HOT update**
+   - `HEAP_HOT_UPDATED`（旧版本）/ `HEAP_ONLY_TUPLE`（新版本）+ `t_ctid` 前向链，链不跨页
+   - `hot_eligible` 判据：表上**所有**索引列取值不变；旧页有空位则同页追加新版本并跳过索引维护，空位不足则回退跨页非 HOT 路径
+   - `HeapHotUpdate` WAL 记录（`page_id, old_slot, new_slot, new_tuple, xmax`）+ pd_lsn 守卫的幂等 redo
+   - 可见性侧：`index_lookup` 与 scan 在旧版本不可见时沿 `t_ctid` 跟链（深度上限 8）
+   - **索引维护缺陷修复**：`HEAP_ONLY_TUPLE` 自身从未获得索引项，因此对它的改键 update / delete 必须退掉**链根**的索引项。原实现按后代 TID 删除，报 `EntryNotFound` 并让索引与堆失去一致；新增 `Engine::hot_chain_root`（页内反向遍历 line pointer 到首个非 `HEAP_ONLY_TUPLE` 版本，HOT 链不跨页所以搜索是页局部的），回归测试 `dml_on_a_hot_descendant_retires_the_chain_root_entry`
+
+3. **ARIES Undo + B+Tree CLR**
+   - `UndoHandler` trait + `UndoContext`（`pg-storage/recovery.rs`）：handler 由 `pg-engine` 注入，因为 `pg-storage` 不能反向依赖 AM crate
+   - `HeapUndoHandler`：堆无需逐条撤销（MVCC 天然屏蔽），唯一动作是把 ATT 每个 XID 在 CLOG 盖 `Aborted`——崩溃可能根本没写出 `TxnAbort`
+   - `IncompleteSplitTracker`：redo 期间由 Prepare/Copy/Commit/CLR handler 维护（`mark_prepare` / `mark_copy` / `clear`），redo 结束后剩下的就是需要 undo 补齐的 split
+   - `BTreeUndoHandler`：按 level 降序（叶先于父）对每个未完成 split 调 `finish_incomplete_split`；只到 Prepare 的 split 用 `choose_split_slot_readonly` 重算中点
+   - `BTreeSplitCLR` 记录（判别式 50）把 Copy + downlink + 清 `SPLIT_INCOMPLETE` 合成一条幂等记录，携带 `redo_ref_lsn`（诊断用）、`parent_page` / `parent_insert_slot` / `separator_key` / `new_root_page` / `meta_page`
+   - **`apply_split_clr` 单一实现**：undo 路径与 `BTreeSplitClrRedoHandler` 调同一个函数，逐页 pd_lsn 守卫，收敛性是结构性的而非两份手写代码的巧合
+   - **`finish_incomplete_split` 改为 log-then-apply**：只读收集 → append+flush CLR 拿到 LSN → apply → 按 right→(new_root/parent/meta)→left 的顺序刷盘。任何页字节都不在 CLR 的 LSN 存在之前被改动
+
+4. **集成崩溃验收（`m2b_crash_rounds`）**
+   - `ixt(id INT, name TEXT)` + `name` 上的 B+Tree；索引键宽约 500B → 每叶仅约 15 项，一轮几十次插入即产生多次叶分裂与一次根分裂，kill 落点因此可能正处于 split 协议中途
+   - 同一 op 流混入 HOT update（只改无索引的 `id`）、非 HOT update（改索引列 `name`）、`FOR SHARE`；每个 op 最多新增一行，以维持父进程 mid 模式 `extras <= 1` 的前缀持久性不变式
+   - 每轮恢复后除既有的行内容比对外，追加：`validate()` 通过、每个已提交 `ixt` 行都能经索引查到、`ixt` 行数 > 30 时 `tree_level() >= 1`（否则该轮没有真正跑到 split 恢复，宁可响亮失败）
+
+### 设计理由
+
+**1. 为什么 undo 只补齐 split，不回滚堆元组？**
+§11.3 的简化 undo：堆的可见性判据是 `CLOG[xmin]`，把 ATT 成员盖成 `Aborted` 即让其全部写入不可见，逐条物理回滚是纯浪费。B+Tree 不同——`SPLIT_INCOMPLETE` 的右兄弟已在 `btpo_next` 链上但没有 downlink，这是**结构**破损，不是可见性问题，必须补齐。
+
+**2. 为什么补齐（redo-style）而不是回滚 split？**
+Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可能已把上半 entry 搬走。往回退需要把 entry 搬回并释放右页；往前推只需补 downlink。PG 同样选择"下一个访问者补齐"，我们只是把补齐时机固定在恢复期。
+
+**3. 为什么 undo 也必须 log-then-apply？**
+先改页再写 CLR 会留下"左页已 rebuild、右页已收到 entry、WAL 里没有 CLR"的状态；下一次崩溃恢复的 undo 会把同一批 entry 再搬一次。这正是本 stage 修掉的真实缺陷（右页 452 项而非 226 项，scan 返回 678 行而非 452 行），根因有两处叠加：`apply_split_copy` 是**追加**语义而 CLR redo 无条件传 `move_to_right = true`；`finish_incomplete_split` 从未给右页盖 CLR 的 pd_lsn，于是重放时 Prepare 的右页初始化被跳过、CLR 又追加一遍。
+**幂等不变式**：`move_to_right = right_lsn < clr_lsn`。左页已过 CLR 而右页没有 = 搬走的 entry 无处可寻，报 `Corrupted` 而不是静默丢数据。
+
+**4. 为什么 HOT 的索引维护要找链根，而不是给后代补一个索引项？**
+给后代补索引项就等于不做 HOT。PG 用页内 line pointer 重定向解决同一问题；我们的链不跨页，所以按 `t_ctid` 反向搜一页即可定位链根，且链上所有版本共享同一索引键（HOT 的前提就是索引列不变），链根的索引项携带的正是调用方读回的那个键。
+
+**5. 为什么用宽索引键而不是批量插入来制造 split？**
+父进程的 mid 模式要求每个 op 最多多出一行，批量插入会直接破坏这条不变式。把键 padding 到 500B 让每叶只装约 15 项，于是单行插入也能密集触发分裂。
+
+**6. 为什么 HOT 链遍历必须复用已 pin 的页，而不能再 pin 一次？**
+`parking_lot::RwLock::read()` 不可重入：同一线程持读锁期间再取读锁，只要中间有写者排队就自锁，而它还攥着外层读锁不放，整个 buffer pool 随之雪崩。首版 HOT 链遍历（`HeapAM::scan` 与 `Engine::heap_tuple_visible`）对 `chain_tid.page_id` 重新 `pin`，在 `m2c_index_concurrent` 的 6 写者 + checkpoint 并发下必然死锁（实测卡满 600s 看门狗，同一测试在 Stage R 基线只需 6.1s）。修法是直接读外层已 pin 的页——`HEAP_HOT_UPDATED` 只由同页快路径 `stamp_hot_update` 盖，**HOT 链永不跨页**，因此复用是语义使然而非权宜；`t_ctid` 若指向别页即为损坏，直接终止遍历。
+
+### 与 PostgreSQL 的 trade-off
+
+| 维度 | PostgreSQL | pg_rust (Stage S) | 取舍理由 |
+|---|---|---|---|
+| 共享行锁 | multixact 段（多持有者共存） | **`t_infomask` 单 bit（`HEAP_XMAX_IS_SHARE`）** | 一次只记得住"有共享锁"，记不住"谁"；完整 multixact 推迟 Phase 6 |
+| HOT 旧版本 | line pointer 转 REDIRECT（由 prune 回收） | **保留旧元组，靠 `t_ctid` 跟链** | 无 vacuum/prune，页内死空间不回收 |
+| HOT 索引项回收 | vacuum 回收，update 期间不删索引项 | **改键 update / delete 即时删链根索引项** | 无 vacuum，只能即时维护；代价是需要 `hot_chain_root` 页内搜索 |
+| 未完成 split | 下一个访问该页的读者/写者补齐 | **恢复期 undo 阶段补齐 + CLR** | 在线路径不必处理"别人的半成品"；代价是恢复多一个阶段 |
+| Undo 范围 | 逐条物理 undo（含 CLR 链） | **仅 CLOG 盖 Aborted + 结构补齐** | MVCC 屏蔽让堆 undo 变成空操作 |
+
+### 已知残留与后续归队
+
+- `BTreeSplitCLRRecord.redo_ref_lsn` 仅诊断用，undo 路径传 `Lsn::INVALID`（`IncompleteSplit` 未记 Prepare 的 LSN）；CLR 循环保护实际由逐页 pd_lsn 守卫承担 → 若将来出现嵌套 CLR，需要真正记录参考 LSN
+- HOT 链深度上限硬编码为 8；超长链的尾部版本在 `index_lookup` 中判不可见（scan 不受影响）→ 页内 prune 落地时一并解决
+- 无 page prune / vacuum：HOT 链把页填满后即退化为跨页非 HOT update → M2c+ 路线图
+- `m2b_crash_rounds` 默认 25 轮（CI 口径），plan 的 1000 轮口径需手工跑 → Stage T 的崩溃自动化承接
+- Multixact 简版记不住共享锁持有者集合，因此不支持"多个事务同时持共享锁后其中之一升级"→ Phase 6
+
+---

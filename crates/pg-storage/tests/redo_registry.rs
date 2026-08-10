@@ -14,7 +14,8 @@ use pg_storage::config::StorageConfig;
 use pg_storage::error::StorageError;
 use pg_storage::page_allocator::PageAllocator;
 use pg_storage::recovery::{
-    ActiveXactTable, DirtyPageTable, RedoContext, RedoHandler, RedoRegistry,
+    ActiveXactTable, DirtyPageTable, IncompleteSplitTracker, RedoContext, RedoHandler,
+    RedoRegistry,
 };
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::{WalRecord, WalRecordType};
@@ -28,6 +29,7 @@ struct CtxParts {
     clog: NoOpClogAccessor,
     att: ActiveXactTable,
     dpt: DirtyPageTable,
+    incomplete_splits: IncompleteSplitTracker,
 }
 
 impl CtxParts {
@@ -45,6 +47,7 @@ impl CtxParts {
             clog: NoOpClogAccessor,
             att: ActiveXactTable::new(),
             dpt: DirtyPageTable::new(),
+            incomplete_splits: IncompleteSplitTracker::new(),
         }
     }
 
@@ -55,6 +58,7 @@ impl CtxParts {
             clog: &self.clog,
             att: &mut self.att,
             dpt: &mut self.dpt,
+            incomplete_splits: &mut self.incomplete_splits,
         }
     }
 }

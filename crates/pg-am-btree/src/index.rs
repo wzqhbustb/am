@@ -169,8 +169,10 @@ use pg_am_heap::tuple::ColumnType;
 use pg_storage::buffer_pool::{BufferPool, PageGuard, PageGuardMut};
 use pg_storage::error::StorageError;
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
+use pg_storage::page_allocator::PageAllocator;
+use pg_storage::sync::Mutex;
 use pg_storage::types::{Lsn, Oid, PageId, Tid, PAGE_SIZE};
-use pg_storage::wal::record::WalRecord;
+use pg_storage::wal::record::{BTreeSplitCLRRecord, WalRecord};
 use pg_storage::wal::WalWriter;
 
 use crate::error::{BTreeError, Result};
@@ -2243,4 +2245,300 @@ pub(crate) fn log_page_init(
 fn stamp_pd_lsn(page: &mut [u8; PAGE_SIZE], lsn: Lsn) {
     let new_lsn = lsn.max(page_pd_lsn(page));
     set_page_pd_lsn(page, new_lsn);
+}
+
+/// The split an undo pass has to finish.
+pub(crate) struct SplitToFinish {
+    pub left_page: PageId,
+    pub right_page: PageId,
+    pub level: u8,
+    /// First slot of the left page that belongs to the right half.
+    pub copy_start_slot: u16,
+    /// LSN of the Prepare record, carried into the CLR for diagnostics.
+    pub prepare_lsn: Lsn,
+}
+
+/// Finish an incomplete B+Tree split during ARIES undo (Stage S, §11.3).
+///
+/// Called for each split that reached Prepare (and optionally Copy) but never
+/// Commit. Applies the copy, installs the downlink, clears `SPLIT_INCOMPLETE`,
+/// updates the meta page for root splits, and emits a `BTreeSplitCLR` so the
+/// result survives a crash during or after undo.
+pub(crate) fn finish_incomplete_split(
+    pool: &BufferPool,
+    wal_writer: &WalWriter,
+    page_allocator: &Mutex<PageAllocator>,
+    split: &SplitToFinish,
+) -> Result<()> {
+    let &SplitToFinish {
+        left_page: left_page_id,
+        right_page: right_page_id,
+        level,
+        copy_start_slot,
+        prepare_lsn,
+    } = split;
+    // Phase 1: gather everything the CLR payload needs without touching a
+    // single page byte. Logging before applying is what makes a crash inside
+    // undo recoverable: a half-applied split with no CLR in the WAL would be
+    // finished a second time by the next undo pass.
+    let (separator_key, is_root_split) = {
+        let left_guard = pool.pin(left_page_id)?;
+        let left: &[u8; PAGE_SIZE] = left_guard.page().try_into().expect("frame is PAGE_SIZE");
+        let is_root_split = BtreePage::flags(left)? & BTREE_FLAG_ROOT != 0;
+        // The copy may already have been redone, in which case the moved
+        // entries live on the right page and the left page ends exactly at
+        // `copy_start_slot`.
+        let bytes = if (SlottedPage::slot_count(left) as u16) > copy_start_slot {
+            entry_bytes(left, copy_start_slot)?.to_vec()
+        } else {
+            let right_guard = pool.pin(right_page_id)?;
+            let right: &[u8; PAGE_SIZE] =
+                right_guard.page().try_into().expect("frame is PAGE_SIZE");
+            if SlottedPage::slot_count(right) == 0 {
+                return Err(BTreeError::Corrupted(
+                    "incomplete split has no entries to move on either page".into(),
+                ));
+            }
+            entry_bytes(right, 0)?.to_vec()
+        };
+        let key = if level == 0 {
+            page::decode_leaf_entry(&bytes)?.0.to_vec()
+        } else {
+            page::decode_internal_entry(&bytes)?.0.to_vec()
+        };
+        (key, is_root_split)
+    };
+
+    let (parent_page, new_root_page, meta_page, parent_insert_slot) = if is_root_split {
+        // Reserve the new root page id; its content is written in phase 3.
+        // `new_page` logs its own PageAlloc, so recovery re-reserves the id.
+        let new_root_id = pool.new_page()?.page_id();
+        let mp = find_meta_page_for_root(pool, page_allocator, left_page_id)?;
+        (PageId::INVALID, new_root_id, mp, 1u16)
+    } else {
+        let parent = find_parent_page(pool, page_allocator, left_page_id, level)?;
+        let slot = {
+            let guard = pool.pin(parent)?;
+            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+            internal_lower_bound(page, &separator_key, right_page_id)? as u16
+        };
+        (parent, PageId::INVALID, PageId::INVALID, slot)
+    };
+
+    let rec = BTreeSplitCLRRecord {
+        left_page: left_page_id,
+        right_page: right_page_id,
+        level,
+        copy_start_slot,
+        redo_ref_lsn: prepare_lsn,
+        parent_page,
+        separator_key,
+        parent_insert_slot,
+        new_root_page,
+        meta_page,
+    };
+
+    // Phase 2: log. The explicit flush is required because
+    // `BufferPool::flush_frame` checks `synced_lsn` against the page's pd_lsn,
+    // and phase 3 stamps pages with this LSN.
+    let clr = WalRecord::btree_split_clr(&rec)?;
+    let lsn = wal_writer.append(clr)?;
+    wal_writer.flush()?;
+
+    // Phase 3: apply, using the exact code path redo will take.
+    apply_split_clr(pool, &rec, lsn)?;
+
+    // Phase 4: make the result durable. `apply_split_clr` already flushed the
+    // right page; the left page goes last so it is never durable ahead of the
+    // pages that hold the entries it gave away.
+    if new_root_page != PageId::INVALID {
+        pool.flush(new_root_page)?;
+    }
+    if parent_page != PageId::INVALID {
+        pool.flush(parent_page)?;
+    }
+    if meta_page != PageId::INVALID {
+        pool.flush(meta_page)?;
+    }
+    pool.flush(left_page_id)?;
+
+    Ok(())
+}
+
+/// Apply the page mutations of a `BTreeSplitCLR` at `lsn`.
+///
+/// Shared by the undo path (`finish_incomplete_split`) and the redo handler, so
+/// both converge on byte-identical pages by construction. Every page is guarded
+/// by its own `pd_lsn`, which makes repeated application a no-op.
+pub(crate) fn apply_split_clr(
+    pool: &BufferPool,
+    rec: &BTreeSplitCLRRecord,
+    lsn: Lsn,
+) -> Result<()> {
+    // 1. Move the entries and finish the left page. Both happen under one
+    //    pd_lsn stamp so the left page is never durable in a half-finished
+    //    state that a later replay would skip.
+    {
+        let mut left_guard = pool.pin_mut(rec.left_page)?;
+        let mut right_guard = pool.pin_mut(rec.right_page)?;
+        let left_lsn = page_pd_lsn(left_guard.page());
+        let right_lsn = page_pd_lsn(right_guard.page());
+        if left_lsn < lsn {
+            let left: &mut [u8; PAGE_SIZE] = as_page_mut(&mut left_guard);
+            let right: &mut [u8; PAGE_SIZE] = as_page_mut(&mut right_guard);
+            // `apply_split_copy` appends to the right page, so the move must be
+            // skipped once the right page already holds the moved entries —
+            // otherwise replay doubles them.
+            let move_to_right = right_lsn < lsn;
+            apply_split_copy(left, right, rec.copy_start_slot, move_to_right)?;
+            if move_to_right {
+                stamp_pd_lsn(right, lsn);
+            }
+            BtreePage::apply_commit_left(left)?;
+            stamp_pd_lsn(left, lsn);
+        } else if right_lsn < lsn {
+            // The left page is past the CLR (already truncated) while the right
+            // page never received the moved entries. Flush ordering makes this
+            // unreachable, so it means on-disk corruption: those entries are
+            // durable nowhere and cannot be recomputed.
+            return Err(BTreeError::Corrupted(format!(
+                "split CLR: left page {} is past the CLR (pd_lsn {:?} >= {:?}) but right page {}                  lacks the moved entries (pd_lsn {:?})",
+                rec.left_page, left_lsn, lsn, rec.right_page, right_lsn
+            )));
+        }
+    }
+    // The right page must reach disk before the left page: the left page has
+    // given its entries away, so a durable left with a stale right loses them.
+    pool.flush(rec.right_page)?;
+
+    // 2. Downlink: a root split creates a new root, a non-root split inserts
+    //    into the existing parent.
+    if rec.new_root_page != PageId::INVALID {
+        let mut guard = pool.pin_mut(rec.new_root_page)?;
+        let page: &mut [u8; PAGE_SIZE] = as_page_mut(&mut guard);
+        if page_pd_lsn(page) < lsn {
+            BtreePage::init(page, rec.level + 1, BTREE_FLAG_ROOT);
+            let e0 = page::encode_internal_entry(&[], rec.left_page);
+            SlottedPage::add_tuple(page, &e0).map_err(BTreeError::Heap)?;
+            let e1 = page::encode_internal_entry(&rec.separator_key, rec.right_page);
+            SlottedPage::add_tuple(page, &e1).map_err(BTreeError::Heap)?;
+            stamp_pd_lsn(page, lsn);
+        }
+    } else if rec.parent_page != PageId::INVALID {
+        let mut guard = pool.pin_mut(rec.parent_page)?;
+        let page: &mut [u8; PAGE_SIZE] = as_page_mut(&mut guard);
+        if page_pd_lsn(page) < lsn {
+            let entry = page::encode_internal_entry(&rec.separator_key, rec.right_page);
+            BtreePage::insert_entry_at(page, rec.parent_insert_slot, &entry)?;
+            stamp_pd_lsn(page, lsn);
+        }
+    }
+
+    // 3. Publish the new root through the meta page (root splits only).
+    if rec.meta_page != PageId::INVALID {
+        let mut guard = pool.pin_mut(rec.meta_page)?;
+        let page: &mut [u8; PAGE_SIZE] = as_page_mut(&mut guard);
+        if page_pd_lsn(page) < lsn {
+            let slot = SlottedPage::slot_count(page) as u16;
+            let meta_bytes = page::encode_meta_record(rec.new_root_page, (rec.level + 1) as u16);
+            BtreePage::insert_entry_at(page, slot, &meta_bytes)?;
+            stamp_pd_lsn(page, lsn);
+        }
+    }
+
+    Ok(())
+}
+
+/// Scan allocated pages for the meta page whose root record points at
+/// `root_page`. The meta page has `flags == 0` (no LEAF, no ROOT) and its
+/// last slot decodes as a `(root_page, tree_level)` meta record.
+fn find_meta_page_for_root(
+    pool: &BufferPool,
+    page_allocator: &Mutex<PageAllocator>,
+    root_page: PageId,
+) -> Result<PageId> {
+    let max_pid = page_allocator.lock().next_page_id().0;
+    for pid in 1..max_pid {
+        let page_id = PageId(pid);
+        let guard = match pool.pin(page_id) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        // Skip non-BTree pages and pages with any tree flags set.
+        let flags = match BtreePage::flags(page) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if flags != 0 {
+            continue;
+        }
+        let count = SlottedPage::slot_count(page);
+        if count == 0 {
+            continue;
+        }
+        if let Ok(bytes) = entry_bytes(page, (count - 1) as u16) {
+            if let Ok((rp, _)) = page::decode_meta_record(bytes) {
+                if rp == root_page {
+                    return Ok(page_id);
+                }
+            }
+        }
+    }
+    Err(BTreeError::Corrupted(format!(
+        "no meta page found for root {root_page}"
+    )))
+}
+
+/// Scan allocated pages for the parent of `child` at `level + 1`. The parent
+/// is an internal page whose downlink set includes `child`.
+fn find_parent_page(
+    pool: &BufferPool,
+    page_allocator: &Mutex<PageAllocator>,
+    child: PageId,
+    level: u8,
+) -> Result<PageId> {
+    let max_pid = page_allocator.lock().next_page_id().0;
+    let target_level = level + 1;
+    for pid in 1..max_pid {
+        let page_id = PageId(pid);
+        let guard = match pool.pin(page_id) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        // Skip pages that aren't internal pages at the target level.
+        let flags = match BtreePage::flags(page) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if flags & BTREE_FLAG_LEAF != 0 {
+            continue; // Leaf pages can't be parents.
+        }
+        let pl = match BtreePage::level(page) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if pl != target_level {
+            continue;
+        }
+        if internal_page_points_at(page, child)? {
+            return Ok(page_id);
+        }
+    }
+    Err(BTreeError::Corrupted(format!(
+        "no parent page found for child {child} at level {level}"
+    )))
+}
+
+/// Compute the split slot for a page whose Copy phase was never reached
+/// (only Prepare). Uses the midpoint heuristic (no pending entry).
+pub(crate) fn choose_split_slot_readonly(
+    pool: &BufferPool,
+    page_id: PageId,
+    level: u8,
+) -> Result<u16> {
+    let guard = pool.pin(page_id)?;
+    let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+    choose_split_slot(page, level, None)
 }

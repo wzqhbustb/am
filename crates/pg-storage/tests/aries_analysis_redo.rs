@@ -177,6 +177,7 @@ fn test_analysis_redo_from_100k_wal() {
         tmp.path(),
         &config,
         vec![heap_handler, noop_handler(WalRecordType::TxnCommit)],
+        Vec::new(),
     )
     .unwrap();
     let recover_elapsed = recover_start.elapsed();
@@ -222,6 +223,7 @@ fn test_analysis_redo_from_100k_wal() {
         tmp.path(),
         &config,
         vec![heap_handler2, noop_handler(WalRecordType::TxnCommit)],
+        Vec::new(),
         Arc::new(MapClog::default()),
     )
     .unwrap();
@@ -278,6 +280,7 @@ fn test_analysis_att_tracks_uncommitted_xids() {
             noop_handler(WalRecordType::TxnCommit),
             noop_handler(WalRecordType::TxnAbort),
         ],
+        Vec::new(),
         Arc::new(MapClog::default()),
     )
     .unwrap();
@@ -325,6 +328,7 @@ fn test_analysis_uses_att_snapshot_baseline() {
         tmp.path(),
         &config,
         vec![noop_handler(WalRecordType::TxnCommit)],
+        Vec::new(),
         Arc::new(MapClog::default()),
     )
     .unwrap();
@@ -389,6 +393,7 @@ fn test_recovered_att_is_filtered_through_rebuilt_clog() {
         tmp.path(),
         &config,
         vec![heap_handler, noop_handler(WalRecordType::TxnCommit)],
+        Vec::new(),
         clog,
     )
     .unwrap();
@@ -735,6 +740,7 @@ fn test_corrupted_snapshot_degrades_to_wal_scan() {
             noop_handler(WalRecordType::TxnCommit),
             noop_handler(WalRecordType::TxnAbort),
         ],
+        Vec::new(),
         Arc::new(MapClog::default()),
     )
     .unwrap();
@@ -785,6 +791,7 @@ fn test_noop_clog_yields_empty_att_even_with_inflight_txns() {
         tmp.path(),
         &config,
         vec![heap_handler, noop_handler(WalRecordType::TxnCommit)],
+        Vec::new(),
     )
     .unwrap();
 

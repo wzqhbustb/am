@@ -132,7 +132,8 @@ use crate::line_pointer::{LpFlags, LINE_POINTER_SIZE};
 use crate::redo::{HeapDeleteHandler, HeapInsertHandler, HeapUpdateHandler};
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 use crate::tuple::{
-    decode_tuple, TupleHeader, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
+    decode_tuple, TupleHeader, HEAP_HOT_UPDATED, HEAP_ONLY_TUPLE, HEAP_UPDATED,
+    HEAP_XMAX_IS_SHARE, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE,
 };
 
 /// Largest tuple that can ever fit on a heap page (page minus special space,
@@ -336,6 +337,24 @@ impl HeapAM {
         Ok(owned)
     }
 
+    /// Like [`stamp_xmin`], but additionally sets the `HEAP_ONLY_TUPLE` bit
+    /// in `t_infomask2`, marking the new tuple as a HOT chain member
+    /// reachable only via `t_ctid` (not via index entries).
+    fn stamp_hot_only(tuple: &[u8], xid: TxnId) -> Result<Vec<u8>> {
+        if tuple.len() < TUPLE_HEADER_SIZE {
+            return Err(HeapError::InvalidArgument(format!(
+                "tuple of {} bytes is shorter than the {}-byte header",
+                tuple.len(),
+                TUPLE_HEADER_SIZE
+            )));
+        }
+        let mut owned = tuple.to_vec();
+        owned[0..8].copy_from_slice(&xid.0.to_le_bytes());
+        let infomask2 = u16::from_le_bytes([owned[54], owned[55]]);
+        owned[54..56].copy_from_slice(&(infomask2 | HEAP_ONLY_TUPLE).to_le_bytes());
+        Ok(owned)
+    }
+
     /// Pin a page (initialized) that has room for `needed` bytes, excluding
     /// `exclude`, extending the chain with a fresh page if none of the
     /// relation's existing pages qualify. The returned guard is held for the
@@ -459,6 +478,33 @@ impl HeapAM {
         // transaction): leaving LOCK_ONLY set would mask the delete from
         // visibility checks and resurrect the row for scans.
         header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+        header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
+        Ok(())
+    }
+
+    /// HOT-update stamp on the OLD tuple: like [`stamp_deleted`] with
+    /// `updated=true`, but additionally sets `t_ctid` to the new version's
+    /// TID and `HEAP_HOT_UPDATED` in `t_infomask2`, forming the chain link
+    /// that `scan` follows when this old version is no longer visible.
+    fn stamp_hot_update(
+        page: &mut [u8; PAGE_SIZE],
+        tid: Tid,
+        xmax: TxnId,
+        curcid: u32,
+        new_tid: Tid,
+    ) -> Result<()> {
+        let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
+        if lp.flags() != LpFlags::Normal {
+            return Err(HeapError::TupleNotFound(tid));
+        }
+        let off = lp.off() as usize;
+        let mut header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
+        header.t_xmax = xmax;
+        header.t_cid = curcid;
+        header.t_infomask |= HEAP_UPDATED;
+        header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+        header.t_ctid = new_tid;
+        header.t_infomask2 |= HEAP_HOT_UPDATED;
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
         Ok(())
     }
@@ -661,13 +707,54 @@ impl HeapAM {
             match gate {
                 RowLockGate::Proceed => {
                     let page = as_page_mut(&mut guard);
-                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid)?;
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, false)?;
                     return Ok(());
                 }
                 RowLockGate::Wait(blocking) => {
                     // Step 5b: release the latch BEFORE sleeping (the edge
                     // is already registered, so no wakeup can be missed);
                     // 5c: block; the loop restarts at step 1.
+                    drop(guard);
+                    self.wait_row_lock(self_xid, blocking)?;
+                }
+            }
+        }
+    }
+
+    /// Stamp a shared row lock (FOR SHARE, Stage S multixact lite). Identical
+    /// to [`lock_tuple`](fn.lock_tuple.html) but sets [`HEAP_XMAX_IS_SHARE`]
+    /// alongside [`HEAP_XMAX_LOCK_ONLY`]. The row stays visible to all
+    /// snapshots — a shared lock is not a delete.
+    pub fn lock_tuple_shared(
+        &self,
+        tid: Tid,
+        snapshot: &Snapshot,
+        clog: &dyn ClogAccessor,
+    ) -> Result<()> {
+        let self_xid = snapshot.current_xid;
+        debug_assert!(
+            self_xid != TxnId::INVALID,
+            "lock_tuple_shared with INVALID current_xid would stamp a no-op lock"
+        );
+        let mut restarts = 0u32;
+        loop {
+            restarts += 1;
+            debug_assert!(
+                restarts < 10_000,
+                "lock_tuple_shared restart loop failed to converge (xid {self_xid})"
+            );
+            let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
+            let gate = {
+                let page = as_page_mut(&mut guard);
+                self.row_lock_gate(page, tid, self_xid, clog, true)?
+            };
+            match gate {
+                RowLockGate::Proceed => {
+                    let page = as_page_mut(&mut guard);
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, true)?;
+                    return Ok(());
+                }
+                RowLockGate::Wait(blocking) => {
                     drop(guard);
                     self.wait_row_lock(self_xid, blocking)?;
                 }
@@ -697,6 +784,7 @@ impl HeapAM {
         tid: Tid,
         locker: TxnId,
         curcid: u32,
+        shared: bool,
     ) -> Result<()> {
         let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
         if lp.flags() != LpFlags::Normal {
@@ -707,6 +795,9 @@ impl HeapAM {
         header.t_xmax = locker;
         header.t_cid = curcid;
         header.t_infomask |= HEAP_XMAX_LOCK_ONLY;
+        if shared {
+            header.t_infomask |= HEAP_XMAX_IS_SHARE;
+        }
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
         Ok(())
     }
@@ -797,9 +888,16 @@ impl AccessMethod for HeapAM {
                     continue;
                 };
                 let (header, values) = decode_tuple(bytes, ctx.rel.columns)?;
-                // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete:
-                // mask it off so a locked row stays visible (§9.1, M2c
-                // Stage P).
+                // Skip HOT chain members — only the chain root (not marked
+                // HEAP_ONLY_TUPLE) is directly scannable; chain members are
+                // reached via t_ctid when the root is invisible.
+                if header.t_infomask2 & HEAP_ONLY_TUPLE != 0 {
+                    continue;
+                }
+                let self_tid = Tid {
+                    page_id,
+                    slot_id: slot,
+                };
                 if is_visible(
                     header.t_xmin,
                     visibility_xmax(&header),
@@ -807,13 +905,44 @@ impl AccessMethod for HeapAM {
                     ctx.snapshot,
                     clog,
                 ) {
-                    out.push((
-                        Tid {
-                            page_id,
-                            slot_id: slot,
-                        },
-                        values,
-                    ));
+                    out.push((self_tid, values));
+                } else if header.t_infomask2 & HEAP_HOT_UPDATED != 0
+                    && header.t_ctid != self_tid
+                {
+                    // HOT chain: old version is invisible but t_ctid may
+                    // point to a newer version visible to this snapshot.
+                    // The whole walk reads the page pinned above: a HOT chain
+                    // never leaves its page, and re-pinning it here would be a
+                    // recursive read latch, which deadlocks as soon as a
+                    // writer queues between the two acquisitions.
+                    let mut chain_tid = header.t_ctid;
+                    for _ in 0..8 {
+                        if chain_tid.page_id != page_id {
+                            break;
+                        }
+                        let Some(chain_bytes) = SlottedPage::tuple(page, chain_tid.slot_id)? else {
+                            break;
+                        };
+                        let (chain_header, chain_values) =
+                            decode_tuple(chain_bytes, ctx.rel.columns)?;
+                        if is_visible(
+                            chain_header.t_xmin,
+                            visibility_xmax(&chain_header),
+                            chain_header.t_cid,
+                            ctx.snapshot,
+                            clog,
+                        ) {
+                            out.push((chain_tid, chain_values));
+                            break;
+                        }
+                        if chain_header.t_infomask2 & HEAP_HOT_UPDATED != 0
+                            && chain_header.t_ctid != chain_tid
+                        {
+                            chain_tid = chain_header.t_ctid;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -881,6 +1010,7 @@ impl UpdatableAM for HeapAM {
             new_tuple,
             out_tid,
             clog,
+            hot_eligible,
         } = ctx;
         Self::validate_tuple_len(new_tuple)?;
         let xmax = snapshot.current_xid;
@@ -929,12 +1059,36 @@ impl UpdatableAM for HeapAM {
                     page_id,
                     slot_id: new_slot,
                 };
-                let rec = WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
-                let lsn = self.wal_writer.append(rec)?;
-                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
-                let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
-                debug_assert_eq!(actual, new_slot);
-                stamp_pd_lsn(old_page, lsn);
+                if hot_eligible {
+                    let hot_tuple = Self::stamp_hot_only(&new_tuple, xmax)?;
+                    let rec = WalRecord::heap_hot_update(
+                        page_id,
+                        old_tid.slot_id,
+                        new_slot,
+                        hot_tuple.clone(),
+                        xmax,
+                        xmax,
+                    )?;
+                    let lsn = self.wal_writer.append(rec)?;
+                    Self::stamp_hot_update(
+                        old_page,
+                        old_tid,
+                        xmax,
+                        snapshot.curcid,
+                        new_tid,
+                    )?;
+                    let actual = SlottedPage::add_tuple(old_page, &hot_tuple)?;
+                    debug_assert_eq!(actual, new_slot);
+                    stamp_pd_lsn(old_page, lsn);
+                } else {
+                    let rec =
+                        WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
+                    let lsn = self.wal_writer.append(rec)?;
+                    Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                    let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
+                    debug_assert_eq!(actual, new_slot);
+                    stamp_pd_lsn(old_page, lsn);
+                }
                 if let Some(out) = out_tid {
                     *out = new_tid;
                 }

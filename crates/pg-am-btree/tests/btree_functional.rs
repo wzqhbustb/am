@@ -256,6 +256,7 @@ fn reopen_recovers_root_from_meta_page() {
         tmp.path(),
         &config,
         pg_am_btree::btree_redo_handlers(),
+        Vec::new(),
     )
     .unwrap();
     let am = BTreeAM::new(
@@ -306,6 +307,7 @@ fn second_split_of_incomplete_page_is_rejected() {
         tmp.path(),
         &config,
         pg_am_btree::btree_redo_handlers(),
+        Vec::new(),
     )
     .unwrap();
     let am = BTreeAM::new(

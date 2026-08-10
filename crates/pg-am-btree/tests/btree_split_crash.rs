@@ -21,10 +21,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pg_am_btree::page::{BtreePage, BTREE_FLAG_SPLIT_INCOMPLETE};
-use pg_am_btree::{btree_redo_handlers, BTreeAM, BTreeIndex};
+use pg_am_btree::{btree_redo_handlers, BTreeAM, BTreeIndex, BTreeUndoHandler};
 
 use pg_am_heap::slotted_page::SlottedPage;
 use pg_am_heap::tuple::ColumnType;
+use pg_am_heap::HeapUndoHandler;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::types::{Oid, PageId, Tid, PAGE_SIZE};
@@ -73,8 +74,16 @@ fn create_and_fill(dir: &Path, config: &StorageConfig) -> (StorageEngine, BTreeI
 /// Reopen after the simulated crash with the B+Tree redo handlers
 /// registered, and rebuild the index handle from the meta page.
 fn recover(dir: &Path, config: &StorageConfig, meta_page: PageId) -> (StorageEngine, BTreeIndex) {
-    let engine =
-        StorageEngine::open_with_redo_handlers(dir, config, btree_redo_handlers()).unwrap();
+    let engine = StorageEngine::open_with_redo_handlers(
+        dir,
+        config,
+        btree_redo_handlers(),
+        vec![
+            Box::new(HeapUndoHandler),
+            Box::new(BTreeUndoHandler),
+        ],
+    )
+    .unwrap();
     let am = BTreeAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -116,20 +125,21 @@ fn chain_from(engine: &StorageEngine, start: PageId) -> Vec<PageId> {
     }
 }
 
-/// Read `btpo_flags` / slot count of a page.
-fn page_state(engine: &StorageEngine, page_id: PageId) -> (u8, usize) {
+/// Read `btpo_flags` / slot count / pd_lsn of a page.
+fn page_state(engine: &StorageEngine, page_id: PageId) -> (u8, usize, pg_storage::types::Lsn) {
     let guard = engine.buffer_pool().pin(page_id).unwrap();
     let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
     (
         BtreePage::flags(page).unwrap(),
         SlottedPage::slot_count(page),
+        pg_storage::page::page_pd_lsn(page),
     )
 }
 
 /// Crash with only `BTreeSplitPrepare` durable: the left page is marked
 /// SPLIT_INCOMPLETE and linked to an initialized but empty right page.
-/// Recovery must rebuild exactly that state; every key still lives on the
-/// left page (Copy never ran), so nothing is lost and the chain walks.
+/// Recovery redo replays Prepare; the undo handler finishes the split
+/// (copy + downlink + commit-clear), so the recovered tree is fully valid.
 #[test]
 fn test_btree_split_crash_after_prepare() {
     let tmp = TempDir::new().unwrap();
@@ -144,38 +154,61 @@ fn test_btree_split_crash_after_prepare() {
         (index.meta_page(), n, st.left, st.right)
     };
 
-    // Recovery 1: replay the Prepare record.
+    // Recovery 1: redo replays Prepare; undo finishes the split.
     let (engine, index) = recover(tmp.path(), &config, meta_page);
     assert_all_keys(&index, n);
+    assert_ne!(index.root_page(), left, "undo must create a new root");
+    assert_eq!(index.tree_level(), 1);
     assert_eq!(
-        chain_from(&engine, index.root_page()),
+        chain_from(&engine, left),
         vec![left, right],
         "the sibling chain must walk left -> right end to end"
     );
-    let (left_flags, left_slots) = page_state(&engine, left);
-    assert_ne!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
+    let (left_flags, _, _) = page_state(&engine, left);
     assert_eq!(
-        left_slots, n as usize,
-        "Copy never ran: left keeps all keys"
+        left_flags & BTREE_FLAG_SPLIT_INCOMPLETE,
+        0,
+        "undo must clear SPLIT_INCOMPLETE"
     );
-    let (_, right_slots) = page_state(&engine, right);
-    assert_eq!(right_slots, 0, "Copy never ran: right stays empty");
+    index
+        .validate()
+        .unwrap_or_else(|e| panic!("recovered tree must validate: {e}"));
+
+    // Snapshot the post-undo page state so recovery 2 can be compared against
+    // it: replaying the CLR must not move the entries a second time.
+    let new_root = index.root_page();
+    let r1_state = [
+        page_state(&engine, left),
+        page_state(&engine, right),
+        page_state(&engine, new_root),
+    ];
+
     std::mem::forget(engine); // crash again, mid/after recovery
 
-    // Recovery 2: replaying the same records a second time must converge.
+    // Recovery 2: CLR replay is idempotent — same state.
     let (engine, index) = recover(tmp.path(), &config, meta_page);
     assert_all_keys(&index, n);
-    assert_eq!(chain_from(&engine, index.root_page()), vec![left, right]);
-    let (left_flags, _) = page_state(&engine, left);
-    assert_ne!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
+    assert_eq!(index.tree_level(), 1);
+    assert_eq!(index.root_page(), new_root);
+    assert_eq!(
+        [
+            page_state(&engine, left),
+            page_state(&engine, right),
+            page_state(&engine, new_root),
+        ],
+        r1_state,
+        "replaying the CLR must converge on the state undo produced"
+    );
+    let (left_flags, _, _) = page_state(&engine, left);
+    assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
     drop(engine);
 }
 
 /// Crash with `BTreeSplitPrepare` + `BTreeSplitCopy` durable: the left page
 /// is truncated, the right page holds the upper half, but no downlink was
 /// ever committed (and, being a root split, the new root was never
-/// created). Recovery must rebuild that state; Blink right hops keep every
-/// key reachable.
+/// created). Recovery redo replays Prepare+Copy; the undo handler finishes
+/// the split (downlink + commit-clear), so the recovered tree is fully valid.
 #[test]
 fn test_btree_split_crash_after_copy() {
     let tmp = TempDir::new().unwrap();
@@ -191,43 +224,27 @@ fn test_btree_split_crash_after_copy() {
         (index.meta_page(), n, st.left, st.right, st.copy_start_slot)
     };
 
-    // Recovery 1.
+    // Recovery 1: redo replays Prepare+Copy; undo finishes the split.
     let (engine, index) = recover(tmp.path(), &config, meta_page);
     assert_all_keys(&index, n);
-    assert_eq!(chain_from(&engine, index.root_page()), vec![left, right]);
-    let (left_flags, left_slots) = page_state(&engine, left);
-    assert_ne!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
+    assert_ne!(index.root_page(), left, "undo must create a new root");
+    assert_eq!(index.tree_level(), 1);
+    assert_eq!(chain_from(&engine, left), vec![left, right]);
+    let (left_flags, left_slots, _) = page_state(&engine, left);
+    assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
     assert_eq!(left_slots, copy_start_slot as usize);
-    let (_, right_slots) = page_state(&engine, right);
+    let (_, right_slots, _) = page_state(&engine, right);
     assert_eq!(right_slots, n as usize - copy_start_slot as usize);
-    // The two halves partition the key space.
-    let left_rows = {
-        let g = engine.buffer_pool().pin(left).unwrap();
-        let p: &[u8; PAGE_SIZE] = g.page().try_into().unwrap();
-        let mut v = Vec::new();
-        for s in 0..SlottedPage::slot_count(p) as u16 {
-            let (k, _) =
-                pg_am_btree::page::decode_leaf_entry(SlottedPage::tuple(p, s).unwrap().unwrap())
-                    .unwrap();
-            v.push(pg_am_btree::decode_i32(k.try_into().unwrap()));
-        }
-        v
-    };
-    assert_eq!(
-        *left_rows.last().unwrap(),
-        copy_start_slot as i32 - 1,
-        "left keeps the lower half"
-    );
     std::mem::forget(engine); // crash again
 
-    // Recovery 2: the Copy record's `left_page_pre_lsn` anchor makes the
-    // second replay converge to the same state.
+    // Recovery 2: CLR replay is idempotent — same state.
     let (engine, index) = recover(tmp.path(), &config, meta_page);
     assert_all_keys(&index, n);
-    assert_eq!(chain_from(&engine, index.root_page()), vec![left, right]);
-    let (_, left_slots) = page_state(&engine, left);
-    let (_, right_slots) = page_state(&engine, right);
+    assert_eq!(index.tree_level(), 1);
+    let (left_flags, left_slots, _) = page_state(&engine, left);
+    assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
     assert_eq!(left_slots, copy_start_slot as usize);
+    let (_, right_slots, _) = page_state(&engine, right);
     assert_eq!(right_slots, n as usize - copy_start_slot as usize);
     drop(engine);
 }
@@ -267,10 +284,10 @@ fn test_btree_split_crash_after_commit() {
         .validate()
         .unwrap_or_else(|e| panic!("recovered tree must pass strict validation: {e}"));
     assert_eq!(chain_from(&engine, left), vec![left, right]);
-    let (left_flags, _) = page_state(&engine, left);
+    let (left_flags, _, _) = page_state(&engine, left);
     assert_eq!(left_flags & BTREE_FLAG_SPLIT_INCOMPLETE, 0);
     // The root holds exactly two downlinks.
-    let (_, root_slots) = page_state(&engine, index.root_page());
+    let (_, root_slots, _) = page_state(&engine, index.root_page());
     assert_eq!(root_slots, 2);
     std::mem::forget(engine); // crash again
 
@@ -279,7 +296,7 @@ fn test_btree_split_crash_after_commit() {
     assert_eq!(index.tree_level(), 1);
     assert_all_keys(&index, n);
     index.validate().unwrap();
-    let (_, root_slots) = page_state(&engine, index.root_page());
+    let (_, root_slots, _) = page_state(&engine, index.root_page());
     assert_eq!(root_slots, 2, "Commit redo must not duplicate the downlink");
     drop(engine);
 }

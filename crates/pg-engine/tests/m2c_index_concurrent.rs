@@ -207,18 +207,17 @@ fn indexed_table_concurrent_dml_aborts_and_checkpoints() {
             "delete-aborted row {id} lost its index entry"
         );
     }
-    // Index scan (via the AM surface) agrees with the heap row count.
+    // Index scan (via the AM surface) agrees with the heap row count. Under
+    // HOT an entry points at the chain ROOT, whose own version is invisible
+    // once it has been updated, so entry TIDs are not compared against the
+    // visible TIDs directly — the per-row `index_lookup` loop above already
+    // checks that each entry resolves to its visible version. What must hold
+    // here is the count: one live entry per visible row, no leaks.
     let index_rows = engine.btree_index("t", "id").unwrap();
     let all_entries = index_rows.range_scan(None, None).unwrap();
     let heap_tids: HashSet<pg_engine::Tid> = rows.iter().map(|(t, _)| *t).collect();
-    let mut indexed_visible = 0usize;
-    for (_k, t) in &all_entries {
-        if heap_tids.contains(t) {
-            indexed_visible += 1;
-        }
-    }
     assert_eq!(
-        indexed_visible,
+        all_entries.len(),
         heap_tids.len(),
         "index and heap disagree on the visible row set"
     );

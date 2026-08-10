@@ -10,7 +10,8 @@
 //! - FOR UPDATE blocks a concurrent writer until the locker's commit, and
 //!   the locked row stays visible to plain readers (LOCK_ONLY is a lock,
 //!   not a delete);
-//! - FOR SHARE parses but is `Unsupported` (multixact deferred);
+//! - FOR SHARE stamps a shared row lock (Stage S multixact lite) and the
+//!   locked row stays visible to all readers;
 //! - a concurrent UPDATE of the same row WAITS (does not error) on an
 //!   in-progress stamper and proceeds after its abort;
 //! - `TupleConcurrentlyUpdated` surfaces as the SQL-level error when the
@@ -257,29 +258,47 @@ fn for_update_blocks_writer_until_commit() {
     engine.shutdown();
 }
 
-/// `FOR SHARE` parses but execution is rejected: shared row locks need
-/// multixact, deferred to a later stage (tech-selection §9.1 placeholder).
+/// `FOR SHARE` (Stage S multixact lite) stamps a shared row lock
+/// (`HEAP_XMAX_LOCK_ONLY` + `HEAP_XMAX_IS_SHARE`) and the locked row stays
+/// visible to all readers (a shared lock is not a delete).
 #[test]
-fn for_share_is_unsupported() {
+fn for_share_locks_row_and_stays_visible() {
     let (_tmp, engine) = open_with_counter();
 
-    let err = engine
-        .exec(None, "SELECT * FROM counter FOR SHARE")
-        .unwrap_err();
-    assert!(
-        matches!(err, EngineError::Unsupported(_)),
-        "auto-commit FOR SHARE must be Unsupported, got {err:?}"
-    );
+    // Auto-commit FOR SHARE: stamps shared lock, commits immediately.
+    let res = engine.exec(None, "SELECT * FROM counter FOR SHARE").unwrap();
+    let QueryResult::Rows { rows, .. } = res else {
+        panic!("auto-commit FOR SHARE must return rows, got {res:?}");
+    };
+    assert_eq!(rows.len(), 1);
 
+    // Row is still visible to a plain reader after the auto-commit lock
+    // is released.
+    let res = engine.exec(None, "SELECT * FROM counter").unwrap();
+    let QueryResult::Rows { rows, .. } = res else {
+        panic!("SELECT after FOR SHARE must return rows, got {res:?}");
+    };
+    assert_eq!(rows.len(), 1);
+
+    // In-txn FOR SHARE: lock persists until commit.
     let txn = engine.begin_txn().unwrap();
-    let err = engine
+    let res = engine
         .exec(Some(&txn), "SELECT * FROM counter FOR SHARE")
-        .unwrap_err();
-    assert!(
-        matches!(err, EngineError::Unsupported(_)),
-        "in-txn FOR SHARE must be Unsupported, got {err:?}"
-    );
-    txn.abort().unwrap();
+        .unwrap();
+    let QueryResult::Rows { rows, .. } = res else {
+        panic!("in-txn FOR SHARE must return rows, got {res:?}");
+    };
+    assert_eq!(rows.len(), 1);
+
+    // A concurrent auto-commit reader still sees the row — the shared
+    // lock does not hide it (LOCK_ONLY masks xmax to INVALID).
+    let res = engine.exec(None, "SELECT * FROM counter").unwrap();
+    let QueryResult::Rows { rows, .. } = res else {
+        panic!("concurrent reader must see FOR SHARE locked row, got {res:?}");
+    };
+    assert_eq!(rows.len(), 1);
+
+    txn.commit().unwrap();
     engine.shutdown();
 }
 

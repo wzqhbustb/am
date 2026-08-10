@@ -53,13 +53,13 @@ use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::recovery::{RedoContext, RedoHandler};
 use pg_storage::types::{Lsn, PAGE_SIZE};
 use pg_storage::wal::record::{
-    BTreeDeleteRecord, BTreeInsertRecord, BTreeSplitCommitRecord, BTreeSplitCopyRecord,
-    BTreeSplitPrepareRecord, WalRecord,
+    BTreeDeleteRecord, BTreeInsertRecord, BTreeSplitCLRRecord, BTreeSplitCommitRecord,
+    BTreeSplitCopyRecord, BTreeSplitPrepareRecord, WalRecord,
 };
 use pg_storage::wal::WalRecordType;
 
 use crate::error::BTreeError;
-use crate::index::apply_split_copy;
+use crate::index::{apply_split_clr, apply_split_copy};
 use crate::page::{self, BtreePage};
 
 /// The B+Tree redo handlers, ready for injection into the recovery registry
@@ -71,6 +71,7 @@ pub fn btree_redo_handlers() -> Vec<Box<dyn RedoHandler>> {
         Box::new(BTreeSplitPrepareHandler),
         Box::new(BTreeSplitCopyHandler),
         Box::new(BTreeSplitCommitHandler),
+        Box::new(BTreeSplitClrRedoHandler),
     ]
 }
 
@@ -136,13 +137,16 @@ impl RedoHandler for BTreeSplitPrepareHandler {
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
         let rec = BTreeSplitPrepareRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
+        ctx.incomplete_splits
+            .mark_prepare(rec.left_page, rec.new_right_page, rec.level, rec.left_old_next);
 
         // Right page: full re-initialization (see the module docs).
         {
             let mut guard = pool.pin_mut(rec.new_right_page)?;
             let page: &mut [u8; PAGE_SIZE] =
                 guard.page_mut().try_into().expect("frame is PAGE_SIZE");
-            if page_pd_lsn(page) < record.lsn {
+            let rpd = page_pd_lsn(page);
+            if rpd < record.lsn {
                 BtreePage::init_right_page(page, rec.left_page, rec.left_old_next, rec.level);
                 stamp_pd_lsn(page, record.lsn);
             }
@@ -202,6 +206,8 @@ impl RedoHandler for BTreeSplitCopyHandler {
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
         let rec = BTreeSplitCopyRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
+        ctx.incomplete_splits
+            .mark_copy(rec.left_page, rec.copy_start_slot);
 
         let mut left_guard = pool.pin_mut(rec.left_page)?;
         let left_lsn = page_pd_lsn(left_guard.page());
@@ -324,6 +330,7 @@ impl RedoHandler for BTreeSplitCommitHandler {
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
         let rec = BTreeSplitCommitRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
+        ctx.incomplete_splits.clear(rec.left_page);
 
         // Parent: insert the downlink `(separator_key, right_page)`.
         {
@@ -368,6 +375,28 @@ impl RedoHandler for BTreeSplitCommitHandler {
     }
 }
 
+/// Redo handler for `BTreeSplitCLR` (Stage S, §11.3): replays a compensation
+/// log record emitted during undo to finish an incomplete B+Tree split. The
+/// CLR combines the Copy, downlink insertion, and Commit-clear into one
+/// record. It shares `apply_split_clr` with the undo path, so redo converges on
+/// the same pages the undo pass produced.
+pub struct BTreeSplitClrRedoHandler;
+
+impl RedoHandler for BTreeSplitClrRedoHandler {
+    fn kind(&self) -> WalRecordType {
+        WalRecordType::BTreeSplitCLR
+    }
+
+    fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        let rec = BTreeSplitCLRRecord::decode(&record.payload)?;
+        let pool = require_pool(ctx)?;
+        // A CLR means the split is finished — clear it from the tracker so
+        // the undo handler does not re-finish it.
+        ctx.incomplete_splits.clear(rec.left_page);
+        apply_split_clr(pool, &rec, record.lsn).map_err(btree_to_storage)
+    }
+}
+
 /// Recovery always opens the buffer pool before replay (Stage I reorder), so
 /// a missing pool is a programming error rather than a recoverable
 /// condition.
@@ -404,7 +433,7 @@ mod tests {
     use pg_storage::config::StorageConfig;
     use pg_storage::engine::StorageEngine;
     use pg_storage::page::set_page_pd_lsn;
-    use pg_storage::recovery::{ActiveXactTable, DirtyPageTable};
+    use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, IncompleteSplitTracker};
     use pg_storage::types::{PageId, Tid, TxnId};
 
     use crate::page::{encode_leaf_entry, BTREE_FLAG_LEAF};
@@ -432,6 +461,7 @@ mod tests {
         clog: NoOpClogAccessor,
         att: ActiveXactTable,
         dpt: DirtyPageTable,
+        incomplete_splits: IncompleteSplitTracker,
     }
 
     impl Harness {
@@ -445,6 +475,7 @@ mod tests {
                 clog: NoOpClogAccessor,
                 att: ActiveXactTable::new(),
                 dpt: DirtyPageTable::new(),
+                incomplete_splits: IncompleteSplitTracker::new(),
             }
         }
 
@@ -459,6 +490,7 @@ mod tests {
                 clog: &self.clog,
                 att: &mut self.att,
                 dpt: &mut self.dpt,
+                incomplete_splits: &mut self.incomplete_splits,
             }
         }
     }

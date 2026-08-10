@@ -126,13 +126,13 @@ use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 
-use pg_am_btree::{btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM};
+use pg_am_btree::{btree_redo_handlers, encode_key, is_supported_key_type, BTreeAM, BTreeUndoHandler};
 use pg_am_heap::access_method::{
     DeleteContext, InsertContext, RelationDesc, ScanContext, UpdateContext,
 };
 use pg_am_heap::line_pointer::LINE_POINTER_SIZE;
 use pg_am_heap::tuple::{decode_tuple, encode_tuple, ColumnType, Datum, TupleHeader};
-use pg_am_heap::{heap_redo_handlers, AccessMethod, HeapAM, SlottedPage, UpdatableAM};
+use pg_am_heap::{heap_redo_handlers, AccessMethod, HeapAM, HeapUndoHandler, SlottedPage, UpdatableAM};
 use pg_catalog::builtin_types::{builtin_type, BUILTIN_TYPES};
 use pg_catalog::system_tables::{
     SystemTableDef, BTREE_AM_OID, HEAP_AM_OID, PG_ATTRIBUTE, PG_CLASS, PG_INDEX, PG_RELPAGES,
@@ -143,7 +143,7 @@ use pg_storage::buffer_pool::BufferPool;
 use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
-use pg_storage::recovery::AttProvider;
+use pg_storage::recovery::{AttProvider, UndoHandler};
 use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::WalWriter;
 use pg_txn::{
@@ -625,10 +625,13 @@ impl Engine {
         let mut redo_handlers = heap_redo_handlers();
         redo_handlers.extend(txn_redo_handlers());
         redo_handlers.extend(btree_redo_handlers());
+        let undo_handlers: Vec<Box<dyn UndoHandler>> =
+            vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)];
         let storage = StorageEngine::open_with_redo_and_clog(
             data_dir,
             &config.storage,
             redo_handlers,
+            undo_handlers,
             Arc::clone(&clog) as Arc<dyn ClogAccessor>,
         )?;
         // 3. Checkpoint-time CLOG flush hook (§6.4, v2.3-21). The engine
@@ -1081,6 +1084,7 @@ impl Engine {
             new_tuple: &new_tuple,
             out_tid: None,
             clog: self.clog.as_ref(),
+            hot_eligible: false,
         })?;
 
         // 2. Free the data pages along the chain.
@@ -1370,8 +1374,8 @@ impl Engine {
         let index = self.btree_index(table, column)?;
         let key_bytes = encode_key(key)?;
         for tid in index.lookup_all(&key_bytes)? {
-            if self.heap_tuple_visible(&snap, tid)? {
-                return Ok(Some(tid));
+            if let Some(visible_tid) = self.heap_tuple_visible(&snap, tid)? {
+                return Ok(Some(visible_tid));
             }
         }
         Ok(None)
@@ -1386,11 +1390,11 @@ impl Engine {
     /// queried key. That is safe because heap slots are append-only
     /// (HeapAM never reclaims slots), so a TID can never come to hold an
     /// unrelated row; revisit if vacuum/slot reuse ever lands.
-    fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<bool> {
+    fn heap_tuple_visible(&self, snap: &Snapshot, tid: Tid) -> Result<Option<Tid>> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
         let Some(bytes) = SlottedPage::tuple(page, tid.slot_id)? else {
-            return Ok(false);
+            return Ok(None);
         };
         let header = TupleHeader::read_from(&bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE])?;
         // A HEAP_XMAX_LOCK_ONLY stamp is a row lock, not a delete: mask it
@@ -1400,13 +1404,116 @@ impl Engine {
         } else {
             header.t_xmax
         };
-        Ok(is_visible(
+        if is_visible(
             header.t_xmin,
             xmax,
             header.t_cid,
             snap,
             self.clog.as_ref(),
-        ))
+        ) {
+            return Ok(Some(tid));
+        }
+        // HOT chain: old version is invisible but t_ctid may point to a
+        // newer version visible to this snapshot (Stage S). The walk reads the
+        // page pinned above: a HOT chain never leaves its page, and re-pinning
+        // it here would be a recursive read latch, which deadlocks as soon as
+        // a writer queues between the two acquisitions.
+        if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
+            && header.t_ctid != tid
+        {
+            let mut chain_tid = header.t_ctid;
+            for _ in 0..8 {
+                if chain_tid.page_id != tid.page_id {
+                    return Ok(None);
+                }
+                let Some(chain_bytes) = SlottedPage::tuple(page, chain_tid.slot_id)? else {
+                    return Ok(None);
+                };
+                let chain_header = TupleHeader::read_from(
+                    &chain_bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE],
+                )?;
+                let chain_xmax =
+                    if chain_header.t_infomask & pg_am_heap::tuple::HEAP_XMAX_LOCK_ONLY != 0 {
+                        TxnId::INVALID
+                    } else {
+                        chain_header.t_xmax
+                    };
+                if is_visible(
+                    chain_header.t_xmin,
+                    chain_xmax,
+                    chain_header.t_cid,
+                    snap,
+                    self.clog.as_ref(),
+                ) {
+                    return Ok(Some(chain_tid));
+                }
+                if chain_header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
+                    && chain_header.t_ctid != chain_tid
+                {
+                    chain_tid = chain_header.t_ctid;
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The TID that owns `tid`'s index entries.
+    ///
+    /// A `HEAP_ONLY_TUPLE` version was created without index entries of its
+    /// own — that is the whole point of HOT — so index maintenance for such a
+    /// version must act on its chain root instead. HOT chains never leave
+    /// their page, so the root is found by walking the page's line pointers
+    /// backwards to the first version that is not `HEAP_ONLY_TUPLE`. Every
+    /// version in a HOT chain shares the same indexed columns, so the root's
+    /// entry carries exactly the key the caller read back from `tid`.
+    fn hot_chain_root(&self, tid: Tid) -> Result<Tid> {
+        let guard = self.storage.buffer_pool().pin(tid.page_id)?;
+        let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
+        let slot_count = SlottedPage::slot_count(page) as u16;
+        let header_of = |slot: u16| -> Result<Option<TupleHeader>> {
+            let Some(bytes) = SlottedPage::tuple(page, slot)? else {
+                return Ok(None);
+            };
+            Ok(Some(TupleHeader::read_from(
+                &bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE],
+            )?))
+        };
+
+        let mut cur = tid;
+        // Bounded by the chain length, which cannot exceed the page's slots.
+        for _ in 0..slot_count {
+            let Some(header) = header_of(cur.slot_id)? else {
+                return Ok(cur);
+            };
+            if header.t_infomask2 & pg_am_heap::tuple::HEAP_ONLY_TUPLE == 0 {
+                return Ok(cur);
+            }
+            let mut predecessor = None;
+            for slot in 0..slot_count {
+                if slot == cur.slot_id {
+                    continue;
+                }
+                let Some(candidate) = header_of(slot)? else {
+                    continue;
+                };
+                if candidate.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
+                    && candidate.t_ctid == cur
+                {
+                    predecessor = Some(Tid {
+                        page_id: cur.page_id,
+                        slot_id: slot,
+                    });
+                    break;
+                }
+            }
+            match predecessor {
+                Some(prev) => cur = prev,
+                None => return Ok(cur),
+            }
+        }
+        Ok(cur)
     }
 
     /// Open the B+Tree handle for the index on `table(column)` (testing /
@@ -1547,6 +1654,10 @@ impl Engine {
         } else {
             self.read_row_by_tid(&entry, &col_types, tid)?
         };
+        let hot_eligible = !indexes.is_empty()
+            && indexes
+                .iter()
+                .all(|(_, col_idx)| old_values.get(*col_idx) == values.get(*col_idx));
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
             slot_id: 0,
@@ -1558,18 +1669,39 @@ impl Engine {
             new_tuple: &tuple,
             out_tid: Some(&mut out_tid),
             clog: self.clog.as_ref(),
+            hot_eligible,
         })?;
-        for (idx, col_index) in &indexes {
-            let mut index = self.open_btree(idx)?;
-            if let Some(old_datum) = &old_values[*col_index] {
-                let key = encode_key(old_datum)?;
-                index.delete(&key, tid)?;
-                self.record_index_undo(snap.current_xid, idx, key, tid, IndexUndoOp::Deleted);
-            }
-            if let Some(new_datum) = &values[*col_index] {
-                let key = encode_key(new_datum)?;
-                index.insert(&key, out_tid)?;
-                self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+        // Skip index maintenance when HOT was actually applied (same-page
+        // update with unchanged key columns): the old index entry still
+        // points to the chain root, and scan follows t_ctid to the new
+        // version. Cross-page fallback reverts to the non-HOT path.
+        let hot_applied = hot_eligible && out_tid.page_id == tid.page_id;
+        if !hot_applied {
+            // The entry to remove belongs to the chain root: `tid` itself may
+            // be a HOT descendant, which never got an entry of its own.
+            let index_tid = if indexes.is_empty() {
+                tid
+            } else {
+                self.hot_chain_root(tid)?
+            };
+            for (idx, col_index) in &indexes {
+                let mut index = self.open_btree(idx)?;
+                if let Some(old_datum) = &old_values[*col_index] {
+                    let key = encode_key(old_datum)?;
+                    index.delete(&key, index_tid)?;
+                    self.record_index_undo(
+                        snap.current_xid,
+                        idx,
+                        key,
+                        index_tid,
+                        IndexUndoOp::Deleted,
+                    );
+                }
+                if let Some(new_datum) = &values[*col_index] {
+                    let key = encode_key(new_datum)?;
+                    index.insert(&key, out_tid)?;
+                    self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+                }
             }
         }
         Ok(out_tid)
@@ -1600,6 +1732,13 @@ impl Engine {
         } else {
             self.read_row_by_tid(&entry, &col_types, tid)?
         };
+        // The entry to remove belongs to the chain root: `tid` itself may be a
+        // HOT descendant, which never got an entry of its own.
+        let index_tid = if indexes.is_empty() {
+            tid
+        } else {
+            self.hot_chain_root(tid)?
+        };
         self.heap.delete(DeleteContext {
             rel: relation_desc(&entry, &col_types),
             snapshot: snap,
@@ -1609,8 +1748,14 @@ impl Engine {
         for (idx, col_index) in &indexes {
             if let Some(old_datum) = &old_values[*col_index] {
                 let key = encode_key(old_datum)?;
-                self.open_btree(idx)?.delete(&key, tid)?;
-                self.record_index_undo(snap.current_xid, idx, key, tid, IndexUndoOp::Deleted);
+                self.open_btree(idx)?.delete(&key, index_tid)?;
+                self.record_index_undo(
+                    snap.current_xid,
+                    idx,
+                    key,
+                    index_tid,
+                    IndexUndoOp::Deleted,
+                );
             }
         }
         Ok(())
@@ -1802,7 +1947,7 @@ impl Engine {
                     None => {
                         let mut snap = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false)
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
                     }
                     // FOR UPDATE (M2c Stage P) needs a real transaction:
                     // the row locks are stamped with its XID and the table
@@ -1812,12 +1957,15 @@ impl Engine {
                     // statement).
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
                         self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
-                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true)
+                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, false)
                     }),
-                    Some(LockClause::ForShare) => Err(EngineError::Unsupported(
-                        "SELECT ... FOR SHARE: shared row locks need multixact (deferred to a later stage, tech-selection §9.1)"
-                            .to_string(),
-                    )),
+                    // FOR SHARE (Stage S multixact lite): stamps a shared
+                    // row lock (HEAP_XMAX_LOCK_ONLY + HEAP_XMAX_IS_SHARE).
+                    // The row stays visible to all snapshots.
+                    Some(LockClause::ForShare) => self.auto_commit(|snap| {
+                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, true)
+                    }),
                 }
             }
             Statement::Update {
@@ -1910,16 +2058,16 @@ impl Engine {
                 match lock {
                     None => {
                         self.lock_table_entry(handle.xid(), &table, LockMode::AccessShare)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false)
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
                     }
                     Some(LockClause::ForUpdate) => {
                         self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
-                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true)
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, false)
                     }
-                    Some(LockClause::ForShare) => Err(EngineError::Unsupported(
-                        "SELECT ... FOR SHARE: shared row locks need multixact (deferred to a later stage, tech-selection §9.1)"
-                            .to_string(),
-                    )),
+                    Some(LockClause::ForShare) => {
+                        self.lock_table_entry(handle.xid(), &table, LockMode::RowExclusive)?;
+                        self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, true, true)
+                    }
                 }
             }
             Statement::Update {
@@ -1980,6 +2128,7 @@ impl Engine {
         order_by: &Option<OrderBy>,
         limit: &Option<usize>,
         lock_rows: bool,
+        shared: bool,
     ) -> Result<QueryResult> {
         let entry = self.table_entry(table)?;
         let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
@@ -2008,7 +2157,12 @@ impl Engine {
         }
         if lock_rows {
             for (tid, _) in &rows {
-                self.heap.lock_tuple(*tid, snap, self.clog.as_ref())?;
+                if shared {
+                    self.heap
+                        .lock_tuple_shared(*tid, snap, self.clog.as_ref())?;
+                } else {
+                    self.heap.lock_tuple(*tid, snap, self.clog.as_ref())?;
+                }
             }
         }
         let (col_names, projected) = match columns {

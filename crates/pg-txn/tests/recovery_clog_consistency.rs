@@ -47,6 +47,7 @@ fn clog_is_rebuilt_from_wal_after_restart() {
         tmp.path(),
         &config,
         txn_redo_handlers(),
+        Vec::new(),
         Arc::clone(&clog),
     )
     .unwrap();
@@ -133,6 +134,7 @@ fn clog_is_rebuilt_from_wal_after_crash() {
         tmp.path(),
         &config,
         txn_redo_handlers(),
+        Vec::new(),
         Arc::clone(&clog),
     )
     .unwrap();

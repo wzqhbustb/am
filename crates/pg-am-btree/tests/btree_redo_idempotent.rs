@@ -15,7 +15,7 @@ use pg_storage::clog::NoOpClogAccessor;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::page::page_pd_lsn;
-use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, RedoContext, RedoHandler};
+use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, RedoContext, RedoHandler, IncompleteSplitTracker};
 use pg_storage::types::{Lsn, PageId, Tid, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
 
@@ -38,12 +38,14 @@ fn apply_ten(handler: &dyn RedoHandler, record: &WalRecord, engine: &StorageEngi
     let mut att = ActiveXactTable::new();
     let mut dpt = DirtyPageTable::new();
     for _ in 0..10 {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         handler.apply(record, &mut ctx).unwrap();
     }
@@ -58,12 +60,14 @@ fn apply_n(handler: &dyn RedoHandler, record: &WalRecord, engine: &StorageEngine
     let mut att = ActiveXactTable::new();
     let mut dpt = DirtyPageTable::new();
     for _ in 0..n {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         handler.apply(record, &mut ctx).unwrap();
     }
@@ -357,12 +361,14 @@ fn split_prepare_redo_validates_high_key() {
     let clog = NoOpClogAccessor;
     let mut att = ActiveXactTable::new();
     let mut dpt = DirtyPageTable::new();
+    let mut incomplete_splits = IncompleteSplitTracker::new();
     let mut ctx = RedoContext {
         buffer_pool: Some(engine.buffer_pool()),
         page_allocator: engine.page_allocator(),
         clog: &clog,
         att: &mut att,
         dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
     };
     assert!(BTreeSplitPrepareHandler.apply(&record, &mut ctx).is_err());
 }
@@ -473,12 +479,14 @@ fn split_copy_redo_hard_fails_when_neither_side_has_copy() {
     let clog = NoOpClogAccessor;
     let mut att = ActiveXactTable::new();
     let mut dpt = DirtyPageTable::new();
+    let mut incomplete_splits = IncompleteSplitTracker::new();
     let mut ctx = RedoContext {
         buffer_pool: Some(engine.buffer_pool()),
         page_allocator: engine.page_allocator(),
         clog: &clog,
         att: &mut att,
         dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
     };
     assert!(BTreeSplitCopyHandler.apply(&copy, &mut ctx).is_err());
 }

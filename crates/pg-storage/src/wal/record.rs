@@ -184,6 +184,28 @@ pub struct HeapDeleteRecord {
     pub xmax: TxnId,
 }
 
+/// Payload for a `HeapHotUpdate` record: a page-local HOT update (Stage S).
+///
+/// The old tuple is stamped deleted (`xmax` + `HEAP_UPDATED` + `t_ctid` →
+/// new version + `HEAP_HOT_UPDATED`) and the new version is inserted at
+/// `new_slot` on the same page (carrying `HEAP_ONLY_TUPLE`). No index
+/// maintenance occurs — the key columns are unchanged, so the B+Tree still
+/// points to the old TID, and scans follow the `t_ctid` chain to the new
+/// version. Redo is idempotent via `page.pd_lsn >= record.lsn`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeapHotUpdateRecord {
+    /// Page containing both old and new versions (always same page for HOT).
+    pub page_id: PageId,
+    /// Slot of the old version (stamped deleted + t_ctid chain).
+    pub old_slot: u16,
+    /// Slot where the new version is inserted.
+    pub new_slot: u16,
+    /// The encoded bytes of the new version (HEAP_ONLY_TUPLE already set).
+    pub new_tuple_bytes: Vec<u8>,
+    /// The `t_xmax` stamped onto the old version.
+    pub xmax: TxnId,
+}
+
 /// Payload for a `BTreeInsert` record: one index entry placed at a slot.
 ///
 /// Used for leaf inserts, internal-page downlink inserts, and appends to an
@@ -276,6 +298,32 @@ pub struct BTreeSplitCommitRecord {
     pub parent_insert_slot: u16,
 }
 
+/// Payload for a `BTreeSplitCLR` record (Stage S, §11.3): a compensation log
+/// record emitted during undo to finish an incomplete B+Tree split.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BTreeSplitCLRRecord {
+    /// The left page of the incomplete split.
+    pub left_page: PageId,
+    /// The right page of the incomplete split.
+    pub right_page: PageId,
+    /// B+Tree level of the split page.
+    pub level: u8,
+    /// Slot where the Copy phase began.
+    pub copy_start_slot: u16,
+    /// LSN of the SplitPrepare record being compensated (idempotency anchor).
+    pub redo_ref_lsn: Lsn,
+    /// Parent page receiving the downlink (non-root splits).
+    pub parent_page: PageId,
+    /// Separator key inserted into the parent.
+    pub separator_key: Vec<u8>,
+    /// Slot at which the parent gains the downlink.
+    pub parent_insert_slot: u16,
+    /// New root page for root splits; `PageId::INVALID` for non-root splits.
+    pub new_root_page: PageId,
+    /// Meta page to update for root splits; `PageId::INVALID` for non-root.
+    pub meta_page: PageId,
+}
+
 /// Payload for a `TxnCommit` record: the transaction whose commit is durable.
 ///
 /// Per the Commit hard-order rule (§3 P1-5), this record is fsynced *before*
@@ -327,6 +375,15 @@ impl HeapDeleteRecord {
     }
 }
 
+impl HeapHotUpdateRecord {
+    /// Decode a `HeapHotUpdate` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
 impl BTreeInsertRecord {
     /// Decode a `BTreeInsert` payload (see [`HeapInsertRecord::decode`]).
     pub fn decode(payload: &[u8]) -> Result<Self> {
@@ -365,6 +422,15 @@ impl BTreeSplitCopyRecord {
 
 impl BTreeSplitCommitRecord {
     /// Decode a `BTreeSplitCommit` payload (see [`HeapInsertRecord::decode`]).
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?
+            .0)
+    }
+}
+
+impl BTreeSplitCLRRecord {
+    /// Decode a `BTreeSplitCLR` payload (see [`HeapInsertRecord::decode`]).
     pub fn decode(payload: &[u8]) -> Result<Self> {
         Ok(bincode::serde::decode_from_slice(payload, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?
@@ -608,6 +674,34 @@ impl WalRecord {
         Ok(rec)
     }
 
+    /// Create a `HeapHotUpdate` record (page-local HOT update, Stage S):
+    /// stamp old version deleted + t_ctid chain + HEAP_HOT_UPDATED, insert
+    /// new version with HEAP_ONLY_TUPLE. Stamped with the updating `xid`
+    /// (see [`Self::heap_insert`] for why).
+    pub fn heap_hot_update(
+        page_id: PageId,
+        old_slot: u16,
+        new_slot: u16,
+        new_tuple_bytes: Vec<u8>,
+        xmax: TxnId,
+        xid: TxnId,
+    ) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(
+            HeapHotUpdateRecord {
+                page_id,
+                old_slot,
+                new_slot,
+                new_tuple_bytes,
+                xmax,
+            },
+            bincode_config(),
+        )
+        .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        let mut rec = Self::new(WalRecordType::HeapHotUpdate, payload);
+        rec.txn_id = xid;
+        Ok(rec)
+    }
+
     /// Create a `BTreeInsert` record (leaf/internal entry or meta-page append).
     ///
     /// `level`/`flags` describe the target page so redo can initialize a
@@ -704,6 +798,14 @@ impl WalRecord {
         )
         .map_err(|e| StorageError::Serialize(e.to_string()))?;
         Ok(Self::new(WalRecordType::BTreeSplitCommit, payload))
+    }
+
+    /// Create a `BTreeSplitCLR` record (Stage S, §11.3 undo):
+    /// a compensation log record that finishes an incomplete split.
+    pub fn btree_split_clr(rec: &BTreeSplitCLRRecord) -> Result<Self> {
+        let payload = bincode::serde::encode_to_vec(rec, bincode_config())
+            .map_err(|e| StorageError::Serialize(e.to_string()))?;
+        Ok(Self::new(WalRecordType::BTreeSplitCLR, payload))
     }
 
     /// Create a `TxnCommit` record for `xid`.

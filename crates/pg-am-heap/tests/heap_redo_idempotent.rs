@@ -12,7 +12,8 @@ use pg_storage::engine::StorageEngine;
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::positioned_file::PositionedFile;
 use pg_storage::recovery::{
-    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, RedoContext, RedoHandler,
+    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker,
+    RedoContext, RedoHandler,
 };
 use pg_storage::types::{Lsn, PageId, Tid, TxnId, PAGE_SIZE};
 use pg_storage::wal::record::WalRecord;
@@ -64,12 +65,14 @@ fn heap_insert_redo_is_idempotent() {
 
     // Replay the same record ten times.
     for _ in 0..10 {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         handler.apply(&record, &mut ctx).unwrap();
     }
@@ -116,22 +119,26 @@ fn fpi_then_heap_record_idempotent() {
     // Replay the (FPI, HeapInsert) pair twice, simulating a crash mid-recovery.
     for _ in 0..2 {
         {
+            let mut incomplete_splits = IncompleteSplitTracker::new();
             let mut ctx = RedoContext {
                 buffer_pool: Some(engine.buffer_pool()),
                 page_allocator: engine.page_allocator(),
                 clog: &clog,
                 att: &mut att,
                 dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
             };
             fpi_handler.apply(&fpi, &mut ctx).unwrap();
         }
         {
+            let mut incomplete_splits = IncompleteSplitTracker::new();
             let mut ctx = RedoContext {
                 buffer_pool: Some(engine.buffer_pool()),
                 page_allocator: engine.page_allocator(),
                 clog: &clog,
                 att: &mut att,
                 dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
             };
             insert_handler.apply(&insert, &mut ctx).unwrap();
         }
@@ -184,22 +191,26 @@ fn heap_update_same_page_redo_is_idempotent() {
 
     // Apply the insert once, then replay the update ten times.
     {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         insert_handler.apply(&insert, &mut ctx).unwrap();
     }
     for _ in 0..10 {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         update_handler.apply(&update, &mut ctx).unwrap();
     }
@@ -256,22 +267,26 @@ fn heap_update_cross_page_redo_is_idempotent() {
     let update_handler = HeapUpdateHandler;
 
     {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         insert_handler.apply(&insert, &mut ctx).unwrap();
     }
     for _ in 0..10 {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(engine.buffer_pool()),
             page_allocator: engine.page_allocator(),
             clog: &clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         update_handler.apply(&update, &mut ctx).unwrap();
     }

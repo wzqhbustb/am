@@ -68,7 +68,9 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, StorageError};
 use crate::types::{Lsn, PageId, Tid, TxnId};
 use crate::wal::reader::WalReader;
-use crate::wal::record::{bincode_config, CheckpointEndRecord, WalRecord, WalRecordType};
+use crate::wal::record::{
+    bincode_config, BTreeSplitCLRRecord, CheckpointEndRecord, WalRecord, WalRecordType,
+};
 
 /// Outcome of the analysis phase: where redo must start, plus the ARIES
 /// tables rebuilt as of the crash (tech-selection §11.1).
@@ -258,9 +260,9 @@ pub fn run_analysis(
 /// Stage N performance sanity check ("analysis far faster than redo")
 /// relies on.
 ///
-/// Record types without a fixed payload layout (`HeapHotUpdate`,
-/// `HeapCleanup`, `BTreeSplitCLR` — all reserved, with no producers yet)
-/// and non-page records (`Txn*`, `Checkpoint*`) touch no pages here.
+/// Record types without a fixed payload layout (`HeapCleanup` — reserved,
+/// with no producer yet) and non-page records (`Txn*`, `Checkpoint*`)
+/// touch no pages here.
 fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Result<()> {
     use WalRecordType::*;
     let payload = record.payload.as_slice();
@@ -282,6 +284,11 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             let new_tid = decode_prefix::<Tid>(payload, &mut off)?;
             f(old_tid.page_id);
             f(new_tid.page_id);
+        }
+        HeapHotUpdate => {
+            // Page-local HOT update: touches only the one page.
+            let mut off = 0;
+            f(decode_prefix::<PageId>(payload, &mut off)?);
         }
         BTreeSplitPrepare => {
             // left_page, new_right_page. `left_old_next` is only *read* by
@@ -307,6 +314,20 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             f(left);
             f(right);
             f(parent);
+        }
+        BTreeSplitCLR => {
+            let rec = BTreeSplitCLRRecord::decode(payload)?;
+            f(rec.left_page);
+            f(rec.right_page);
+            if rec.parent_page != PageId::INVALID {
+                f(rec.parent_page);
+            }
+            if rec.new_root_page != PageId::INVALID {
+                f(rec.new_root_page);
+            }
+            if rec.meta_page != PageId::INVALID {
+                f(rec.meta_page);
+            }
         }
         _ => {}
     }
@@ -736,22 +757,22 @@ mod tests {
             BTreeSplitPrepare,
             BTreeSplitCopy,
             BTreeSplitCommit,
-        ];
-        // Reserved types with no payload layout and no producers yet
-        // (HeapHotUpdate, HeapCleanup, BTreeSplitCLR), transaction and
-        // checkpoint markers, and the Phase-2+ logical/segment records: no
-        // pages are tracked for them. If any of these gains a producer that
-        // modifies pages, move it to PAGE_MODIFYING and extend
-        // `for_each_touched_page` — this test fails until you do.
-        const NON_PAGE: &[WalRecordType] = &[
             HeapHotUpdate,
+            BTreeSplitCLR,
+        ];
+        // Reserved type with no payload layout and no producers yet
+        // (HeapCleanup), transaction and checkpoint markers, and the
+        // Phase-2+ logical/segment records: no pages are tracked for them.
+        // If any of these gains a producer that modifies pages, move it to
+        // PAGE_MODIFYING and extend `for_each_touched_page` — this test
+        // fails until you do.
+        const NON_PAGE: &[WalRecordType] = &[
             HeapCleanup,
             TxnBegin,
             TxnCommit,
             TxnAbort,
             CheckpointBegin,
             CheckpointEnd,
-            BTreeSplitCLR,
             LogicalHnsw,
             LogicalInverted,
             LogicalGraph,

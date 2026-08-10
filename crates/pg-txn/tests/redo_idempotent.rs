@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use pg_storage::config::StorageConfig;
 use pg_storage::page_allocator::PageAllocator;
-use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, RedoContext};
+use pg_storage::recovery::{ActiveXactTable, DirtyPageTable, RedoContext, IncompleteSplitTracker};
 use pg_storage::types::{Lsn, TxnId};
 use pg_storage::wal::record::WalRecord;
 use pg_storage::wal::writer::WalWriter;
@@ -29,12 +29,14 @@ fn txn_redo_handlers_are_idempotent_under_repeated_apply() {
     let clog = InMemoryClogAccessor::new();
     let mut att = ActiveXactTable::new();
     let mut dpt = DirtyPageTable::new();
+    let mut incomplete_splits = IncompleteSplitTracker::new();
     let mut ctx = RedoContext {
         buffer_pool: None, // txn handlers only touch the CLOG
         page_allocator: &allocator,
         clog: &clog,
         att: &mut att,
         dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
     };
 
     let handlers = txn_redo_handlers();

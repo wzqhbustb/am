@@ -328,6 +328,10 @@ impl SlottedPage {
             Err(HeapError::InvalidSlot(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
+        if lp.flags() == LpFlags::Redirect {
+            let target_slot = lp.off();
+            return Self::tuple(page, target_slot);
+        }
         if lp.flags() != LpFlags::Normal {
             return Ok(None);
         }

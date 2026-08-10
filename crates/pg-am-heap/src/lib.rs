@@ -20,6 +20,7 @@ pub mod redo;
 pub mod slotted_page;
 pub mod toast;
 pub mod tuple;
+pub mod undo;
 
 pub use access_method::{
     AccessMethod, BuildContext, DeleteContext, InsertContext, RelationDesc, ScanContext,
@@ -32,3 +33,4 @@ pub use redo::{heap_redo_handlers, HeapDeleteHandler, HeapInsertHandler, HeapUpd
 pub use slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
 pub use toast::ToastPointer;
 pub use tuple::{ColumnType, Datum, TupleHeader};
+pub use undo::HeapUndoHandler;

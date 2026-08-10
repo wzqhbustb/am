@@ -64,6 +64,11 @@ pub const HEAP_UPDATED: u16 = 0x2000;
 /// `HEAP_XMAX_LOCK_ONLY`; this crate's infomask layout is §三, not PG's, so
 /// only the relative gap matters.
 pub const HEAP_XMAX_LOCK_ONLY: u16 = 0x1000;
+/// `t_xmax` holds a shared row lock (FOR SHARE, Stage S multixact lite,
+/// tech-selection §9.1). Always set together with [`HEAP_XMAX_LOCK_ONLY`].
+/// Distinguishes a shared lock from an exclusive one without a separate
+/// multixact struct — full multixact is deferred to Phase 6.
+pub const HEAP_XMAX_IS_SHARE: u16 = 0x4000;
 
 // `t_infomask2` bits (§三): natts occupies bits 0..=10 (up to 2047 columns;
 // 11 bits represent 0..=2047).

@@ -27,6 +27,7 @@ use crate::page_allocator::PageAllocator;
 use crate::positioned_file::PositionedFile;
 use crate::types::{Lsn, PageId, TxnId, PAGE_SIZE};
 use crate::wal::record::{bincode_config, FullPageImageRecord, WalRecord, WalRecordType};
+use crate::wal::WalWriter;
 
 /// Active transaction table (ARIES analysis).
 ///
@@ -123,6 +124,77 @@ impl DirtyPageTable {
     }
 }
 
+/// Tracks B+Tree splits that were started (Prepare) but never finished
+/// (Commit) before a crash. Populated during redo and consumed during undo.
+#[derive(Debug, Default)]
+pub struct IncompleteSplitTracker {
+    splits: HashMap<PageId, IncompleteSplit>,
+}
+
+/// A single incomplete split (Stage S, §11.3).
+#[derive(Debug, Clone)]
+pub struct IncompleteSplit {
+    /// Page ID of the left half of the split.
+    pub left_page: PageId,
+    /// Page ID of the right half of the split.
+    pub right_page: PageId,
+    /// B+Tree level of the split page.
+    pub level: u8,
+    /// Original next-sibling pointer of the left page before the split.
+    pub left_old_next: PageId,
+    /// Slot where the Copy phase began (None if only Prepare was reached).
+    pub copy_start_slot: Option<u16>,
+}
+
+impl IncompleteSplitTracker {
+    /// Create an empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a split that reached the Prepare phase.
+    pub fn mark_prepare(
+        &mut self,
+        left_page: PageId,
+        right_page: PageId,
+        level: u8,
+        left_old_next: PageId,
+    ) {
+        self.splits.insert(
+            left_page,
+            IncompleteSplit {
+                left_page,
+                right_page,
+                level,
+                left_old_next,
+                copy_start_slot: None,
+            },
+        );
+    }
+
+    /// Record that the Copy phase was reached (updates `copy_start_slot`).
+    pub fn mark_copy(&mut self, left_page: PageId, copy_start_slot: u16) {
+        if let Some(split) = self.splits.get_mut(&left_page) {
+            split.copy_start_slot = Some(copy_start_slot);
+        }
+    }
+
+    /// Remove a split (Commit reached — split is complete, no undo needed).
+    pub fn clear(&mut self, left_page: PageId) {
+        self.splits.remove(&left_page);
+    }
+
+    /// All incomplete splits, keyed by left page.
+    pub fn incomplete_splits(&self) -> &HashMap<PageId, IncompleteSplit> {
+        &self.splits
+    }
+
+    /// Returns true if no incomplete splits are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.splits.is_empty()
+    }
+}
+
 /// Context passed to every redo handler during replay.
 ///
 /// All M2 stages compile against this struct from day one; the set of
@@ -143,6 +215,10 @@ pub struct RedoContext<'a> {
     pub att: &'a mut ActiveXactTable,
     /// Dirty page table (Stage N).
     pub dpt: &'a mut DirtyPageTable,
+    /// Incomplete B+Tree split tracker (Stage S, §11.3): populated during
+    /// redo by split Prepare/Copy/Commit handlers; consumed by undo handlers
+    /// to finish or roll back incomplete splits.
+    pub incomplete_splits: &'a mut IncompleteSplitTracker,
 }
 
 /// Redo handler for one [`WalRecordType`].
@@ -151,6 +227,31 @@ pub trait RedoHandler: Send + Sync {
     fn kind(&self) -> WalRecordType;
     /// Apply `record` to the on-disk/in-memory state.
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()>;
+}
+
+/// Undo handler (Stage S, §11.3): runs after redo + ATT filter to reverse
+/// or complete the effects of crashed transactions. Injected from
+/// `pg-engine` (which depends on all AM crates) since `pg-storage` cannot
+/// depend on `pg-am-btree` or `pg-am-heap`.
+pub trait UndoHandler: Send + Sync {
+    /// Reverse or complete the effects of crashed transactions.
+    fn undo(&self, ctx: &mut UndoContext<'_>) -> Result<()>;
+}
+
+/// Context passed to undo handlers.
+pub struct UndoContext<'a> {
+    /// Buffer pool for reading/writing pages.
+    pub buffer_pool: &'a BufferPool,
+    /// WAL writer for emitting CLR records.
+    pub wal_writer: &'a WalWriter,
+    /// Commit-status accessor (for stamping aborted XIDs).
+    pub clog: &'a dyn ClogAccessor,
+    /// XIDs of transactions that were active at crash time (the ATT).
+    pub att: &'a [TxnId],
+    /// Incomplete B+Tree splits detected during redo.
+    pub incomplete_splits: &'a IncompleteSplitTracker,
+    /// Page allocator (for scanning allocated pages to find meta pages).
+    pub page_allocator: &'a Mutex<PageAllocator>,
 }
 
 /// Maps each [`WalRecordType`] to exactly one [`RedoHandler`].
@@ -364,6 +465,7 @@ mod tests {
         clog: &'a dyn ClogAccessor,
         att: &'a mut ActiveXactTable,
         dpt: &'a mut DirtyPageTable,
+        incomplete_splits: &'a mut IncompleteSplitTracker,
     ) -> RedoContext<'a> {
         RedoContext {
             buffer_pool: None,
@@ -371,6 +473,7 @@ mod tests {
             clog,
             att,
             dpt,
+            incomplete_splits,
         }
     }
 
@@ -396,7 +499,8 @@ mod tests {
             flags: 0,
             payload: Vec::new(),
         };
-        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt);
+        let mut incomplete_splits = IncompleteSplitTracker::new();
+        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt, &mut incomplete_splits);
         registry.apply(&record, &mut ctx).unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
@@ -432,7 +536,8 @@ mod tests {
             flags: 0,
             payload: Vec::new(),
         };
-        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt);
+        let mut incomplete_splits = IncompleteSplitTracker::new();
+        let mut ctx = noop_ctx(&c.allocator, &clog, &mut att, &mut dpt, &mut incomplete_splits);
         let err = registry.apply(&record, &mut ctx).unwrap_err();
         assert!(matches!(
             err,

@@ -36,6 +36,7 @@ pub mod index;
 pub mod key;
 pub mod page;
 pub mod redo;
+pub mod undo;
 
 pub use am::BTreeAM;
 pub use error::{BTreeError, Result};
@@ -45,3 +46,4 @@ pub use key::{
     MAX_INDEX_KEY_BYTES,
 };
 pub use redo::btree_redo_handlers;
+pub use undo::BTreeUndoHandler;

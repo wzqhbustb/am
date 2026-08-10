@@ -37,13 +37,15 @@
 
 use crate::error::HeapError;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
-use crate::tuple::{TupleHeader, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE};
+use crate::tuple::{TupleHeader, HEAP_HOT_UPDATED, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::error::{Result, StorageError};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
 use pg_storage::recovery::{RedoContext, RedoHandler};
 use pg_storage::types::{Lsn, Tid, PAGE_SIZE};
-use pg_storage::wal::record::{HeapDeleteRecord, HeapInsertRecord, HeapUpdateRecord, WalRecord};
+use pg_storage::wal::record::{
+    HeapDeleteRecord, HeapHotUpdateRecord, HeapInsertRecord, HeapUpdateRecord, WalRecord,
+};
 use pg_storage::wal::WalRecordType;
 
 /// The heap redo handlers, ready for injection into the recovery registry
@@ -56,6 +58,7 @@ pub fn heap_redo_handlers() -> Vec<Box<dyn RedoHandler>> {
         Box::new(HeapInsertHandler),
         Box::new(HeapUpdateHandler),
         Box::new(HeapDeleteHandler),
+        Box::new(HeapHotUpdateHandler),
     ]
 }
 
@@ -192,6 +195,46 @@ impl RedoHandler for HeapDeleteHandler {
     }
 }
 
+/// Redo handler for `HeapHotUpdate` records (same-page HOT update: stamp
+/// old version with t_ctid + HOT flags, insert new version).
+pub struct HeapHotUpdateHandler;
+
+impl RedoHandler for HeapHotUpdateHandler {
+    fn kind(&self) -> WalRecordType {
+        WalRecordType::HeapHotUpdate
+    }
+
+    fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
+        let rec = HeapHotUpdateRecord::decode(&record.payload)?;
+        let pool = require_pool(ctx)?;
+        let mut guard = pool.pin_mut(rec.page_id)?;
+        let page: &mut [u8; PAGE_SIZE] = guard.page_mut().try_into().expect("frame is PAGE_SIZE");
+
+        if page_pd_lsn(page) >= record.lsn {
+            return Ok(());
+        }
+        SlottedPage::init_if_fresh_with_special(page, HEAP_SPECIAL_SIZE);
+        let old_tid = Tid {
+            page_id: rec.page_id,
+            slot_id: rec.old_slot,
+        };
+        let new_tid = Tid {
+            page_id: rec.page_id,
+            slot_id: rec.new_slot,
+        };
+        stamp_hot_update(page, old_tid, new_tid, rec.xmax).map_err(heap_to_storage)?;
+        let slot = SlottedPage::add_tuple(page, &rec.new_tuple_bytes).map_err(heap_to_storage)?;
+        if slot != rec.new_slot {
+            return Err(StorageError::MetadataCorrupted(format!(
+                "HeapHotUpdate redo slot diverged: record expects slot {}, page gives {slot}",
+                rec.new_slot
+            )));
+        }
+        stamp_pd_lsn(page, record.lsn);
+        Ok(())
+    }
+}
+
 /// Recovery always opens the buffer pool before replay (Stage I reorder), so a
 /// missing pool is a programming error rather than a recoverable condition.
 fn require_pool<'a>(ctx: &RedoContext<'a>) -> Result<&'a BufferPool> {
@@ -245,6 +288,31 @@ fn stamp_deleted(
     // delete from visibility and resurrect the row). Mirrors the live
     // path's `HeapAM::stamp_deleted`.
     header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+    header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
+    Ok(())
+}
+
+/// Stamp `t_xmax`, `HEAP_UPDATED`, `t_ctid`, and `HEAP_HOT_UPDATED` onto the
+/// old tuple at `old_tid`'s slot, mirroring `HeapAM::stamp_hot_update` for
+/// the redo path. Like `stamp_deleted`, `t_cid` is not restored (the WAL
+/// record does not carry it — see [`stamp_deleted`]'s comment).
+fn stamp_hot_update(
+    page: &mut [u8; PAGE_SIZE],
+    old_tid: Tid,
+    new_tid: Tid,
+    xmax: pg_storage::types::TxnId,
+) -> std::result::Result<(), HeapError> {
+    let lp = SlottedPage::line_pointer(page, old_tid.slot_id)?;
+    if lp.flags() != crate::line_pointer::LpFlags::Normal {
+        return Err(HeapError::TupleNotFound(old_tid));
+    }
+    let off = lp.off() as usize;
+    let mut header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
+    header.t_xmax = xmax;
+    header.t_infomask |= HEAP_UPDATED;
+    header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+    header.t_ctid = new_tid;
+    header.t_infomask2 |= HEAP_HOT_UPDATED;
     header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
     Ok(())
 }

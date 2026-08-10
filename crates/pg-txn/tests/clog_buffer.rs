@@ -361,6 +361,7 @@ fn txn_redo_rebuilds_disk_clog_after_crash() {
             tmp.path(),
             &config,
             txn_redo_handlers(),
+            Vec::new(),
             clog.clone(),
         )
         .unwrap();
@@ -389,6 +390,7 @@ fn txn_redo_rebuilds_disk_clog_after_crash() {
             tmp.path(),
             &config,
             txn_redo_handlers(),
+            Vec::new(),
             clog.clone(),
         )
         .unwrap();

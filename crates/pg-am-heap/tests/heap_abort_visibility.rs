@@ -404,6 +404,7 @@ fn delete_of_deleted_and_update_of_deleted_are_rejected() {
     let err = heap
         .update(UpdateContext {
             clog: clog.as_ref(),
+            hot_eligible: false,
             rel: rel(first_page),
             snapshot: &snap_u,
             old_tid: tid,
@@ -529,6 +530,7 @@ fn aborted_deleter_tuple_can_be_deleted_again() {
         new_tuple: &encode_row(xid_u, 3, "updated"),
         out_tid: None,
         clog: clog.as_ref(),
+        hot_eligible: false,
     })
     .expect("update after an aborted deleter must be allowed");
     mgr.commit_txn(xid_u).unwrap();

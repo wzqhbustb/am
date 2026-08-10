@@ -141,6 +141,7 @@ fn update_then_delete_visibility() {
     };
     heap.update(UpdateContext {
         clog: &NoOpClogAccessor,
+        hot_eligible: false,
         rel: rel(first_page),
         snapshot: &snap,
         old_tid: tid,
@@ -215,6 +216,7 @@ fn heap_crash_recovery_after_update() {
         };
         heap.update(UpdateContext {
             clog: &NoOpClogAccessor,
+            hot_eligible: false,
             rel: rel(first_page),
             snapshot: &snap,
             old_tid: tid,
@@ -229,7 +231,7 @@ fn heap_crash_recovery_after_update() {
     };
 
     let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -279,7 +281,7 @@ fn heap_crash_recovery() {
 
     // Phase 2: reopen with heap redo handlers; replay must reconstruct the rows.
     let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -354,6 +356,7 @@ fn heap_cross_page_update_crash_recovery() {
         };
         heap.update(UpdateContext {
             clog: &NoOpClogAccessor,
+            hot_eligible: false,
             rel: rel(first_page),
             snapshot: &snap,
             old_tid: tid,
@@ -391,7 +394,7 @@ fn heap_cross_page_update_crash_recovery() {
 
     // Reopen and replay: the relocated row must be reconstructed on the new page.
     let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -465,7 +468,7 @@ fn rejected_delete_leaves_no_poison_wal_record() {
 
     // Recovery must NOT choke on a poison HeapDelete record.
     let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -660,6 +663,7 @@ fn multi_page_relation_crud() {
     };
     heap.update(UpdateContext {
         clog: &NoOpClogAccessor,
+        hot_eligible: false,
         rel: rel(first_page),
         snapshot: &snap,
         old_tid: tids[0],
@@ -718,7 +722,7 @@ fn multi_page_crash_recovery() {
     };
 
     let engine =
-        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers()).unwrap();
+        StorageEngine::open_with_redo_handlers(tmp.path(), &config, heap_redo_handlers(), Vec::new()).unwrap();
     let heap = HeapAM::new(
         Arc::clone(engine.buffer_pool()),
         Arc::clone(engine.wal_writer()),
@@ -809,6 +813,7 @@ fn test_am_stamps_xmin_matches_current_xid() {
     };
     heap.update(UpdateContext {
         clog: &NoOpClogAccessor,
+        hot_eligible: false,
         rel: rel(first_page),
         snapshot: &snap,
         old_tid: rows[0].0,

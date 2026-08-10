@@ -195,6 +195,7 @@ fn lock_only_stamp_visible_blocks_then_overwritable() {
             new_tuple: &new_tuple,
             out_tid: None,
             clog: rig.clog.as_ref(),
+            hot_eligible: false,
         })
         .unwrap();
     rig.mgr.commit_txn(xid_u).unwrap();
@@ -260,6 +261,7 @@ fn crashed_in_progress_stamper_is_treated_as_aborted() {
             new_tuple: &new_tuple,
             out_tid: None,
             clog: rig.clog.as_ref(),
+            hot_eligible: false,
         })
         .unwrap();
     mgr2.commit_txn(xid_u).unwrap();

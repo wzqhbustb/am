@@ -22,8 +22,9 @@ use crate::io::ensure_data_dir;
 use crate::page_allocator::PageAllocator;
 use crate::positioned_file::PositionedFile;
 use crate::recovery::{
-    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, NoOpRedoHandler,
-    PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler, RedoRegistry,
+    ActiveXactTable, DirtyPageTable, FullPageImageRedoHandler, IncompleteSplitTracker,
+    NoOpRedoHandler, PageAllocRedoHandler, PageFreeRedoHandler, RedoContext, RedoHandler,
+    RedoRegistry, UndoHandler, UndoContext,
 };
 use crate::superblock::Superblock;
 use crate::txn_id::TxnIdClock;
@@ -68,7 +69,7 @@ impl StorageEngine {
     /// Background checkpointing is not started automatically; call
     /// [`Self::start_background_checkpointing`] to enable it.
     pub fn open(data_dir: impl AsRef<Path>, config: &StorageConfig) -> Result<Self> {
-        Self::open_with_redo_handlers(data_dir, config, Vec::new())
+        Self::open_with_redo_handlers(data_dir, config, Vec::new(), Vec::new())
     }
 
     /// Open or create a storage engine, injecting extra redo handlers.
@@ -82,11 +83,13 @@ impl StorageEngine {
         data_dir: impl AsRef<Path>,
         config: &StorageConfig,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        extra_undo_handlers: Vec<Box<dyn UndoHandler>>,
     ) -> Result<Self> {
         Self::open_with_redo_and_clog(
             data_dir,
             config,
             extra_redo_handlers,
+            extra_undo_handlers,
             Arc::new(NoOpClogAccessor),
         )
     }
@@ -106,6 +109,7 @@ impl StorageEngine {
         data_dir: impl AsRef<Path>,
         config: &StorageConfig,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        extra_undo_handlers: Vec<Box<dyn UndoHandler>>,
         clog: Arc<dyn ClogAccessor>,
     ) -> Result<Self> {
         config.validate()?;
@@ -114,7 +118,13 @@ impl StorageEngine {
 
         let sb_path = Superblock::path(&data_dir);
         if sb_path.exists() {
-            Self::recover_with_redo_handlers(data_dir, config, extra_redo_handlers, clog)
+            Self::recover_with_redo_handlers(
+                data_dir,
+                config,
+                extra_redo_handlers,
+                extra_undo_handlers,
+                clog,
+            )
         } else {
             Self::create_new(data_dir, config, clog)
         }
@@ -185,7 +195,13 @@ impl StorageEngine {
     /// must use [`Self::open_with_redo_handlers`] with the heap handlers
     /// injected, or replay will fail on the unregistered record types.
     pub fn recover(data_dir: PathBuf, config: &StorageConfig) -> Result<Self> {
-        Self::recover_with_redo_handlers(data_dir, config, Vec::new(), Arc::new(NoOpClogAccessor))
+        Self::recover_with_redo_handlers(
+            data_dir,
+            config,
+            Vec::new(),
+            Vec::new(),
+            Arc::new(NoOpClogAccessor),
+        )
     }
 
     /// Recover, injecting `extra_redo_handlers` into the redo registry.
@@ -200,6 +216,7 @@ impl StorageEngine {
         data_dir: PathBuf,
         config: &StorageConfig,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
+        extra_undo_handlers: Vec<Box<dyn UndoHandler>>,
         clog: Arc<dyn ClogAccessor>,
     ) -> Result<Self> {
         info!(data_dir = %data_dir.display(), "recovering storage engine");
@@ -287,7 +304,7 @@ impl StorageEngine {
         let analysis_result = Self::run_analysis(&data_dir, config, checkpoint_lsn)?;
         let replay_start = analysis_result.redo_start;
         let recovered_att = analysis_result.att;
-        let replayed_max_txn_id = Self::replay_wal(
+        let (replayed_max_txn_id, incomplete_splits) = Self::replay_wal(
             data_dir.clone(),
             config,
             replay_start,
@@ -319,6 +336,30 @@ impl StorageEngine {
                 )
             })
             .collect();
+
+        // Undo phase (Stage S, §11.3): finish incomplete B+Tree splits and
+        // stamp aborted XIDs in the CLOG. Runs after redo + ATT filter, before
+        // the checkpoint_lsn seed.
+        if !incomplete_splits.is_empty() || !recovered_att.is_empty() {
+            let mut undo_ctx = UndoContext {
+                buffer_pool: &buffer_pool,
+                wal_writer: &wal_writer,
+                clog: clog.as_ref(),
+                att: &recovered_att,
+                incomplete_splits: &incomplete_splits,
+                page_allocator: &page_allocator,
+            };
+            for handler in &extra_undo_handlers {
+                handler.undo(&mut undo_ctx)?;
+            }
+            // Make CLR records durable before flushing data pages
+            // (WAL-before-data invariant for undo-generated records).
+            wal_writer.flush()?;
+            // Flush dirty pages from undo.
+            for page_id in buffer_pool.dirty_page_ids() {
+                buffer_pool.flush(page_id)?;
+            }
+        }
 
         // Seed the buffer pool's checkpoint_lsn from the superblock. Without
         // this it stays INVALID until the first new checkpoint, and
@@ -483,7 +524,7 @@ impl StorageEngine {
         buffer_pool: &BufferPool,
         extra_redo_handlers: Vec<Box<dyn RedoHandler>>,
         clog: &dyn ClogAccessor,
-    ) -> Result<TxnId> {
+    ) -> Result<(TxnId, IncompleteSplitTracker)> {
         let mut reader =
             WalReader::open_at(data_dir.join("wal"), config.wal_segment_size, replay_start)?;
 
@@ -515,12 +556,14 @@ impl StorageEngine {
 
         let mut att = ActiveXactTable::new();
         let mut dpt = DirtyPageTable::new();
+        let mut incomplete_splits = IncompleteSplitTracker::new();
         let mut ctx = RedoContext {
             buffer_pool: Some(buffer_pool),
             page_allocator,
             clog,
             att: &mut att,
             dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
         };
         let mut records_replayed = 0usize;
         let mut max_txn_id = TxnId::INVALID;
@@ -557,7 +600,7 @@ impl StorageEngine {
         }
 
         info!(records_replayed, "WAL replay complete");
-        Ok(max_txn_id)
+        Ok((max_txn_id, incomplete_splits))
     }
 
     /// Return the data directory.
@@ -1208,7 +1251,8 @@ mod tests {
         // Recovery must replay the HeapInsert record through the probe handler,
         // and the buffer pool must exist at that point.
         let _engine =
-            StorageEngine::open_with_redo_handlers(tmp.path(), &config, handlers).unwrap();
+            StorageEngine::open_with_redo_handlers(tmp.path(), &config, handlers, Vec::new())
+                .unwrap();
         assert!(
             applied.load(Ordering::Relaxed),
             "probe handler was never invoked during recovery"

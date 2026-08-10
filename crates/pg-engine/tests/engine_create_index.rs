@@ -372,6 +372,72 @@ fn dml_maintains_indexes() {
     index.validate().unwrap();
 }
 
+/// A `HEAP_ONLY_TUPLE` never got an index entry of its own, so index
+/// maintenance for that version has to act on its HOT chain root. Acting on
+/// the descendant's own TID instead fails with `EntryNotFound` and leaves the
+/// index disagreeing with the heap.
+#[test]
+fn dml_on_a_hot_descendant_retires_the_chain_root_entry() {
+    let tmp = TempDir::new().unwrap();
+    let engine = open(tmp.path());
+    engine.create_table("t", &schema()).unwrap();
+    // A single index, so an update that leaves `k` alone is HOT-eligible.
+    engine.create_index("t", "k").unwrap();
+
+    let root = engine
+        .insert("t", &[Some(Datum::Int8(1)), Some(Datum::Int8(10))])
+        .unwrap();
+    let hot = engine
+        .update("t", root, &[Some(Datum::Int8(1)), Some(Datum::Int8(11))])
+        .unwrap();
+    assert_eq!(
+        hot.page_id, root.page_id,
+        "the new version must have stayed on the page for the update to be HOT"
+    );
+    assert_ne!(hot, root);
+    assert_eq!(
+        engine.index_lookup("t", "k", &Datum::Int8(1)).unwrap(),
+        Some(hot),
+        "the chain root's entry must resolve through t_ctid to the HOT version"
+    );
+
+    // Key-changing update of the HOT descendant.
+    let moved = engine
+        .update("t", hot, &[Some(Datum::Int8(2)), Some(Datum::Int8(11))])
+        .unwrap();
+    assert_eq!(
+        engine.index_lookup("t", "k", &Datum::Int8(1)).unwrap(),
+        None,
+        "the retired key must no longer resolve to a live row"
+    );
+    assert_eq!(
+        engine.index_lookup("t", "k", &Datum::Int8(2)).unwrap(),
+        Some(moved)
+    );
+
+    // Same for a DELETE of a HOT descendant.
+    let root2 = engine
+        .insert("t", &[Some(Datum::Int8(3)), Some(Datum::Int8(30))])
+        .unwrap();
+    let hot2 = engine
+        .update("t", root2, &[Some(Datum::Int8(3)), Some(Datum::Int8(31))])
+        .unwrap();
+    assert_eq!(hot2.page_id, root2.page_id);
+    engine.delete("t", hot2).unwrap();
+    assert_eq!(
+        engine.index_lookup("t", "k", &Datum::Int8(3)).unwrap(),
+        None
+    );
+
+    let index = engine.btree_index("t", "k").unwrap();
+    assert_eq!(
+        index.range_scan(None, None).unwrap().len(),
+        1,
+        "only the surviving (k=2) row may still own an entry"
+    );
+    index.validate().unwrap();
+}
+
 /// P3-1: when a system catalog page is full, `create_index` must fail with
 /// `CatalogFull` from the pre-check — before running the heap scan and bulk
 /// load (the failure is cheap and leaves the table fully usable).

@@ -77,6 +77,10 @@ pub struct UpdateContext<'a> {
     /// updated again (without this, such a tuple would be visible yet
     /// permanently unmodifiable).
     pub clog: &'a dyn ClogAccessor,
+    /// Whether the update is HOT-eligible: no indexed columns changed and
+    /// the new version fits on the same page. When true the AM skips index
+    /// maintenance and chains via `t_ctid` + `HEAP_HOT_UPDATED` (Stage S).
+    pub hot_eligible: bool,
 }
 
 /// Inputs to [`AccessMethod::delete`].
