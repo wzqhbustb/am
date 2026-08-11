@@ -144,6 +144,11 @@ pub struct IncompleteSplit {
     pub left_old_next: PageId,
     /// Slot where the Copy phase began (None if only Prepare was reached).
     pub copy_start_slot: Option<u16>,
+    /// LSN of the SplitPrepare record that opened the split (post-Stage-S
+    /// review B8): carried into the CLR's `redo_ref_lsn` for diagnostics.
+    /// `Lsn::INVALID` when the split was detected by the undo-time page
+    /// scan (its Prepare predates the replay window, so no LSN is known).
+    pub prepare_lsn: Lsn,
 }
 
 impl IncompleteSplitTracker {
@@ -152,13 +157,15 @@ impl IncompleteSplitTracker {
         Self::default()
     }
 
-    /// Record a split that reached the Prepare phase.
+    /// Record a split that reached the Prepare phase, keeping the Prepare
+    /// record's LSN for the CLR's diagnostic `redo_ref_lsn` (B8).
     pub fn mark_prepare(
         &mut self,
         left_page: PageId,
         right_page: PageId,
         level: u8,
         left_old_next: PageId,
+        prepare_lsn: Lsn,
     ) {
         self.splits.insert(
             left_page,
@@ -168,6 +175,7 @@ impl IncompleteSplitTracker {
                 level,
                 left_old_next,
                 copy_start_slot: None,
+                prepare_lsn,
             },
         );
     }

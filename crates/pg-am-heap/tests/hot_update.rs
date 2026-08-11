@@ -312,3 +312,42 @@ fn test_hot_update_crash_recovery() {
     assert_eq!(rows[0].1[0], Some(Datum::Int4(1)));
     assert_eq!(rows[0].1[1], Some(Datum::Text("bob".to_string())));
 }
+
+/// Post-Stage-S review H1: a 20-hop HOT chain (the pre-H1 hardcoded 8-hop
+/// cap silently dropped every version past the eighth) is followed to its
+/// end by the heap scan.
+#[test]
+fn test_hot_update_chain_20_followed_to_end() {
+    const UPDATES: u64 = 20;
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+    let heap = HeapAM::new(
+        Arc::clone(engine.buffer_pool()),
+        Arc::clone(engine.wal_writer()),
+    );
+    let first_page = heap.create_heap(REL_OID).unwrap();
+
+    let mut tid = insert_as(&heap, first_page, TxnId(100), 1, "v0");
+    for i in 1..=UPDATES {
+        let name = format!("v{i}");
+        tid = hot_update(&heap, first_page, tid, TxnId(100 + i), 1, &name);
+        assert_eq!(tid.page_id, first_page, "update {i} must stay same-page");
+    }
+
+    let scan_snap = Snapshot::everything();
+    let rows = heap
+        .scan(ScanContext {
+            rel: rel(first_page),
+            snapshot: &scan_snap,
+            clog: &NoOpClogAccessor,
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one visible row");
+    assert_eq!(rows[0].0, tid, "scan returns the 20-hop chain tail");
+    assert_eq!(
+        rows[0].1[1],
+        Some(Datum::Text(format!("v{UPDATES}"))),
+        "scan must follow the chain to its end, not stop at the cap"
+    );
+}

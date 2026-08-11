@@ -300,6 +300,14 @@ pub struct BTreeSplitCommitRecord {
 
 /// Payload for a `BTreeSplitCLR` record (Stage S, §11.3): a compensation log
 /// record emitted during undo to finish an incomplete B+Tree split.
+///
+/// Two shapes exist (post-Stage-S review C1/C2): a *finishing* CLR completes
+/// the split (move owed entries, insert the downlink, clear the flag) and
+/// always carries either a parent page or a new root + meta page; an
+/// *unlink* CLR abandons the split (the whole right half was deleted in the
+/// Copy→Commit window, so no separator exists) and carries `INVALID` for
+/// parent/new_root/meta — `apply_split_clr` then splices the empty right
+/// page out of the sibling chain and clears only `SPLIT_INCOMPLETE`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BTreeSplitCLRRecord {
     /// The left page of the incomplete split.
@@ -308,17 +316,21 @@ pub struct BTreeSplitCLRRecord {
     pub right_page: PageId,
     /// B+Tree level of the split page.
     pub level: u8,
-    /// Slot where the Copy phase began.
+    /// Slot where the Copy phase began. Only consulted when the right page
+    /// never held entries; otherwise the apply keys off the right page's
+    /// first entry.
     pub copy_start_slot: u16,
     /// LSN of the SplitPrepare record being compensated (idempotency anchor).
     pub redo_ref_lsn: Lsn,
-    /// Parent page receiving the downlink (non-root splits).
+    /// Parent page receiving the downlink (non-root splits); `INVALID` for
+    /// root splits and unlink records.
     pub parent_page: PageId,
-    /// Separator key inserted into the parent.
+    /// Separator key inserted into the parent. Empty for unlink records.
     pub separator_key: Vec<u8>,
     /// Slot at which the parent gains the downlink.
     pub parent_insert_slot: u16,
-    /// New root page for root splits; `PageId::INVALID` for non-root splits.
+    /// New root page for root splits; `PageId::INVALID` for non-root splits
+    /// and unlink records.
     pub new_root_page: PageId,
     /// Meta page to update for root splits; `PageId::INVALID` for non-root.
     pub meta_page: PageId,
@@ -1190,6 +1202,66 @@ mod tests {
                 .0;
         assert_eq!(payload.tid, tid);
         assert_eq!(payload.xmax, TxnId(11));
+    }
+
+    /// Post-Stage-S review B5: the Stage S record types roundtrip too.
+    #[test]
+    fn heap_hot_update_roundtrip() {
+        let mut record =
+            WalRecord::heap_hot_update(PageId(7), 3, 9, vec![8, 8, 8], TxnId(21), TxnId(21))
+                .unwrap();
+        record.lsn = Lsn(88);
+        let buf = record.encode().unwrap();
+        let (decoded, _) = WalRecord::decode(&buf).unwrap();
+        assert_eq!(decoded.record_type, WalRecordType::HeapHotUpdate);
+        assert_eq!(decoded.txn_id, TxnId(21));
+        let payload = HeapHotUpdateRecord::decode(&decoded.payload).unwrap();
+        assert_eq!(payload.page_id, PageId(7));
+        assert_eq!(payload.old_slot, 3);
+        assert_eq!(payload.new_slot, 9);
+        assert_eq!(payload.new_tuple_bytes, vec![8, 8, 8]);
+        assert_eq!(payload.xmax, TxnId(21));
+    }
+
+    /// Post-Stage-S review B5: both CLR shapes — a finishing CLR (parent
+    /// downlink) and an unlink CLR (INVALID parent/new_root/meta) — encode
+    /// and decode losslessly.
+    #[test]
+    fn btree_split_clr_roundtrip() {
+        let finishing = BTreeSplitCLRRecord {
+            left_page: PageId(10),
+            right_page: PageId(11),
+            level: 0,
+            copy_start_slot: 113,
+            redo_ref_lsn: Lsn(4_200),
+            parent_page: PageId(12),
+            separator_key: vec![1, 2, 3, 4],
+            parent_insert_slot: 57,
+            new_root_page: PageId::INVALID,
+            meta_page: PageId::INVALID,
+        };
+        let unlink = BTreeSplitCLRRecord {
+            left_page: PageId(10),
+            right_page: PageId(11),
+            level: 0,
+            copy_start_slot: 113,
+            redo_ref_lsn: Lsn::INVALID,
+            parent_page: PageId::INVALID,
+            separator_key: Vec::new(),
+            parent_insert_slot: 0,
+            new_root_page: PageId::INVALID,
+            meta_page: PageId::INVALID,
+        };
+        for rec in [finishing, unlink] {
+            let mut record = WalRecord::btree_split_clr(&rec).unwrap();
+            record.lsn = Lsn(9_999);
+            let buf = record.encode().unwrap();
+            let (decoded, _) = WalRecord::decode(&buf).unwrap();
+            assert_eq!(decoded.record_type, WalRecordType::BTreeSplitCLR);
+            assert_eq!(decoded.lsn, Lsn(9_999));
+            let payload = BTreeSplitCLRRecord::decode(&decoded.payload).unwrap();
+            assert_eq!(payload, rec);
+        }
     }
 
     #[test]

@@ -126,7 +126,7 @@ fn fpi_then_heap_record_idempotent() {
                 clog: &clog,
                 att: &mut att,
                 dpt: &mut dpt,
-            incomplete_splits: &mut incomplete_splits,
+                incomplete_splits: &mut incomplete_splits,
             };
             fpi_handler.apply(&fpi, &mut ctx).unwrap();
         }
@@ -138,7 +138,7 @@ fn fpi_then_heap_record_idempotent() {
                 clog: &clog,
                 att: &mut att,
                 dpt: &mut dpt,
-            incomplete_splits: &mut incomplete_splits,
+                incomplete_splits: &mut incomplete_splits,
             };
             insert_handler.apply(&insert, &mut ctx).unwrap();
         }
@@ -304,5 +304,93 @@ fn heap_update_cross_page_redo_is_idempotent() {
     assert_eq!(
         SlottedPage::tuple(new, 0).unwrap(),
         Some(updated.as_slice())
+    );
+}
+
+/// Post-Stage-S review B1: `HeapHotUpdate` redo is idempotent, like the
+/// `HeapUpdate` tests above — stamping the old version + appending the
+/// HEAP_ONLY new version replays to the same page state ten times.
+#[test]
+fn heap_hot_update_redo_is_idempotent() {
+    use pg_am_heap::tuple::HEAP_ONLY_TUPLE;
+    use pg_am_heap::HeapHotUpdateHandler;
+
+    let tmp = TempDir::new().unwrap();
+    let config = StorageConfig::new(tmp.path());
+    let engine = StorageEngine::open(tmp.path(), &config).unwrap();
+
+    let page_id = {
+        let guard = engine.buffer_pool().new_page().unwrap();
+        guard.page_id()
+    };
+
+    // Seed the page with the original version at slot 0 (lsn 1000).
+    let original = encode_row(1, "original");
+    let mut insert = WalRecord::heap_insert(page_id, 0, original.clone(), TxnId(100)).unwrap();
+    insert.lsn = Lsn(1_000);
+
+    // HOT update: stamp slot 0 (t_ctid + HOT flags) + append the HEAP_ONLY
+    // new version at slot 1 — same tuple bytes the live path logs.
+    let mut updated = encode_row(1, "updated");
+    let infomask2 = u16::from_le_bytes([updated[54], updated[55]]);
+    updated[54..56].copy_from_slice(&(infomask2 | HEAP_ONLY_TUPLE).to_le_bytes());
+    let mut hot =
+        WalRecord::heap_hot_update(page_id, 0, 1, updated.clone(), TxnId(100), TxnId(100))
+            .unwrap();
+    hot.lsn = Lsn(2_000);
+
+    let clog = NoOpClogAccessor;
+    let mut att = ActiveXactTable::new();
+    let mut dpt = DirtyPageTable::new();
+    let insert_handler = HeapInsertHandler;
+    let hot_handler = HeapHotUpdateHandler;
+
+    {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
+        let mut ctx = RedoContext {
+            buffer_pool: Some(engine.buffer_pool()),
+            page_allocator: engine.page_allocator(),
+            clog: &clog,
+            att: &mut att,
+            dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
+        };
+        insert_handler.apply(&insert, &mut ctx).unwrap();
+    }
+    // Replay the HOT update ten times (crash mid-recovery reruns prefixes).
+    for _ in 0..10 {
+        let mut incomplete_splits = IncompleteSplitTracker::new();
+        let mut ctx = RedoContext {
+            buffer_pool: Some(engine.buffer_pool()),
+            page_allocator: engine.page_allocator(),
+            clog: &clog,
+            att: &mut att,
+            dpt: &mut dpt,
+            incomplete_splits: &mut incomplete_splits,
+        };
+        hot_handler.apply(&hot, &mut ctx).unwrap();
+    }
+
+    let guard = engine.buffer_pool().pin(page_id).unwrap();
+    let page: &[u8; PAGE_SIZE] = guard.page().try_into().unwrap();
+    assert_eq!(page_pd_lsn(page), Lsn(2_000));
+    assert_eq!(SlottedPage::slot_count(page), 2, "no double-append");
+    assert_eq!(
+        SlottedPage::tuple(page, 1).unwrap(),
+        Some(updated.as_slice())
+    );
+    // The old version carries the chain link exactly once.
+    let old = SlottedPage::tuple(page, 0).unwrap().unwrap();
+    let old_header = TupleHeader::read_from(&old[..pg_am_heap::tuple::TUPLE_HEADER_SIZE]).unwrap();
+    assert!(
+        old_header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0,
+        "old tuple must carry HEAP_HOT_UPDATED"
+    );
+    assert_eq!(
+        old_header.t_ctid,
+        Tid {
+            page_id,
+            slot_id: 1
+        }
     );
 }

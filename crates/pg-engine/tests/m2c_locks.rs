@@ -684,3 +684,230 @@ fn cross_page_update_under_contention() {
     assert_eq!(v, (THREADS * PER_THREAD) as i32, "lost update on cross-page path");
     engine.shutdown();
 }
+
+/// H5 (post-Stage-S review): share/share coexistence. Two transactions hold
+/// FOR SHARE on the same row at the same time — pre-H5 the second locker
+/// blocked on the first's stamp (shared locks conflicted like exclusive
+/// ones, producing waits and false deadlocks PG wouldn't have); now both
+/// proceed immediately and no wait edge is ever registered.
+#[test]
+fn for_share_coexists_with_for_share() {
+    let (_tmp, engine) = open_with_counter();
+
+    let a = engine.begin_txn().unwrap();
+    let b = engine.begin_txn().unwrap();
+    let res = engine
+        .exec(Some(&a), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    assert!(matches!(res, QueryResult::Rows { .. }));
+
+    // The second FOR SHARE must NOT block: run it on a worker with a
+    // watchdog so a regression fails the test instead of hanging it.
+    let engine2 = Arc::clone(&engine);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let r = engine2.exec(Some(&b), "SELECT v FROM counter WHERE id = 1 FOR SHARE");
+        let _ = tx.send((r, b));
+    });
+    let b = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok((Ok(QueryResult::Rows { rows, .. }), b)) => {
+            assert_eq!(rows.len(), 1);
+            b
+        }
+        Ok((other, _)) => panic!("second FOR SHARE must coexist with the first, got {other:?}"),
+        Err(e) => panic!("second FOR SHARE blocked (share/share regression): {e}"),
+    };
+    assert!(
+        engine.txn_manager().wait_edges().is_empty(),
+        "share/share coexistence must never register a wait edge"
+    );
+
+    a.commit().unwrap();
+    b.commit().unwrap();
+    // Both locks died with their transactions: the row is freely writable.
+    engine.exec(None, "UPDATE counter SET v = 9 WHERE id = 1").unwrap();
+    assert_eq!(counter_value(&engine), 9);
+    engine.shutdown();
+}
+
+/// H5: a writer must wait for ALL registered share holders, not just the
+/// one named in `t_xmax`. Two transactions FOR SHARE the row; a concurrent
+/// UPDATE stays blocked after the FIRST holder commits and completes only
+/// after the second one does.
+#[test]
+fn writer_waits_for_all_share_holders() {
+    let (_tmp, engine) = open_with_counter();
+
+    let a = engine.begin_txn().unwrap();
+    let b = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&a), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    engine
+        .exec(Some(&b), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+
+    let engine2 = Arc::clone(&engine);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(engine2.exec(None, "UPDATE counter SET v = 41 WHERE id = 1"));
+    });
+    wait_until("writer's row-wait edge", || {
+        !engine.txn_manager().wait_edges().is_empty()
+    });
+
+    // The FIRST holder commits: the writer must STILL be blocked on the
+    // second (pre-H5 the stamp named only one holder, so the writer would
+    // have proceeded here).
+    a.commit().unwrap();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "writer must wait for ALL share holders, not just the first"
+    );
+
+    b.commit().unwrap();
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(_)) => {}
+        other => panic!("writer did not complete after the last holder's commit: {other:?}"),
+    }
+    assert_eq!(counter_value(&engine), 41);
+    assert!(engine.txn_manager().wait_edges().is_empty());
+    engine.shutdown();
+}
+
+/// H5: same-transaction FOR SHARE → FOR UPDATE / UPDATE upgrade. The sole
+/// share holder upgrades without waiting; with a second holder present the
+/// upgrade waits for it and proceeds after its commit. A FOR SHARE on a row
+/// the transaction already holds EXCLUSIVELY does not downgrade the stamp.
+#[test]
+fn for_share_upgrades_within_same_txn() {
+    let (_tmp, engine) = open_with_counter();
+
+    // Sole holder: upgrade to FOR UPDATE, then a real UPDATE — all inside
+    // one transaction, no waiting.
+    let t = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&t), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    engine
+        .exec(Some(&t), "SELECT v FROM counter WHERE id = 1 FOR UPDATE")
+        .unwrap();
+    // FOR SHARE on top of the exclusive lock: no downgrade, no error.
+    engine
+        .exec(Some(&t), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    let res = engine
+        .exec(Some(&t), "UPDATE counter SET v = 5 WHERE id = 1")
+        .unwrap();
+    assert!(matches!(res, QueryResult::Affected(1)));
+    t.commit().unwrap();
+    assert_eq!(counter_value(&engine), 5);
+
+    // Two holders: one holder's upgrade waits for the OTHER holder.
+    let a = engine.begin_txn().unwrap();
+    let b = engine.begin_txn().unwrap();
+    engine
+        .exec(Some(&a), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    engine
+        .exec(Some(&b), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+
+    let engine2 = Arc::clone(&engine);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let r = engine2.exec(Some(&a), "UPDATE counter SET v = 6 WHERE id = 1");
+        if r.is_ok() {
+            a.commit().unwrap();
+        } else {
+            a.abort().unwrap();
+        }
+        let _ = tx.send(r);
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the upgrade must wait for the other share holder"
+    );
+    b.commit().unwrap();
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(QueryResult::Affected(1))) => {}
+        other => panic!("upgrade did not complete after the other holder's commit: {other:?}"),
+    }
+    assert_eq!(counter_value(&engine), 6);
+    assert!(engine.txn_manager().wait_edges().is_empty());
+    engine.shutdown();
+}
+
+/// H5: mixed FOR SHARE / FOR UPDATE deadlock detection still works. Two
+/// transactions share-lock OPPOSITE rows, then both try to write: each
+/// upgrade waits for the other holder, closing a wait-for cycle that the
+/// detector breaks by aborting the younger transaction.
+#[test]
+fn for_share_upgrade_deadlock_detected() {
+    let (_tmp, engine) = open_with_counter();
+    engine.exec(None, "INSERT INTO counter VALUES (2, 2)").unwrap();
+
+    let a = engine.begin_txn().unwrap();
+    let b = engine.begin_txn().unwrap();
+    assert!(b.xid() > a.xid(), "b is the younger transaction");
+    engine
+        .exec(Some(&a), "SELECT v FROM counter WHERE id = 1 FOR SHARE")
+        .unwrap();
+    engine
+        .exec(Some(&b), "SELECT v FROM counter WHERE id = 2 FOR SHARE")
+        .unwrap();
+
+    // a attacks row 2 (waits on b's share); on success it commits.
+    let engine1 = Arc::clone(&engine);
+    let (tx_a, rx_a) = mpsc::channel();
+    thread::spawn(move || {
+        let r = engine1.exec(Some(&a), "UPDATE counter SET v = 12 WHERE id = 2");
+        match &r {
+            Ok(_) => a.commit().unwrap(),
+            Err(_) => a.abort().unwrap(),
+        }
+        let _ = tx_a.send(r);
+    });
+    wait_until("a's wait edge into b", || {
+        !engine.txn_manager().wait_edges().is_empty()
+    });
+
+    // b attacks row 1: the cycle closes here. The detector (100ms tick)
+    // must interrupt b — run it on a worker so a regression fails on a
+    // timeout instead of hanging the suite.
+    let engine2 = Arc::clone(&engine);
+    let (tx_b, rx_b) = mpsc::channel();
+    thread::spawn(move || {
+        let r = engine2.exec(Some(&b), "UPDATE counter SET v = 11 WHERE id = 1");
+        let _ = tx_b.send((r, b));
+    });
+    let (victim_result, b) = rx_b
+        .recv_timeout(Duration::from_secs(15))
+        .expect("victim's UPDATE was not interrupted within 15s");
+    assert!(
+        matches!(
+            victim_result,
+            Err(EngineError::Heap(HeapError::DeadlockVictim))
+        ),
+        "younger txn must fail with HeapError::DeadlockVictim, got {victim_result:?}"
+    );
+    b.abort().unwrap();
+
+    // The elder's blocked update now proceeds and its commit lands.
+    let elder_result = rx_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("elder's UPDATE did not complete after the victim's abort");
+    assert!(
+        matches!(elder_result, Ok(QueryResult::Affected(1))),
+        "elder's UPDATE must succeed after the victim's abort, got {elder_result:?}"
+    );
+    assert_eq!(counter_value(&engine), 0); // row 1 untouched
+    match engine.exec(None, "SELECT v FROM counter WHERE id = 2").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            assert_eq!(rows[0][0], Some(Datum::Int4(12)));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    assert!(engine.txn_manager().wait_edges().is_empty());
+    engine.shutdown();
+}

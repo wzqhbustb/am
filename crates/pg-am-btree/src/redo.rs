@@ -137,8 +137,14 @@ impl RedoHandler for BTreeSplitPrepareHandler {
     fn apply(&self, record: &WalRecord, ctx: &mut RedoContext<'_>) -> Result<()> {
         let rec = BTreeSplitPrepareRecord::decode(&record.payload)?;
         let pool = require_pool(ctx)?;
-        ctx.incomplete_splits
-            .mark_prepare(rec.left_page, rec.new_right_page, rec.level, rec.left_old_next);
+        ctx.incomplete_splits.mark_prepare(
+            rec.left_page,
+            rec.new_right_page,
+            rec.level,
+            rec.left_old_next,
+            // B8: carried into the CLR's diagnostic redo_ref_lsn at undo time.
+            record.lsn,
+        );
 
         // Right page: full re-initialization (see the module docs).
         {

@@ -338,9 +338,28 @@ impl StorageEngine {
             .collect();
 
         // Undo phase (Stage S, §11.3): finish incomplete B+Tree splits and
-        // stamp aborted XIDs in the CLOG. Runs after redo + ATT filter, before
-        // the checkpoint_lsn seed.
-        if !incomplete_splits.is_empty() || !recovered_att.is_empty() {
+        // stamp aborted XIDs in the CLOG. Runs after redo + ATT filter, BEFORE
+        // the checkpoint_lsn seed — deliberately (post-Stage-S review H4):
+        // seeding earlier would make `pin_mut` emit FPIs during undo, and an
+        // FPI stamps the page's pd_lsn with the FPI's own LSN, which is
+        // NEWER than the already-appended CLR — the CLR apply's per-page
+        // idempotency guards (page_pd_lsn < clr_lsn) would then skip the
+        // very changes the CLR owes (observed: `btree_undo_clr` H3 tests
+        // fail with "left page is past the CLR but right page never received
+        // the moved entries"). The torn-write hole this ordering leaves —
+        // a crash mid-undo-flush producing a garbage pd_lsn ≥ CLR lsn that
+        // the next recovery would skip — is instead closed by explicit
+        // pre-image FullPageImage records appended BEFORE each CLR
+        // (`emit_and_apply_clr` in pg-am-btree): FPI replay restores the
+        // pre-image unconditionally, then re-applies the CLR on top.
+        //
+        // The handlers run UNCONDITIONALLY — even
+        // with an empty tracker and ATT — because the B+Tree undo handler
+        // also scans pages for `SPLIT_INCOMPLETE` flags that redo could not
+        // see (post-Stage-S review H3: a split whose Prepare predates the
+        // checkpoint's redo start leaves no record in the replay window, but
+        // its flag is durable on the page).
+        {
             let mut undo_ctx = UndoContext {
                 buffer_pool: &buffer_pool,
                 wal_writer: &wal_writer,

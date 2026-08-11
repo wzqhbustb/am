@@ -109,6 +109,16 @@
 //! transient concurrency markers whose meaning ends with the stamper's
 //! transaction, and a stamp that survives a crash reads as an in-progress
 //! or aborted XID — never hiding the row.
+//!
+//! ## Shared locks (Stage S multixact lite; H5)
+//!
+//! A stamp with [`HEAP_XMAX_IS_SHARE`] additionally set is a FOR SHARE
+//! lock. Because `t_xmax` names only one transaction, the full holder set
+//! lives in the HeapAM's in-memory `share_locks` registry (see the field
+//! docs): additional share lockers are registered without touching the
+//! stamp, and a writer/exclusive requester waits for every live holder.
+//! The registry is as transient as the stamps themselves — consistent with
+//! locks being WAL-less.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -162,6 +172,18 @@ pub struct HeapAM {
     /// the pre-Stage-P "second-writer-errors" behavior — see the module
     /// docs' backward-compatibility section.
     row_waiter: Option<Arc<dyn RowWaiter>>,
+    /// Stage S multixact lite (post-Stage-S review H5): the in-memory
+    /// shared-row-lock holder registry, `(page_id, slot) → set of holder
+    /// XIDs`. A `HEAP_XMAX_IS_SHARE` stamp on a tuple names only ONE holder
+    /// in `t_xmax`; this set tracks the rest, which is what real
+    /// share/share coexistence needs. Row locks are WAL-less by design (see
+    /// the module docs), so an in-memory registry is consistent with that:
+    /// on crash it vanishes exactly like the lock stamps' meaning does (a
+    /// dead stamper's stamp is treated as aborted by the gate). Entries are
+    /// written under the page's write latch by the gate and pruned lazily —
+    /// a holder's transaction end does not remove it, the next gate pass on
+    /// that tuple does.
+    share_locks: Mutex<HashMap<(PageId, u16), std::collections::BTreeSet<TxnId>>>,
 }
 
 impl HeapAM {
@@ -173,6 +195,7 @@ impl HeapAM {
             pages: Mutex::new(HashMap::new()),
             extend_lock: Mutex::new(()),
             row_waiter: None,
+            share_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -476,8 +499,10 @@ impl HeapAM {
         // A real delete/update supersedes any lock-only stamp on the row
         // (e.g. `SELECT ... FOR UPDATE` followed by DELETE in the same
         // transaction): leaving LOCK_ONLY set would mask the delete from
-        // visibility checks and resurrect the row for scans.
-        header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+        // visibility checks and resurrect the row for scans. IS_SHARE (H5)
+        // goes with it — the holder registry entry was already dropped by
+        // the gate's `note_stamp_overwrite`.
+        header.t_infomask &= !(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE);
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
         Ok(())
     }
@@ -502,7 +527,7 @@ impl HeapAM {
         header.t_xmax = xmax;
         header.t_cid = curcid;
         header.t_infomask |= HEAP_UPDATED;
-        header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+        header.t_infomask &= !(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE);
         header.t_ctid = new_tid;
         header.t_infomask2 |= HEAP_HOT_UPDATED;
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
@@ -518,17 +543,33 @@ impl HeapAM {
     /// the caller already locked/deleted/updated this row version inside its
     /// own transaction and simply proceeds (never waits on itself).
     ///
-    /// `for_lock` marks the lock-only acquisition path
-    /// ([`Self::lock_tuple`]): re-stamping a row whose existing stamp is my
-    /// own REAL delete/update (not [`HEAP_XMAX_LOCK_ONLY`]) would re-add the
-    /// lock-only bit on top of a delete stamp, and the visibility mask
-    /// would then resurrect the row — so that combination is rejected and
-    /// only idempotent re-locking of my own LOCK_ONLY stamp proceeds.
-    /// Delete/update pass `false` (overwriting their own stamp is the
-    /// normal same-transaction re-write).
+    /// `request` says what the caller wants to stamp (post-Stage-S review
+    /// H5 — replaces the boolean `for_lock`):
+    ///
+    /// - [`LockRequest::Writer`] (delete/update): a REAL `t_xmax` stamp,
+    ///   which supersedes any lock. Overwriting my own stamp is the normal
+    ///   same-transaction re-write.
+    /// - [`LockRequest::Exclusive`] ([`Self::lock_tuple`], FOR UPDATE): an
+    ///   exclusive lock-only stamp. Re-stamping a row whose existing stamp
+    ///   is my own REAL delete/update (not [`HEAP_XMAX_LOCK_ONLY`]) would
+    ///   re-add the lock-only bit on top of a delete stamp, and the
+    ///   visibility mask would then resurrect the row — so that combination
+    ///   is rejected and only idempotent re-locking of my own LOCK_ONLY
+    ///   stamp proceeds.
+    /// - [`LockRequest::Shared`] ([`Self::lock_tuple_shared`], FOR SHARE): a
+    ///   shared lock-only stamp. Shared holders COEXIST (H5 multixact lite):
+    ///   the first holder stamps `t_xmax` and every holder (including the
+    ///   first) is tracked in the `share_locks` registry; additional share
+    ///   lockers are registered without touching the stamp
+    ///   ([`RowLockGate::ProceedNoStamp`]). A writer or exclusive requester
+    ///   must wait for ALL live holders — one at a time, restarting the
+    ///   protocol after each wait. A FOR SHARE → FOR UPDATE/write upgrade
+    ///   inside one transaction waits for every OTHER holder; a shared
+    ///   request on a row I already hold EXCLUSIVELY does not downgrade the
+    ///   stamp (PG keeps the stronger lock).
     ///
     /// When the verdict is [`RowLockGate::Wait`] the wait edge
-    /// (`self_xid → t_xmax`) is registered BEFORE this function returns —
+    /// (`self_xid → blocker`) is registered BEFORE this function returns —
     /// i.e. still under the latch — so the caller releasing the latch and
     /// sleeping cannot miss the blocker's commit/abort broadcast (the
     /// step-5a-before-5b ordering, see the module docs).
@@ -544,15 +585,15 @@ impl HeapAM {
     ///   transaction COMMITTED — the addressed row version is dead. A
     ///   committed LOCK_ONLY stamp is not a delete: the row stays
     ///   modifiable and the stamp is overwritten (Proceed).
-    /// - [`HeapError::InvalidArgument`] (`for_lock` only): the row already
-    ///   carries MY real delete/update stamp (see above).
+    /// - [`HeapError::InvalidArgument`] (lock requests only): the row
+    ///   already carries MY real delete/update stamp (see above).
     fn row_lock_gate(
         &self,
         page: &[u8; PAGE_SIZE],
         tid: Tid,
         self_xid: TxnId,
         clog: &dyn ClogAccessor,
-        for_lock: bool,
+        request: LockRequest,
     ) -> Result<RowLockGate> {
         let lp = SlottedPage::line_pointer(page, tid.slot_id)?;
         if lp.flags() != LpFlags::Normal {
@@ -561,16 +602,73 @@ impl HeapAM {
         let off = lp.off() as usize;
         let header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
         let xmax = header.t_xmax;
-        // Step 2 (no stamp yet) / self-conflict (my own stamp).
-        if xmax == TxnId::INVALID || xmax == self_xid {
-            if for_lock && xmax == self_xid && header.t_infomask & HEAP_XMAX_LOCK_ONLY == 0 {
-                return Err(HeapError::InvalidArgument(format!(
-                    "cannot lock {tid:?}: row version already deleted or updated by this transaction"
-                )));
+        let lock_only = header.t_infomask & HEAP_XMAX_LOCK_ONLY != 0;
+        let is_share = header.t_infomask & HEAP_XMAX_IS_SHARE != 0;
+
+        // Step 2 (no stamp yet): proceed. A shared request's fresh stamp
+        // starts a new singleton holder set; any other stamp supersedes
+        // whatever the registry held (bookkeeping in `note_stamp_overwrite`).
+        if xmax == TxnId::INVALID {
+            self.note_stamp_overwrite(tid, self_xid, request);
+            return Ok(RowLockGate::Proceed);
+        }
+
+        if xmax == self_xid {
+            // Self-conflict (my own stamp): never wait on myself.
+            if !lock_only {
+                // My own REAL delete/update stamp: re-stamping a lock on top
+                // would resurrect the row via the visibility mask (see the
+                // doc above); a writer overwriting its own stamp is the
+                // normal same-transaction re-write.
+                if request != LockRequest::Writer {
+                    return Err(HeapError::InvalidArgument(format!(
+                        "cannot lock {tid:?}: row version already deleted or updated by this transaction"
+                    )));
+                }
+                return Ok(RowLockGate::Proceed);
+            }
+            if is_share {
+                // My own SHARE stamp (H5): other holders may be registered
+                // alongside me.
+                return match request {
+                    LockRequest::Shared => {
+                        // Idempotent re-lock: make sure I am registered; the
+                        // stamp is already mine and stays unchanged.
+                        self.register_share_holder(tid, self_xid);
+                        Ok(RowLockGate::ProceedNoStamp)
+                    }
+                    LockRequest::Exclusive | LockRequest::Writer => {
+                        // FOR SHARE → FOR UPDATE / write upgrade (same txn):
+                        // wait for every OTHER live holder, one at a time.
+                        let live = self.live_share_holders(tid, xmax, clog)?;
+                        if let Some(&blocking) = live.iter().find(|&&h| h != self_xid) {
+                            self.register_wait_edge(self_xid, blocking);
+                            return Ok(RowLockGate::Wait(blocking));
+                        }
+                        // Sole holder: the upgrade proceeds; the caller's
+                        // stamp supersedes the shared one.
+                        self.note_stamp_overwrite(tid, self_xid, request);
+                        Ok(RowLockGate::Proceed)
+                    }
+                };
+            }
+            // My own EXCLUSIVE lock-only stamp. A shared request does not
+            // downgrade it (PG keeps the stronger lock); anything else is an
+            // idempotent re-stamp.
+            if request == LockRequest::Shared {
+                return Ok(RowLockGate::ProceedNoStamp);
             }
             return Ok(RowLockGate::Proceed);
         }
-        let lock_only = header.t_infomask & HEAP_XMAX_LOCK_ONLY != 0;
+
+        // Someone else's stamp.
+        if is_share {
+            // H5 multixact lite: a share stamp's `t_xmax` names only one
+            // holder; the registry holds the full set.
+            return self.share_stamp_gate(tid, self_xid, xmax, clog, request);
+        }
+
+        // Exclusive lock-only stamp or a real delete/update stamp.
         let mut state = clog.get_state(xmax);
         if matches!(state, TxnState::InProgress | TxnState::SubCommitted) {
             // Step 5a: the holder LOOKS active. `SubCommitted` (M3-reserved,
@@ -612,18 +710,180 @@ impl HeapAM {
             // overwrite it. A terminal LOCK_ONLY stamp (committed or
             // aborted) lands in the Proceed arms too — a lock is not a
             // delete, so the row stays modifiable.
-            TxnState::Aborted => Ok(RowLockGate::Proceed),
+            TxnState::Aborted => {}
             // InProgress/SubCommitted here is only reachable via the
             // crashed-stamper re-read above (a live holder took the `Wait`
             // early return; legacy mode returned already).
-            TxnState::InProgress | TxnState::SubCommitted => Ok(RowLockGate::Proceed),
-            TxnState::Committed if lock_only => Ok(RowLockGate::Proceed),
+            TxnState::InProgress | TxnState::SubCommitted => {}
+            TxnState::Committed if lock_only => {}
             // Step 3: a committed real delete/update owns this version.
             TxnState::Committed => match &self.row_waiter {
-                Some(_) => Err(HeapError::TupleConcurrentlyUpdated(tid)),
-                None => Err(HeapError::TupleNotFound(tid)), // legacy mode
+                Some(_) => return Err(HeapError::TupleConcurrentlyUpdated(tid)),
+                None => return Err(HeapError::TupleNotFound(tid)), // legacy mode
             },
         }
+        self.note_stamp_overwrite(tid, self_xid, request);
+        Ok(RowLockGate::Proceed)
+    }
+
+    /// H5 gate for a tuple carrying SOMEONE ELSE's share stamp
+    /// ([`HEAP_XMAX_IS_SHARE`]): the `share_locks` registry is authoritative
+    /// for the holder set; the stamp's `t_xmax` is always folded in as a
+    /// holder (it is the first stamper), so a registry that lost entries —
+    /// the registry is per-`HeapAM`, and nothing stops a second instance
+    /// from opening the same pages — degrades to the pre-H5 single-holder
+    /// behavior instead of falsely proceeding.
+    fn share_stamp_gate(
+        &self,
+        tid: Tid,
+        self_xid: TxnId,
+        stamp_xmax: TxnId,
+        clog: &dyn ClogAccessor,
+        request: LockRequest,
+    ) -> Result<RowLockGate> {
+        let live = self.live_share_holders(tid, stamp_xmax, clog)?;
+        if live.contains(&self_xid) {
+            // I already hold a share on this row (a later holder's fresh
+            // stamp moved `t_xmax` on): same rules as the "my own share
+            // stamp" case in `row_lock_gate`.
+            return match request {
+                LockRequest::Shared => {
+                    self.register_share_holder(tid, self_xid);
+                    Ok(RowLockGate::ProceedNoStamp)
+                }
+                LockRequest::Exclusive | LockRequest::Writer => {
+                    if let Some(&blocking) = live.iter().find(|&&h| h != self_xid) {
+                        self.register_wait_edge(self_xid, blocking);
+                        return Ok(RowLockGate::Wait(blocking));
+                    }
+                    self.note_stamp_overwrite(tid, self_xid, request);
+                    Ok(RowLockGate::Proceed)
+                }
+            };
+        }
+        match request {
+            LockRequest::Shared => {
+                if live.is_empty() {
+                    // Every previous holder ended: take a FRESH stamp (the
+                    // caller re-stamps `t_xmax` with its own XID).
+                    self.note_stamp_overwrite(tid, self_xid, request);
+                    return Ok(RowLockGate::Proceed);
+                }
+                // share/share coexistence (H5): register as an additional
+                // holder and leave the stamp unchanged — the row's `t_xmax`
+                // keeps naming the first holder, the registry now names both.
+                self.register_share_holder(tid, self_xid);
+                Ok(RowLockGate::ProceedNoStamp)
+            }
+            LockRequest::Exclusive | LockRequest::Writer => {
+                // FOR UPDATE excludes share lockers and vice versa: wait for
+                // ALL registered holders — one at a time, restarting the
+                // protocol after each wait (the next gate pass re-evaluates
+                // the remaining set).
+                if let Some(&blocking) = live.iter().next() {
+                    self.register_wait_edge(self_xid, blocking);
+                    return Ok(RowLockGate::Wait(blocking));
+                }
+                // No live holders: overwrite the stale stamp.
+                self.note_stamp_overwrite(tid, self_xid, request);
+                Ok(RowLockGate::Proceed)
+            }
+        }
+    }
+
+    /// The LIVE holders of the share lock on `tid` (H5): the registry set
+    /// ∪ {`stamp_xmax`}, pruned of ended or crashed transactions. The pruned
+    /// set is written back to the registry so dead holders cannot
+    /// accumulate (a holder's transaction end never removes it — entries
+    /// are only reconciled here, under the page latch, or dropped by
+    /// [`Self::note_stamp_overwrite`]).
+    ///
+    /// A holder is LIVE iff its CLOG entry is non-terminal AND it is still
+    /// in the active set — the same crashed-stamper rule as the main gate
+    /// (an `InProgress` CLOG read with no active-set membership means the
+    /// holder ended in the race window or crashed; either way it must never
+    /// be waited on).
+    ///
+    /// Legacy no-waiter mode keeps the pre-H5 behavior: a holder whose CLOG
+    /// entry reads `InProgress` is [`HeapError::TupleNotFound`].
+    fn live_share_holders(
+        &self,
+        tid: Tid,
+        stamp_xmax: TxnId,
+        clog: &dyn ClogAccessor,
+    ) -> Result<std::collections::BTreeSet<TxnId>> {
+        let key = (tid.page_id, tid.slot_id);
+        let mut holders = self
+            .share_locks
+            .lock()
+            .expect("share lock registry poisoned")
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        holders.insert(stamp_xmax);
+        let mut live = std::collections::BTreeSet::new();
+        for h in holders {
+            match clog.get_state(h) {
+                TxnState::Committed | TxnState::Aborted => {}
+                TxnState::InProgress | TxnState::SubCommitted => match &self.row_waiter {
+                    Some(waiter) if waiter.is_active(h) => {
+                        live.insert(h);
+                    }
+                    // Ended in the race window, or crashed: not a blocker.
+                    Some(_) => {}
+                    None => return Err(HeapError::TupleNotFound(tid)), // legacy mode
+                },
+            }
+        }
+        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        if live.is_empty() {
+            map.remove(&key);
+        } else {
+            map.insert(key, live.clone());
+        }
+        Ok(live)
+    }
+
+    /// Registry bookkeeping for a gate [`RowLockGate::Proceed`] that the
+    /// caller will follow by OVERWRITING the tuple's stamp (H5): a fresh
+    /// shared stamp starts a new singleton holder set; an exclusive lock or
+    /// a real delete/update retires the set (the stamp alone is
+    /// authoritative again).
+    fn note_stamp_overwrite(&self, tid: Tid, self_xid: TxnId, request: LockRequest) {
+        let key = (tid.page_id, tid.slot_id);
+        let mut map = self.share_locks.lock().expect("share lock registry poisoned");
+        match request {
+            LockRequest::Shared => {
+                map.insert(key, std::collections::BTreeSet::from([self_xid]));
+            }
+            LockRequest::Exclusive | LockRequest::Writer => {
+                map.remove(&key);
+            }
+        }
+    }
+
+    /// Register `xid` as an additional share holder of `tid` (H5). Runs
+    /// under the caller's page latch, so it cannot interleave with another
+    /// gate pass on the same tuple.
+    fn register_share_holder(&self, tid: Tid, xid: TxnId) {
+        self.share_locks
+            .lock()
+            .expect("share lock registry poisoned")
+            .entry((tid.page_id, tid.slot_id))
+            .or_default()
+            .insert(xid);
+    }
+
+    /// Register the §9.1 step-5a wait edge `self_xid → blocking` (still
+    /// under the caller's page latch). Only called on paths where a waiter
+    /// is installed — H5 share waits are unreachable in legacy mode because
+    /// `live_share_holders` errors out first.
+    fn register_wait_edge(&self, self_xid: TxnId, blocking: TxnId) {
+        let waiter = self
+            .row_waiter
+            .as_ref()
+            .expect("H5 share-lock wait requires a row waiter");
+        waiter.register_row_wait(self_xid, blocking);
     }
 
     /// §9.1 steps 5b–5c: block until `blocking_xid` ends. The caller must
@@ -702,13 +962,16 @@ impl HeapAM {
             let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
             let gate = {
                 let page = as_page_mut(&mut guard);
-                self.row_lock_gate(page, tid, self_xid, clog, true)?
+                self.row_lock_gate(page, tid, self_xid, clog, LockRequest::Exclusive)?
             };
             match gate {
                 RowLockGate::Proceed => {
                     let page = as_page_mut(&mut guard);
                     Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, false)?;
                     return Ok(());
+                }
+                RowLockGate::ProceedNoStamp => {
+                    unreachable!("exclusive lock requests never coalesce with share holders")
                 }
                 RowLockGate::Wait(blocking) => {
                     // Step 5b: release the latch BEFORE sleeping (the edge
@@ -721,9 +984,15 @@ impl HeapAM {
         }
     }
 
-    /// Stamp a shared row lock (FOR SHARE, Stage S multixact lite). Identical
-    /// to [`lock_tuple`](fn.lock_tuple.html) but sets [`HEAP_XMAX_IS_SHARE`]
-    /// alongside [`HEAP_XMAX_LOCK_ONLY`]. The row stays visible to all
+    /// Stamp a shared row lock (FOR SHARE, Stage S multixact lite; real
+    /// share/share coexistence since post-Stage-S review H5). Like
+    /// [`lock_tuple`](fn.lock_tuple.html) but the stamp carries
+    /// [`HEAP_XMAX_IS_SHARE`] alongside [`HEAP_XMAX_LOCK_ONLY`], and — the
+    /// H5 difference — additional share lockers COEXIST: the first holder's
+    /// XID stays in `t_xmax` while every holder is tracked in the
+    /// `share_locks` registry. A writer or FOR UPDATE requester waits for
+    /// ALL live holders; a same-transaction FOR SHARE → FOR UPDATE/write
+    /// upgrade waits for every OTHER holder. The row stays visible to all
     /// snapshots — a shared lock is not a delete.
     pub fn lock_tuple_shared(
         &self,
@@ -746,12 +1015,22 @@ impl HeapAM {
             let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
             let gate = {
                 let page = as_page_mut(&mut guard);
-                self.row_lock_gate(page, tid, self_xid, clog, true)?
+                self.row_lock_gate(page, tid, self_xid, clog, LockRequest::Shared)?
             };
             match gate {
                 RowLockGate::Proceed => {
+                    // Fresh stamp: no live holders remain, so `t_xmax`
+                    // becomes mine and the gate reset the holder registry
+                    // to just me.
                     let page = as_page_mut(&mut guard);
                     Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, true)?;
+                    return Ok(());
+                }
+                RowLockGate::ProceedNoStamp => {
+                    // share/share coexistence (H5): registered as an
+                    // additional holder; the stamp names the first holder
+                    // and stays unchanged. Also the no-downgrade path for a
+                    // row I already hold exclusively.
                     return Ok(());
                 }
                 RowLockGate::Wait(blocking) => {
@@ -797,6 +1076,12 @@ impl HeapAM {
         header.t_infomask |= HEAP_XMAX_LOCK_ONLY;
         if shared {
             header.t_infomask |= HEAP_XMAX_IS_SHARE;
+        } else {
+            // An exclusive stamp supersedes a shared one (same-transaction
+            // FOR SHARE → FOR UPDATE upgrade, H5): leave no stale IS_SHARE
+            // bit behind, or the gate would keep consulting the holder
+            // registry the upgrade already discarded.
+            header.t_infomask &= !HEAP_XMAX_IS_SHARE;
         }
         header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
         Ok(())
@@ -807,10 +1092,31 @@ impl HeapAM {
 enum RowLockGate {
     /// The caller may stamp the tuple now, still under the page latch.
     Proceed,
-    /// `t_xmax` names a still-active OTHER transaction; the wait edge is
-    /// registered. The caller drops every latch, blocks in `wait_for`, and
-    /// restarts the protocol from step 1.
+    /// Shared-lock coexistence (post-Stage-S review H5): the caller is
+    /// registered as an additional share holder and the tuple stamp stays
+    /// unchanged, so the caller must NOT re-stamp. Only produced for
+    /// [`LockRequest::Shared`]; writers and exclusive lockers never see it.
+    ProceedNoStamp,
+    /// `t_xmax` (or a registered share holder) names a still-active OTHER
+    /// transaction; the wait edge is registered. The caller drops every
+    /// latch, blocks in `wait_for`, and restarts the protocol from step 1.
     Wait(TxnId),
+}
+
+/// What a [`HeapAM::row_lock_gate`] caller wants to do with the tuple once
+/// the gate lets it through (post-Stage-S review H5 — replaces the Stage P
+/// boolean `for_lock`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LockRequest {
+    /// Delete or update: stamps a REAL `t_xmax` (supersedes any lock stamp).
+    Writer,
+    /// `SELECT ... FOR UPDATE` ([`HeapAM::lock_tuple`]): exclusive lock-only
+    /// stamp. Excludes share holders and is excluded by them.
+    Exclusive,
+    /// `SELECT ... FOR SHARE` ([`HeapAM::lock_tuple_shared`]): shared
+    /// lock-only stamp. Coexists with other share holders (H5 multixact
+    /// lite); excluded by writers/exclusive lockers.
+    Shared,
 }
 
 /// The `t_xmax` a visibility judgment should see: a [`HEAP_XMAX_LOCK_ONLY`]
@@ -823,6 +1129,117 @@ fn visibility_xmax(header: &TupleHeader) -> TxnId {
     } else {
         header.t_xmax
     }
+}
+
+/// Follow a HOT chain forward from an invisible version (Stage S; the single
+/// shared forward follower, post-Stage-S review H1): walk `t_ctid` links
+/// starting at `start` until a version visible under `snapshot` is found and
+/// return its TID, or `Ok(None)` when the chain ends without one.
+///
+/// The caller MUST already hold the chain page's pin (read or write): a HOT
+/// chain never leaves its page (`HEAP_HOT_UPDATED` is only stamped by the
+/// same-page fast path), and re-pinning here would be a recursive latch
+/// acquisition, which deadlocks as soon as a writer queues (see
+/// docs/stage_spec.md Stage S, 设计理由 6). A `t_ctid` pointing off-page is
+/// corruption and ends the walk.
+///
+/// The walk runs to the chain END, bounded by the page's slot count as the
+/// cycle guard: a well-formed chain terminates (`t_ctid == self`, or a
+/// version without `HEAP_HOT_UPDATED`) within that many hops, so exhausting
+/// the bound means a cycle — reported loudly as [`HeapError::Corrupted`].
+/// (The pre-H1 hardcoded 8-hop cap silently dropped every version beyond the
+/// eighth from scans and index lookups; in a vacuum-less system chains only
+/// grow.)
+pub fn follow_hot_chain(
+    page: &[u8; PAGE_SIZE],
+    page_id: PageId,
+    start: Tid,
+    snapshot: &Snapshot,
+    clog: &dyn ClogAccessor,
+) -> Result<Option<Tid>> {
+    let slot_count = SlottedPage::slot_count(page) as u16;
+    let mut chain_tid = start;
+    for _ in 0..slot_count {
+        if chain_tid.page_id != page_id {
+            return Ok(None);
+        }
+        let Some(bytes) = SlottedPage::tuple(page, chain_tid.slot_id)? else {
+            return Ok(None);
+        };
+        let header = TupleHeader::read_from(&bytes[..TUPLE_HEADER_SIZE])?;
+        if is_visible(
+            header.t_xmin,
+            visibility_xmax(&header),
+            header.t_cid,
+            snapshot,
+            clog,
+        ) {
+            return Ok(Some(chain_tid));
+        }
+        if header.t_infomask2 & HEAP_HOT_UPDATED != 0 && header.t_ctid != chain_tid {
+            chain_tid = header.t_ctid;
+        } else {
+            return Ok(None);
+        }
+    }
+    Err(HeapError::Corrupted(format!(
+        "HOT chain on page {page_id} exceeds {slot_count} hops (cycle?)"
+    )))
+}
+
+/// The TID that owns `tid`'s index entries (Stage S; the single shared
+/// reverse follower, post-Stage-S review H1/B6).
+///
+/// A `HEAP_ONLY_TUPLE` version was created without index entries of its own —
+/// that is the whole point of HOT — so index maintenance for such a version
+/// must act on its chain root: the nearest ancestor version that is not
+/// `HEAP_ONLY_TUPLE`. HOT chains never leave their page, so the root is found
+/// by walking `t_ctid` links backwards. Every version in a HOT chain shares
+/// the same indexed columns, so the root's entry carries exactly the key the
+/// caller read back from `tid`. The caller MUST hold the page's pin.
+///
+/// The walk builds the page's `t_ctid → slot` map ONCE (B6: the naive
+/// per-hop full slot scan is O(slots²) on deep chains) and is bounded by the
+/// slot count; exhausting the bound means a cycle — [`HeapError::Corrupted`].
+/// A `HEAP_ONLY` tuple with no predecessor link on the page is itself the
+/// root candidate (returned as-is), matching the pre-H1 engine behavior.
+pub fn hot_chain_root(page: &[u8; PAGE_SIZE], page_id: PageId, tid: Tid) -> Result<Tid> {
+    let slot_count = SlottedPage::slot_count(page) as u16;
+    // Forward links of the whole page, built once: t_ctid → slot for every
+    // HOT_UPDATED tuple (B6).
+    let mut links: HashMap<Tid, u16> = HashMap::new();
+    for slot in 0..slot_count {
+        let Some(bytes) = SlottedPage::tuple(page, slot)? else {
+            continue;
+        };
+        let header = TupleHeader::read_from(&bytes[..TUPLE_HEADER_SIZE])?;
+        if header.t_infomask2 & HEAP_HOT_UPDATED != 0 {
+            links.insert(header.t_ctid, slot);
+        }
+    }
+
+    let mut cur = tid;
+    for _ in 0..slot_count {
+        let Some(bytes) = SlottedPage::tuple(page, cur.slot_id)? else {
+            return Ok(cur);
+        };
+        let header = TupleHeader::read_from(&bytes[..TUPLE_HEADER_SIZE])?;
+        if header.t_infomask2 & HEAP_ONLY_TUPLE == 0 {
+            return Ok(cur);
+        }
+        match links.get(&cur) {
+            Some(&slot) => {
+                cur = Tid {
+                    page_id,
+                    slot_id: slot,
+                };
+            }
+            None => return Ok(cur),
+        }
+    }
+    Err(HeapError::Corrupted(format!(
+        "HOT chain root search on page {page_id} exceeds {slot_count} hops (cycle?)"
+    )))
 }
 
 impl AccessMethod for HeapAM {
@@ -911,37 +1328,18 @@ impl AccessMethod for HeapAM {
                 {
                     // HOT chain: old version is invisible but t_ctid may
                     // point to a newer version visible to this snapshot.
-                    // The whole walk reads the page pinned above: a HOT chain
-                    // never leaves its page, and re-pinning it here would be a
-                    // recursive read latch, which deadlocks as soon as a
-                    // writer queues between the two acquisitions.
-                    let mut chain_tid = header.t_ctid;
-                    for _ in 0..8 {
-                        if chain_tid.page_id != page_id {
-                            break;
-                        }
-                        let Some(chain_bytes) = SlottedPage::tuple(page, chain_tid.slot_id)? else {
-                            break;
-                        };
-                        let (chain_header, chain_values) =
-                            decode_tuple(chain_bytes, ctx.rel.columns)?;
-                        if is_visible(
-                            chain_header.t_xmin,
-                            visibility_xmax(&chain_header),
-                            chain_header.t_cid,
-                            ctx.snapshot,
-                            clog,
-                        ) {
-                            out.push((chain_tid, chain_values));
-                            break;
-                        }
-                        if chain_header.t_infomask2 & HEAP_HOT_UPDATED != 0
-                            && chain_header.t_ctid != chain_tid
-                        {
-                            chain_tid = chain_header.t_ctid;
-                        } else {
-                            break;
-                        }
+                    // The walk reads the page pinned above (HOT chains never
+                    // leave their page; re-pinning here would be a recursive
+                    // read latch, which deadlocks as soon as a writer queues
+                    // between the two acquisitions) and runs to the chain
+                    // end, slot-count bounded — see `follow_hot_chain`.
+                    if let Some(visible_tid) =
+                        follow_hot_chain(page, page_id, header.t_ctid, ctx.snapshot, clog)?
+                    {
+                        let chain_bytes = SlottedPage::tuple(page, visible_tid.slot_id)?
+                            .expect("follow_hot_chain only returns readable slots");
+                        let (_, chain_values) = decode_tuple(chain_bytes, ctx.rel.columns)?;
+                        out.push((visible_tid, chain_values));
                     }
                 }
             }
@@ -969,7 +1367,7 @@ impl AccessMethod for HeapAM {
             let mut guard = self.buffer_pool.pin_mut(tid.page_id)?;
             let gate = {
                 let page = as_page_mut(&mut guard);
-                self.row_lock_gate(page, tid, xmax, ctx.clog, false)?
+                self.row_lock_gate(page, tid, xmax, ctx.clog, LockRequest::Writer)?
             };
             if let RowLockGate::Wait(blocking) = gate {
                 // Step 5b/5c: release the latch BEFORE sleeping (the edge
@@ -979,6 +1377,10 @@ impl AccessMethod for HeapAM {
                 self.wait_row_lock(xmax, blocking)?;
                 continue;
             }
+            debug_assert!(
+                matches!(gate, RowLockGate::Proceed),
+                "writer gates never coalesce with share holders"
+            );
 
             let page = as_page_mut(&mut guard);
             // Validate-then-WAL discipline is unchanged (the gate ran first):
@@ -1039,13 +1441,17 @@ impl UpdatableAM for HeapAM {
             let mut old_guard = self.buffer_pool.pin_mut(old_tid.page_id)?;
             let gate = {
                 let old_page = as_page_mut(&mut old_guard);
-                self.row_lock_gate(old_page, old_tid, xmax, clog, false)?
+                self.row_lock_gate(old_page, old_tid, xmax, clog, LockRequest::Writer)?
             };
             if let RowLockGate::Wait(blocking) = gate {
                 drop(old_guard);
                 self.wait_row_lock(xmax, blocking)?;
                 continue;
             }
+            debug_assert!(
+                matches!(gate, RowLockGate::Proceed),
+                "writer gates never coalesce with share holders"
+            );
             let old_has_room = {
                 let old_page = as_page_mut(&mut old_guard);
                 SlottedPage::free_space(old_page) >= needed
@@ -1146,7 +1552,7 @@ impl UpdatableAM for HeapAM {
             // count.
             let gate = {
                 let old_page = as_page_mut(&mut old_guard);
-                self.row_lock_gate(old_page, old_tid, xmax, clog, false)?
+                self.row_lock_gate(old_page, old_tid, xmax, clog, LockRequest::Writer)?
             };
             if let RowLockGate::Wait(blocking) = gate {
                 // Sleep holding NO latch: drop the new page's guard too — a
@@ -1156,6 +1562,10 @@ impl UpdatableAM for HeapAM {
                 self.wait_row_lock(xmax, blocking)?;
                 continue;
             }
+            debug_assert!(
+                matches!(gate, RowLockGate::Proceed),
+                "writer gates never coalesce with share holders"
+            );
 
             // The new slot is computed only now, under the final latching:
             // in the re-ordered acquisition above the new page may have been

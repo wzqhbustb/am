@@ -205,6 +205,39 @@ thread_local! {
     /// builds carry no injection surface. Never set outside tests.
     #[doc(hidden)]
     pub static SPLIT_ALLOC_FAILURES: Cell<usize> = const { Cell::new(0) };
+
+    /// Test hook (post-Stage-S review C2, `test-hooks` feature): while
+    /// nonzero **in the current thread**, the undo cascade
+    /// ([`ensure_downlink_slot`]) fails right after one parent-split CLR has
+    /// completed — one failure per count — simulating a crash mid-cascade so
+    /// tests can verify the next recovery re-derives and finishes the
+    /// remaining work. Thread-local for the same reason as
+    /// [`SPLIT_ALLOC_FAILURES`]; recovery runs on the thread that opened the
+    /// engine, so arming it from a test thread works. Never set outside
+    /// tests.
+    #[doc(hidden)]
+    pub static UNDO_CASCADE_FAILURES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Consume one injected undo-cascade failure (see [`UNDO_CASCADE_FAILURES`]);
+/// returns an error when the hook fired. Compiled only under `test-hooks`.
+#[cfg(feature = "test-hooks")]
+fn undo_cascade_failure_hook() -> Result<()> {
+    let injected = UNDO_CASCADE_FAILURES.with(|failures| {
+        let remaining = failures.get();
+        if remaining > 0 {
+            failures.set(remaining - 1);
+            true
+        } else {
+            false
+        }
+    });
+    if injected {
+        return Err(BTreeError::Storage(StorageError::InvalidOperation(
+            "injected undo cascade failure (test hook)".to_string(),
+        )));
+    }
+    Ok(())
 }
 
 /// Outcome of one pessimistic insert pass (see [`BTreeIndex::insert_pessimistic`]).
@@ -2231,7 +2264,7 @@ fn as_page_mut<'g>(guard: &'g mut PageGuardMut<'_>) -> &'g mut [u8; PAGE_SIZE] {
 /// stamp its `pd_lsn` — the durability anchor for page initialization (same
 /// pattern as the heap's `log_page_init`).
 pub(crate) fn log_page_init(
-    wal_writer: &Arc<WalWriter>,
+    wal_writer: &WalWriter,
     page_id: PageId,
     page: &mut [u8; PAGE_SIZE],
 ) -> Result<()> {
@@ -2258,12 +2291,76 @@ pub(crate) struct SplitToFinish {
     pub prepare_lsn: Lsn,
 }
 
+/// How an incomplete split is finished, decided from the **current page
+/// states** — never from the left page's slot count alone (post-Stage-S
+/// review C1). The Copy→Commit window is observable online (the leaf latch
+/// is dropped before the Commit walks the path), so by crash time the WAL
+/// may carry, after the Copy record, the pending `BTreeInsert` (≈50% of
+/// online splits land it in the LEFT half) and/or `BTreeDelete`s from
+/// concurrent transactions (the delete path right-hops onto the uncommitted
+/// twin and never checks `SPLIT_INCOMPLETE`). After redo converges, the
+/// right page's content — not the left page's slot count — says which state
+/// the split is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitFinishPlan {
+    /// The right page never held entries (`pd_upper == pd_special`): Copy
+    /// was never applied. Move `left[copy_start_slot..]` right, exactly like
+    /// the online Copy. (Deletes cannot precede Copy online — one latch
+    /// spans Prepare→Copy — so the left page still holds the moved set.)
+    Move,
+    /// The right page holds entries: Copy was applied (and redone) before
+    /// the crash. Never move again — appending `left[copy_start_slot..]` to
+    /// the right page's END would corrupt its sort order when a pending
+    /// insert landed left, and resurrect entries deleted from the right
+    /// page in-window. The separator is the right page's first entry key,
+    /// the same key the online Commit computes (`first_entry_bytes(right)`).
+    NoMove,
+    /// The right page held entries but is empty now (tuple bytes carved,
+    /// then all removed by in-window deletes). There is nothing to move and
+    /// no first entry to anchor a separator on, so completing the split is
+    /// impossible; instead the split is *abandoned*: splice the empty right
+    /// page out of the sibling chain (`left.next = right.next`) and clear
+    /// `SPLIT_INCOMPLETE`, keeping the left page (and its ROOT flag, for a
+    /// root split) intact. The orphan page leaks — reclaimed by no one,
+    /// corrupting nothing. No downlink is inserted; the CLR carries
+    /// `INVALID` for parent/new_root/meta, which `apply_split_clr` reads as
+    /// the unlink plan.
+    Unlink,
+}
+
+/// True if the page never held a tuple since its (re-)initialization:
+/// `pd_upper` still equals `pd_special` — no tuple bytes were ever carved
+/// out of the data area. A page that held entries and lost them all to
+/// physical deletes keeps `pd_upper < pd_special` (deletes shrink only the
+/// LP array), which is how the undo path tells "Copy never ran" apart from
+/// "Copy ran but the whole right half was deleted in-window" without needing
+/// any LSN bookkeeping.
+fn page_never_had_entries(page: &[u8; PAGE_SIZE]) -> bool {
+    let header = SlottedPage::header(page);
+    header.pd_upper == header.pd_special
+}
+
+/// A `BTreeSplitCLR` with no downlink target at all is the unlink plan (see
+/// [`SplitFinishPlan::Unlink`]). Every other CLR has either a parent page
+/// (non-root split) or a new root + meta page (root split).
+fn clr_is_unlink(rec: &BTreeSplitCLRRecord) -> bool {
+    rec.parent_page == PageId::INVALID
+        && rec.new_root_page == PageId::INVALID
+        && rec.meta_page == PageId::INVALID
+}
+
 /// Finish an incomplete B+Tree split during ARIES undo (Stage S, §11.3).
 ///
 /// Called for each split that reached Prepare (and optionally Copy) but never
 /// Commit. Applies the copy, installs the downlink, clears `SPLIT_INCOMPLETE`,
 /// updates the meta page for root splits, and emits a `BTreeSplitCLR` so the
 /// result survives a crash during or after undo.
+///
+/// If the parent has no room for the downlink, the parent is split first —
+/// recursively up to and including the root — via [`split_page_in_undo`]
+/// (post-Stage-S review C2: recovery is single-threaded, so each cascade
+/// level is completed directly by its own CLR; every cascade prefix
+/// re-converges on the next recovery).
 pub(crate) fn finish_incomplete_split(
     pool: &BufferPool,
     wal_writer: &WalWriter,
@@ -2277,52 +2374,77 @@ pub(crate) fn finish_incomplete_split(
         copy_start_slot,
         prepare_lsn,
     } = split;
-    // Phase 1: gather everything the CLR payload needs without touching a
-    // single page byte. Logging before applying is what makes a crash inside
-    // undo recoverable: a half-applied split with no CLR in the WAL would be
-    // finished a second time by the next undo pass.
-    let (separator_key, is_root_split) = {
+    // Phase 1: decide the finish plan and gather everything the CLR payload
+    // needs without touching a single page byte. Logging before applying is
+    // what makes a crash inside undo recoverable: a half-applied split with
+    // no CLR in the WAL would be finished a second time by the next undo
+    // pass.
+    let (plan, separator_key, is_root_split) = {
         let left_guard = pool.pin(left_page_id)?;
         let left: &[u8; PAGE_SIZE] = left_guard.page().try_into().expect("frame is PAGE_SIZE");
+        let right_guard = pool.pin(right_page_id)?;
+        let right: &[u8; PAGE_SIZE] = right_guard.page().try_into().expect("frame is PAGE_SIZE");
         let is_root_split = BtreePage::flags(left)? & BTREE_FLAG_ROOT != 0;
-        // The copy may already have been redone, in which case the moved
-        // entries live on the right page and the left page ends exactly at
-        // `copy_start_slot`.
-        let bytes = if (SlottedPage::slot_count(left) as u16) > copy_start_slot {
-            entry_bytes(left, copy_start_slot)?.to_vec()
-        } else {
-            let right_guard = pool.pin(right_page_id)?;
-            let right: &[u8; PAGE_SIZE] =
-                right_guard.page().try_into().expect("frame is PAGE_SIZE");
-            if SlottedPage::slot_count(right) == 0 {
-                return Err(BTreeError::Corrupted(
-                    "incomplete split has no entries to move on either page".into(),
-                ));
+        let (plan, key) = if SlottedPage::slot_count(right) > 0 {
+            // Copy already applied: the separator is the right page's first
+            // entry key (same as the online Commit). Note the left page may
+            // hold MORE than `copy_start_slot` entries here (a pending
+            // insert that landed left) or FEWER (in-window deletes) — both
+            // are fine, the apply path never counts slots on the left page.
+            let key = entry_key(entry_bytes(right, 0)?, level)?.to_vec();
+            (SplitFinishPlan::NoMove, key)
+        } else if page_never_had_entries(right) {
+            // Copy never ran: the entries to move are still on the left
+            // page, and the separator is the first of them.
+            let count = SlottedPage::slot_count(left) as u16;
+            if copy_start_slot >= count {
+                return Err(BTreeError::Corrupted(format!(
+                    "incomplete split of page {left_page_id}: copy_start_slot \
+                     {copy_start_slot} outside slot count {count} with a \
+                     never-written right page"
+                )));
             }
-            entry_bytes(right, 0)?.to_vec()
-        };
-        let key = if level == 0 {
-            page::decode_leaf_entry(&bytes)?.0.to_vec()
+            let key = entry_key(entry_bytes(left, copy_start_slot)?, level)?.to_vec();
+            (SplitFinishPlan::Move, key)
         } else {
-            page::decode_internal_entry(&bytes)?.0.to_vec()
+            // Right page held entries and is empty now: the whole right half
+            // was deleted in the Copy→Commit window. Abandon the split.
+            (SplitFinishPlan::Unlink, Vec::new())
         };
-        (key, is_root_split)
+        (plan, key, is_root_split)
     };
 
-    let (parent_page, new_root_page, meta_page, parent_insert_slot) = if is_root_split {
-        // Reserve the new root page id; its content is written in phase 3.
-        // `new_page` logs its own PageAlloc, so recovery re-reserves the id.
-        let new_root_id = pool.new_page()?.page_id();
-        let mp = find_meta_page_for_root(pool, page_allocator, left_page_id)?;
-        (PageId::INVALID, new_root_id, mp, 1u16)
-    } else {
-        let parent = find_parent_page(pool, page_allocator, left_page_id, level)?;
-        let slot = {
-            let guard = pool.pin(parent)?;
-            let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
-            internal_lower_bound(page, &separator_key, right_page_id)? as u16
-        };
-        (parent, PageId::INVALID, PageId::INVALID, slot)
+    let (parent_page, new_root_page, meta_page, parent_insert_slot) = match plan {
+        SplitFinishPlan::Unlink => (
+            PageId::INVALID,
+            PageId::INVALID,
+            PageId::INVALID,
+            0,
+        ),
+        _ if is_root_split => {
+            // Reserve the new root page id; its content is written by the
+            // apply. `new_page` logs its own PageAlloc, so recovery
+            // re-reserves the id.
+            let new_root_id = pool.new_page()?.page_id();
+            let mp = find_meta_page_for_root(pool, page_allocator, left_page_id)?;
+            (PageId::INVALID, new_root_id, mp, 1u16)
+        }
+        _ => {
+            let parent = find_parent_page(pool, page_allocator, left_page_id, level)?;
+            // C2: the parent may not have room for the downlink (the online
+            // Commit would have cascaded, but the crash happened first).
+            // Split the parent — recursively — before inserting.
+            let (target, slot) = ensure_downlink_slot(
+                pool,
+                wal_writer,
+                page_allocator,
+                parent,
+                level + 1,
+                &separator_key,
+                right_page_id,
+            )?;
+            (target, PageId::INVALID, PageId::INVALID, slot)
+        }
     };
 
     let rec = BTreeSplitCLRRecord {
@@ -2338,77 +2460,375 @@ pub(crate) fn finish_incomplete_split(
         meta_page,
     };
 
-    // Phase 2: log. The explicit flush is required because
-    // `BufferPool::flush_frame` checks `synced_lsn` against the page's pd_lsn,
-    // and phase 3 stamps pages with this LSN.
-    let clr = WalRecord::btree_split_clr(&rec)?;
+    emit_and_apply_clr(pool, wal_writer, &rec)
+}
+
+/// The outcome of splitting a page during undo (C2 cascade): everything the
+/// caller needs to place the downlink that triggered the cascade.
+struct UndoSplitOutcome {
+    /// The freshly created right half.
+    right_page: PageId,
+    /// Raw bytes of the right page's first entry; the landing-side choice
+    /// compares the pending downlink against it in full `(key, child)`
+    /// order — the same rule the online cascade uses.
+    right_first: Vec<u8>,
+}
+
+/// Resolve where the downlink `(separator_key, child)` must go during undo:
+/// `parent` itself when it has room, otherwise split `parent` first —
+/// recursively up to and including the root (C2) — and pick the half the
+/// downlink sorts into, in full `(key, child)` order like the online
+/// cascade. Returns `(page, insertion_slot)`.
+fn ensure_downlink_slot(
+    pool: &BufferPool,
+    wal_writer: &WalWriter,
+    page_allocator: &Mutex<PageAllocator>,
+    parent: PageId,
+    parent_level: u8,
+    separator_key: &[u8],
+    child: PageId,
+) -> Result<(PageId, u16)> {
+    let downlink = page::encode_internal_entry(separator_key, child);
+    let needed = downlink.len() + 4; // entry + one line pointer
+    let fits = {
+        let guard = pool.pin(parent)?;
+        SlottedPage::free_space(as_page(&guard)) >= needed
+    };
+    let target = if fits {
+        parent
+    } else {
+        let outcome = split_page_in_undo(
+            pool,
+            wal_writer,
+            page_allocator,
+            parent,
+            parent_level,
+            Some(&downlink),
+        )?;
+        // Crash-injection hook (`test-hooks` only): simulate a crash right
+        // after a cascade level completed — its CLR is durable, the split
+        // that triggered the cascade is not finished yet.
+        #[cfg(feature = "test-hooks")]
+        undo_cascade_failure_hook()?;
+        if entry_cmp(&downlink, &outcome.right_first, false)? != Ordering::Less {
+            outcome.right_page
+        } else {
+            parent
+        }
+    };
+    let slot = {
+        let guard = pool.pin(target)?;
+        internal_lower_bound(as_page(&guard), separator_key, child)? as u16
+    };
+    Ok((target, slot))
+}
+
+/// Complete a FRESH split of `left_page` during undo (C2 cascade): the
+/// downlink insertion of another split's finish found `left_page` without
+/// room. Unlike [`finish_incomplete_split`] there is no Prepare/Copy in the
+/// WAL for this split — the entire split (right-page creation and sibling
+/// link, entry move, downlink, root promotion) is captured by one
+/// `BTreeSplitCLR`; the apply path establishes the sibling links itself, so
+/// the record alone suffices to redo it.
+///
+/// Crash safety at every intermediate state: the right page's
+/// initialization is FPI-logged before the CLR (the allocator may hand a
+/// recycled page whose on-disk bytes are a previous tenant's — the same
+/// hazard `create_new_root` guards against), the CLR is WAL-flushed before
+/// any page it touches, and each completed cascade level is fully flushed
+/// before the next starts. A crash mid-cascade replays the completed CLRs
+/// as pd_lsn-guarded no-ops and re-runs the original incomplete split's
+/// finish, which re-derives its downlink target from the post-cascade
+/// pages.
+fn split_page_in_undo(
+    pool: &BufferPool,
+    wal_writer: &WalWriter,
+    page_allocator: &Mutex<PageAllocator>,
+    left_page: PageId,
+    level: u8,
+    pending: Option<&[u8]>,
+) -> Result<UndoSplitOutcome> {
+    let (copy_start_slot, is_root_split, old_next) = {
+        let guard = pool.pin(left_page)?;
+        let page = as_page(&guard);
+        let flags = BtreePage::flags(page)?;
+        if flags & BTREE_FLAG_SPLIT_INCOMPLETE != 0 {
+            // The undo pass finishes higher-level incomplete splits first,
+            // so reaching a flagged page here means detection missed one —
+            // splitting it again would orphan its uncommitted right twin
+            // (the exact hazard `split_prepare` refuses online). Loud, never
+            // silent.
+            return Err(BTreeError::Corrupted(format!(
+                "undo cascade: page {left_page} is itself SPLIT_INCOMPLETE"
+            )));
+        }
+        (
+            choose_split_slot(page, level, pending)?,
+            flags & BTREE_FLAG_ROOT != 0,
+            BtreePage::next(page)?,
+        )
+    };
+
+    // Right page: allocate, initialize, and make the initialization durable
+    // with a post-image FPI.
+    let right_page = {
+        let mut guard = pool.new_page()?;
+        let page_id = guard.page_id();
+        {
+            let page = as_page_mut(&mut guard);
+            BtreePage::init_right_page(page, left_page, old_next, level);
+        }
+        log_page_init(wal_writer, page_id, as_page_mut(&mut guard))?;
+        page_id
+    };
+
+    let right_first = {
+        let guard = pool.pin(left_page)?;
+        entry_bytes(as_page(&guard), copy_start_slot)?.to_vec()
+    };
+    let separator_key = entry_key(&right_first, level)?.to_vec();
+
+    let (parent_page, new_root_page, meta_page, parent_insert_slot) = if is_root_split {
+        // Reserve the new root page id; `apply_split_clr` writes its content
+        // (a full re-initialization, so no FPI is needed for it).
+        let new_root_id = pool.new_page()?.page_id();
+        let mp = find_meta_page_for_root(pool, page_allocator, left_page)?;
+        (PageId::INVALID, new_root_id, mp, 1u16)
+    } else {
+        let parent = find_parent_page(pool, page_allocator, left_page, level)?;
+        let (target, slot) = ensure_downlink_slot(
+            pool,
+            wal_writer,
+            page_allocator,
+            parent,
+            level + 1,
+            &separator_key,
+            right_page,
+        )?;
+        (target, PageId::INVALID, PageId::INVALID, slot)
+    };
+
+    let rec = BTreeSplitCLRRecord {
+        left_page,
+        right_page,
+        level,
+        copy_start_slot,
+        // No Prepare record exists for this split; the field is diagnostic.
+        redo_ref_lsn: Lsn::INVALID,
+        parent_page,
+        separator_key,
+        parent_insert_slot,
+        new_root_page,
+        meta_page,
+    };
+    emit_and_apply_clr(pool, wal_writer, &rec)?;
+    Ok(UndoSplitOutcome {
+        right_page,
+        right_first,
+    })
+}
+
+/// Phases 2–4 of finishing a split during undo: log the CLR and flush the
+/// WAL (the apply stamps pages with this LSN and `BufferPool::flush_frame`
+/// checks `synced_lsn` against it), apply through the exact code path redo
+/// takes, then make the result durable — the right page first (inside
+/// [`apply_split_clr`]), the left page last so it is never durable ahead of
+/// the pages that hold the entries it gave away.
+///
+/// # Torn-write protection during undo (post-Stage-S review H4)
+///
+/// The undo phase runs with the buffer pool's own FPI gate CLOSED
+/// (`checkpoint_lsn` is seeded only after undo — see `pg-storage` engine
+/// open; an earlier seed would make `pin_mut`'s FPI stamp `pd_lsn` past the
+/// already-appended CLR and defeat the apply's per-page idempotency
+/// guards). A crash tearing the post-apply page flush could therefore leave
+/// a garbage `pd_lsn ≥ clr_lsn` that the next recovery would read as
+/// "already applied", skipping the CLR — silent corruption. To close that
+/// hole, every page the CLR modifies gets an explicit **pre-image**
+/// `FullPageImage` record appended BEFORE the CLR: FPI replay restores the
+/// image unconditionally (torn writes are exactly what it repairs) and
+/// patches `pd_lsn` to the FPI's own LSN — still below the CLR's, so the
+/// CLR re-applies cleanly on top. The image is a pure WAL artifact here:
+/// the live page's `pd_lsn` is NOT bumped (that is the difference from
+/// `pin_mut`'s FPI, and why the guards keep working).
+fn emit_and_apply_clr(
+    pool: &BufferPool,
+    wal_writer: &WalWriter,
+    rec: &BTreeSplitCLRRecord,
+) -> Result<()> {
+    for page_id in [
+        rec.left_page,
+        rec.right_page,
+        rec.parent_page,
+        rec.new_root_page,
+        rec.meta_page,
+    ] {
+        if page_id == PageId::INVALID {
+            continue;
+        }
+        let image = {
+            let guard = pool.pin(page_id)?;
+            guard.page().to_vec()
+        };
+        wal_writer.append(WalRecord::full_page_image(page_id, image)?)?;
+    }
+
+    let clr = WalRecord::btree_split_clr(rec)?;
     let lsn = wal_writer.append(clr)?;
     wal_writer.flush()?;
 
-    // Phase 3: apply, using the exact code path redo will take.
-    apply_split_clr(pool, &rec, lsn)?;
+    apply_split_clr(pool, rec, lsn)?;
 
-    // Phase 4: make the result durable. `apply_split_clr` already flushed the
-    // right page; the left page goes last so it is never durable ahead of the
-    // pages that hold the entries it gave away.
-    if new_root_page != PageId::INVALID {
-        pool.flush(new_root_page)?;
+    if rec.new_root_page != PageId::INVALID {
+        pool.flush(rec.new_root_page)?;
     }
-    if parent_page != PageId::INVALID {
-        pool.flush(parent_page)?;
+    if rec.parent_page != PageId::INVALID {
+        pool.flush(rec.parent_page)?;
     }
-    if meta_page != PageId::INVALID {
-        pool.flush(meta_page)?;
+    if rec.meta_page != PageId::INVALID {
+        pool.flush(rec.meta_page)?;
     }
-    pool.flush(left_page_id)?;
-
+    pool.flush(rec.left_page)?;
     Ok(())
 }
 
 /// Apply the page mutations of a `BTreeSplitCLR` at `lsn`.
 ///
-/// Shared by the undo path (`finish_incomplete_split`) and the redo handler, so
-/// both converge on byte-identical pages by construction. Every page is guarded
-/// by its own `pd_lsn`, which makes repeated application a no-op.
+/// Shared by the undo path (`finish_incomplete_split` / `split_page_in_undo`)
+/// and the redo handler, so both converge on byte-identical pages by
+/// construction. Every page is guarded by its own `pd_lsn`, which makes
+/// repeated application a no-op.
+///
+/// The left/right pair branches on the RIGHT page's content, never on the
+/// left page's slot count (review C1 — the left page may hold a pending
+/// in-window insert or have lost entries to in-window deletes):
+///
+/// - **right non-empty** — Copy was already applied (redone from the WAL, or
+///   applied by an earlier partial application of this very CLR): never move
+///   entries; only the left page's finish is potentially missing. The left
+///   page is truncated at the first entry sorting at-or-above the right
+///   page's first entry (full `(key, trailer)` order, so duplicate keys
+///   straddling the split point survive) — a no-op in every
+///   online-reachable state, kept as the defensive bound.
+/// - **right empty, never written** (`pd_upper == pd_special`) — Copy never
+///   ran: move `left[copy_start_slot..]` right, like the online Copy.
+/// - **right empty, previously written** — only reachable for an unlink CLR
+///   (the right half was deleted in-window): splice the right page out of
+///   the chain and clear `SPLIT_INCOMPLETE`, preserving `ROOT`.
+///
+/// The left page's `btpo_next` is (re-)written unconditionally in the
+/// non-unlink branches: a no-op for incomplete-split finishes (Prepare
+/// linked it), but the write that ESTABLISHES the link for cascade splits
+/// created during undo (which have no Prepare record).
 pub(crate) fn apply_split_clr(
     pool: &BufferPool,
     rec: &BTreeSplitCLRRecord,
     lsn: Lsn,
 ) -> Result<()> {
-    // 1. Move the entries and finish the left page. Both happen under one
-    //    pd_lsn stamp so the left page is never durable in a half-finished
-    //    state that a later replay would skip.
+    // 1. Move the entries (when the plan calls for it) and finish the left
+    //    page under one pd_lsn stamp, so the left page is never durable in a
+    //    half-finished state that a later replay would skip. The RIGHT page
+    //    is stamped to `lsn` in EVERY branch (post-Stage-S review H4): the
+    //    undo path appends a pre-image FPI of every CLR-touched page before
+    //    the CLR, and FPI replay patches pd_lsn to the FPI's own LSN — only
+    //    re-stamping the page to the CLR's LSN here makes recovery converge
+    //    round-over-round. This does NOT weaken the C1 idempotency logic:
+    //    the plan is chosen by the right page's CONTENT (entries present /
+    //    never-written), never by comparing right pd_lsn to the CLR's, and
+    //    the "move still owed" state (right page empty AND never-written)
+    //    remains the only one that is never stamped.
     {
         let mut left_guard = pool.pin_mut(rec.left_page)?;
         let mut right_guard = pool.pin_mut(rec.right_page)?;
         let left_lsn = page_pd_lsn(left_guard.page());
-        let right_lsn = page_pd_lsn(right_guard.page());
         if left_lsn < lsn {
             let left: &mut [u8; PAGE_SIZE] = as_page_mut(&mut left_guard);
             let right: &mut [u8; PAGE_SIZE] = as_page_mut(&mut right_guard);
-            // `apply_split_copy` appends to the right page, so the move must be
-            // skipped once the right page already holds the moved entries —
-            // otherwise replay doubles them.
-            let move_to_right = right_lsn < lsn;
-            apply_split_copy(left, right, rec.copy_start_slot, move_to_right)?;
-            if move_to_right {
+            if clr_is_unlink(rec) {
+                // Unlink: abandon the split. The right page's content stays
+                // untouched (orphaned); only its pd_lsn is stamped (H4, see
+                // the fn-level comment). The left page reabsorbs its
+                // key range by re-pointing past the orphan. `ROOT` is
+                // preserved — this record creates no new root.
+                let right_next = BtreePage::next(right)?;
+                BtreePage::set_next(left, right_next);
+                BtreePage::set_flag(left, BTREE_FLAG_SPLIT_INCOMPLETE, false)?;
                 stamp_pd_lsn(right, lsn);
+                stamp_pd_lsn(left, lsn);
+            } else if SlottedPage::slot_count(right) > 0 {
+                // NoMove: the moved entries are already on the right page.
+                // Re-appending `left[copy_start_slot..]` here is the C1 bug:
+                // with a pending insert in the left half it copies the
+                // pending entry onto the right page's END (out of order) and
+                // picks the wrong separator.
+                let right_first = entry_bytes(right, 0)?.to_vec();
+                let left_count = SlottedPage::slot_count(left);
+                if left_count > 0 {
+                    let truncate_at = entry_lower_bound(left, &right_first, rec.level == 0)?;
+                    if truncate_at == 0 {
+                        return Err(BTreeError::Corrupted(format!(
+                            "split CLR: every entry of left page {} sorts at-or-above the \
+                             right page {}'s first entry — the split boundary is inverted",
+                            rec.left_page, rec.right_page
+                        )));
+                    }
+                    // Rebuild-only (no move): keeps `[0, truncate_at)`.
+                    apply_split_copy(left, right, truncate_at as u16, false)?;
+                }
+                BtreePage::set_next(left, rec.right_page);
+                BtreePage::apply_commit_left(left)?;
+                // Content unchanged by this CLR; stamped for H4 convergence
+                // (see the fn-level comment).
+                stamp_pd_lsn(right, lsn);
+                stamp_pd_lsn(left, lsn);
+            } else {
+                // Right page empty: the move is still owed. It is only safe
+                // if the right page never held entries — otherwise the
+                // entries were deleted in-window and moving would resurrect
+                // them. That state is exactly what unlink CLRs cover, so a
+                // non-unlink record meeting a previously-written empty right
+                // page is corruption.
+                if !page_never_had_entries(right) {
+                    return Err(BTreeError::Corrupted(format!(
+                        "split CLR: right page {} held entries and is empty now, but the \
+                         record is not an unlink — moving would resurrect deleted entries",
+                        rec.right_page
+                    )));
+                }
+                apply_split_copy(left, right, rec.copy_start_slot, true)?;
+                stamp_pd_lsn(right, lsn);
+                BtreePage::set_next(left, rec.right_page);
+                BtreePage::apply_commit_left(left)?;
+                stamp_pd_lsn(left, lsn);
             }
-            BtreePage::apply_commit_left(left)?;
-            stamp_pd_lsn(left, lsn);
-        } else if right_lsn < lsn {
-            // The left page is past the CLR (already truncated) while the right
-            // page never received the moved entries. Flush ordering makes this
-            // unreachable, so it means on-disk corruption: those entries are
-            // durable nowhere and cannot be recomputed.
-            return Err(BTreeError::Corrupted(format!(
-                "split CLR: left page {} is past the CLR (pd_lsn {:?} >= {:?}) but right page {}                  lacks the moved entries (pd_lsn {:?})",
-                rec.left_page, left_lsn, lsn, rec.right_page, right_lsn
-            )));
+        } else {
+            // The left page is past the CLR. Guard the one state flush
+            // ordering makes unreachable: a record that still owes the move
+            // (right page never written) while the left page is already
+            // finished — the moved entries would be durable nowhere. (A
+            // non-empty or previously-written right page is legitimate: the
+            // NoMove and unlink plans never MOVE entries, though they do
+            // stamp the right page's pd_lsn — H4, see above.)
+            let right: &[u8; PAGE_SIZE] = right_guard.page().try_into().expect("frame is PAGE_SIZE");
+            if !clr_is_unlink(rec)
+                && SlottedPage::slot_count(right) == 0
+                && page_never_had_entries(right)
+            {
+                return Err(BTreeError::Corrupted(format!(
+                    "split CLR: left page {} is past the CLR (pd_lsn {:?} >= {:?}) but right \
+                     page {} never received the moved entries",
+                    rec.left_page,
+                    left_lsn,
+                    lsn,
+                    rec.right_page
+                )));
+            }
         }
     }
     // The right page must reach disk before the left page: the left page has
-    // given its entries away, so a durable left with a stale right loses them.
+    // given its entries away, so a durable left with a stale right loses
+    // them. (For the NoMove/unlink plans the right page is untouched here —
+    // the flush is a harmless no-op.)
     pool.flush(rec.right_page)?;
 
     // 2. Downlink: a root split creates a new root, a non-root split inserts

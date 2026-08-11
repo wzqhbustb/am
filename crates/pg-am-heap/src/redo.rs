@@ -37,7 +37,10 @@
 
 use crate::error::HeapError;
 use crate::slotted_page::{SlottedPage, HEAP_SPECIAL_SIZE};
-use crate::tuple::{TupleHeader, HEAP_HOT_UPDATED, HEAP_UPDATED, HEAP_XMAX_LOCK_ONLY, TUPLE_HEADER_SIZE};
+use crate::tuple::{
+    TupleHeader, HEAP_HOT_UPDATED, HEAP_UPDATED, HEAP_XMAX_IS_SHARE, HEAP_XMAX_LOCK_ONLY,
+    TUPLE_HEADER_SIZE,
+};
 use pg_storage::buffer_pool::BufferPool;
 use pg_storage::error::{Result, StorageError};
 use pg_storage::page::{page_pd_lsn, set_page_pd_lsn};
@@ -285,9 +288,9 @@ fn stamp_deleted(
     // that may sit on the flushed page image (M2c Stage P — lock-only
     // stamps are not WAL-logged, so a page flushed while a FOR UPDATE lock
     // was held can carry one; leaving it set would mask the replayed
-    // delete from visibility and resurrect the row). Mirrors the live
-    // path's `HeapAM::stamp_deleted`.
-    header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+    // delete from visibility and resurrect the row). IS_SHARE (H5) goes
+    // with it. Mirrors the live path's `HeapAM::stamp_deleted`.
+    header.t_infomask &= !(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE);
     header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);
     Ok(())
 }
@@ -310,7 +313,7 @@ fn stamp_hot_update(
     let mut header = TupleHeader::read_from(&page[off..off + TUPLE_HEADER_SIZE])?;
     header.t_xmax = xmax;
     header.t_infomask |= HEAP_UPDATED;
-    header.t_infomask &= !HEAP_XMAX_LOCK_ONLY;
+    header.t_infomask &= !(HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_IS_SHARE);
     header.t_ctid = new_tid;
     header.t_infomask2 |= HEAP_HOT_UPDATED;
     header.write_to(&mut page[off..off + TUPLE_HEADER_SIZE]);

@@ -1191,7 +1191,17 @@ impl Engine {
             for (tid, values) in rows {
                 // NULL keys are not indexed (see the fn docs).
                 if let Some(datum) = &values[col_index] {
-                    entries.push((encode_key(datum)?, tid));
+                    // Post-Stage-S review H2: the scan yields the VISIBLE
+                    // version, which for a HOT chain is a `HEAP_ONLY_TUPLE`
+                    // tail that never gets index entries of its own. Build
+                    // the entry against the chain ROOT instead, so a later
+                    // key-changing update or delete — which retires entries
+                    // via `hot_chain_root` — finds it (`EntryNotFound`
+                    // otherwise, and the index would leak the deleted row
+                    // forever). Safe under the build's Exclusive table lock:
+                    // no writer can be mutating the chains mid-scan.
+                    let index_tid = self.hot_chain_root(tid)?;
+                    entries.push((encode_key(datum)?, index_tid));
                 }
             }
 
@@ -1415,46 +1425,22 @@ impl Engine {
         }
         // HOT chain: old version is invisible but t_ctid may point to a
         // newer version visible to this snapshot (Stage S). The walk reads the
-        // page pinned above: a HOT chain never leaves its page, and re-pinning
-        // it here would be a recursive read latch, which deadlocks as soon as
-        // a writer queues between the two acquisitions.
+        // page pinned above (HOT chains never leave their page; re-pinning
+        // here would be a recursive read latch, which deadlocks as soon as a
+        // writer queues) and runs to the chain end, slot-count bounded — the
+        // shared `follow_hot_chain` helper (post-Stage-S review H1; the
+        // pre-H1 8-hop cap made >8-hop chains silently vanish from
+        // index_lookup).
         if header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
             && header.t_ctid != tid
         {
-            let mut chain_tid = header.t_ctid;
-            for _ in 0..8 {
-                if chain_tid.page_id != tid.page_id {
-                    return Ok(None);
-                }
-                let Some(chain_bytes) = SlottedPage::tuple(page, chain_tid.slot_id)? else {
-                    return Ok(None);
-                };
-                let chain_header = TupleHeader::read_from(
-                    &chain_bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE],
-                )?;
-                let chain_xmax =
-                    if chain_header.t_infomask & pg_am_heap::tuple::HEAP_XMAX_LOCK_ONLY != 0 {
-                        TxnId::INVALID
-                    } else {
-                        chain_header.t_xmax
-                    };
-                if is_visible(
-                    chain_header.t_xmin,
-                    chain_xmax,
-                    chain_header.t_cid,
-                    snap,
-                    self.clog.as_ref(),
-                ) {
-                    return Ok(Some(chain_tid));
-                }
-                if chain_header.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
-                    && chain_header.t_ctid != chain_tid
-                {
-                    chain_tid = chain_header.t_ctid;
-                } else {
-                    return Ok(None);
-                }
-            }
+            return Ok(pg_am_heap::follow_hot_chain(
+                page,
+                tid.page_id,
+                header.t_ctid,
+                snap,
+                self.clog.as_ref(),
+            )?);
         }
         Ok(None)
     }
@@ -1463,57 +1449,17 @@ impl Engine {
     ///
     /// A `HEAP_ONLY_TUPLE` version was created without index entries of its
     /// own — that is the whole point of HOT — so index maintenance for such a
-    /// version must act on its chain root instead. HOT chains never leave
-    /// their page, so the root is found by walking the page's line pointers
-    /// backwards to the first version that is not `HEAP_ONLY_TUPLE`. Every
-    /// version in a HOT chain shares the same indexed columns, so the root's
-    /// entry carries exactly the key the caller read back from `tid`.
+    /// version must act on its chain root instead. Thin wrapper over the
+    /// shared [`pg_am_heap::hot_chain_root`] helper (post-Stage-S review H1,
+    /// which also folded the reverse walk's per-hop O(slots) scan into one
+    /// `t_ctid → slot` map, B6): pin the page, walk `t_ctid` links backwards
+    /// to the first version that is not `HEAP_ONLY_TUPLE`. Every version in
+    /// a HOT chain shares the same indexed columns, so the root's entry
+    /// carries exactly the key the caller read back from `tid`.
     fn hot_chain_root(&self, tid: Tid) -> Result<Tid> {
         let guard = self.storage.buffer_pool().pin(tid.page_id)?;
         let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
-        let slot_count = SlottedPage::slot_count(page) as u16;
-        let header_of = |slot: u16| -> Result<Option<TupleHeader>> {
-            let Some(bytes) = SlottedPage::tuple(page, slot)? else {
-                return Ok(None);
-            };
-            Ok(Some(TupleHeader::read_from(
-                &bytes[..pg_am_heap::tuple::TUPLE_HEADER_SIZE],
-            )?))
-        };
-
-        let mut cur = tid;
-        // Bounded by the chain length, which cannot exceed the page's slots.
-        for _ in 0..slot_count {
-            let Some(header) = header_of(cur.slot_id)? else {
-                return Ok(cur);
-            };
-            if header.t_infomask2 & pg_am_heap::tuple::HEAP_ONLY_TUPLE == 0 {
-                return Ok(cur);
-            }
-            let mut predecessor = None;
-            for slot in 0..slot_count {
-                if slot == cur.slot_id {
-                    continue;
-                }
-                let Some(candidate) = header_of(slot)? else {
-                    continue;
-                };
-                if candidate.t_infomask2 & pg_am_heap::tuple::HEAP_HOT_UPDATED != 0
-                    && candidate.t_ctid == cur
-                {
-                    predecessor = Some(Tid {
-                        page_id: cur.page_id,
-                        slot_id: slot,
-                    });
-                    break;
-                }
-            }
-            match predecessor {
-                Some(prev) => cur = prev,
-                None => return Ok(cur),
-            }
-        }
-        Ok(cur)
+        Ok(pg_am_heap::hot_chain_root(page, tid.page_id, tid)?)
     }
 
     /// Open the B+Tree handle for the index on `table(column)` (testing /

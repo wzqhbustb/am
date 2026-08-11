@@ -322,31 +322,45 @@ impl SlottedPage {
     /// Returns [`HeapError::Corrupted`] if the header geometry or the line
     /// pointer's offset/length are inconsistent — corrupted page bytes must
     /// never cause an out-of-bounds panic (M2 has no page checksums).
+    ///
+    /// LP REDIRECT hops are followed iteratively, bounded by the page's slot
+    /// count (post-Stage-S review B4): NOTHING in this system writes
+    /// REDIRECT line pointers (HOT chains keep the old tuple in place and
+    /// follow `t_ctid` — the pre-prune in-place style, see
+    /// docs/stage_spec.md Stage S), so a redirect chain longer than the slot
+    /// count is only reachable on a corrupt page, where the previous
+    /// unbounded recursion would have overflowed the stack.
     pub fn tuple(page: &[u8; PAGE_SIZE], slot: u16) -> Result<Option<&[u8]>> {
-        let lp = match Self::line_pointer(page, slot) {
-            Ok(lp) => lp,
-            Err(HeapError::InvalidSlot(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if lp.flags() == LpFlags::Redirect {
-            let target_slot = lp.off();
-            return Self::tuple(page, target_slot);
+        let mut cur = slot;
+        for _ in 0..=Self::slot_count(page) {
+            let lp = match Self::line_pointer(page, cur) {
+                Ok(lp) => lp,
+                Err(HeapError::InvalidSlot(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if lp.flags() == LpFlags::Redirect {
+                cur = lp.off();
+                continue;
+            }
+            if lp.flags() != LpFlags::Normal {
+                return Ok(None);
+            }
+            let header = Self::checked_header(page)?;
+            let off = lp.off() as usize;
+            let end = off + lp.len() as usize;
+            if off < header.pd_upper as usize || end > header.pd_special as usize {
+                return Err(HeapError::Corrupted(format!(
+                    "slot {slot}: tuple region [{off}, {end}) outside [{}, {})",
+                    header.pd_upper, header.pd_special
+                )));
+            }
+            // checked_header guarantees pd_special <= PAGE_SIZE, so this
+            // slice is always in bounds.
+            return Ok(Some(&page[off..end]));
         }
-        if lp.flags() != LpFlags::Normal {
-            return Ok(None);
-        }
-        let header = Self::checked_header(page)?;
-        let off = lp.off() as usize;
-        let end = off + lp.len() as usize;
-        if off < header.pd_upper as usize || end > header.pd_special as usize {
-            return Err(HeapError::Corrupted(format!(
-                "slot {slot}: tuple region [{off}, {end}) outside [{}, {})",
-                header.pd_upper, header.pd_special
-            )));
-        }
-        // checked_header guarantees pd_special <= PAGE_SIZE, so this slice is
-        // always in bounds.
-        Ok(Some(&page[off..end]))
+        Err(HeapError::Corrupted(format!(
+            "slot {slot}: LP REDIRECT chain longer than the page's slot count"
+        )))
     }
 
     /// Write a line pointer into the LP array.

@@ -77,9 +77,15 @@ pub struct UpdateContext<'a> {
     /// updated again (without this, such a tuple would be visible yet
     /// permanently unmodifiable).
     pub clog: &'a dyn ClogAccessor,
-    /// Whether the update is HOT-eligible: no indexed columns changed and
-    /// the new version fits on the same page. When true the AM skips index
-    /// maintenance and chains via `t_ctid` + `HEAP_HOT_UPDATED` (Stage S).
+    /// Whether the update is HOT-eligible: the caller asserts that no
+    /// indexed column changed. Whether the new version FITS on the old page
+    /// is decided by the AM, not the caller (post-Stage-S review B7): when
+    /// it does, the AM appends the new version same-page, chains it via
+    /// `t_ctid` + `HEAP_HOT_UPDATED`, and skips index maintenance (Stage S);
+    /// when it does not, the AM silently falls back to the cross-page
+    /// non-HOT path and the caller's index maintenance proceeds — compare
+    /// `out_tid.page_id` against `old_tid.page_id` to tell which happened
+    /// (see `Engine::update_inner`'s `hot_applied`).
     pub hot_eligible: bool,
 }
 
