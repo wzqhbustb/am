@@ -68,9 +68,7 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, StorageError};
 use crate::types::{Lsn, PageId, Tid, TxnId};
 use crate::wal::reader::WalReader;
-use crate::wal::record::{
-    bincode_config, BTreeSplitCLRRecord, CheckpointEndRecord, WalRecord, WalRecordType,
-};
+use crate::wal::record::{bincode_config, CheckpointEndRecord, WalRecord, WalRecordType};
 
 /// Outcome of the analysis phase: where redo must start, plus the ARIES
 /// tables rebuilt as of the crash (tech-selection §11.1).
@@ -316,17 +314,33 @@ fn for_each_touched_page(record: &WalRecord, f: &mut impl FnMut(PageId)) -> Resu
             f(parent);
         }
         BTreeSplitCLR => {
-            let rec = BTreeSplitCLRRecord::decode(payload)?;
-            f(rec.left_page);
-            f(rec.right_page);
-            if rec.parent_page != PageId::INVALID {
-                f(rec.parent_page);
+            // Prefix-decode only the fixed-size leading fields (post-Stage-S
+            // fix B5): `separator_key` — the record's LAST field by layout
+            // contract, see `BTreeSplitCLRRecord` — is a length-prefixed
+            // `Vec<u8>`, and bincode's standard config has no size limit, so
+            // full-decoding it here would trust a corrupt length prefix on a
+            // CRC-valid record with an unbounded allocation. Analysis needs
+            // only the page ids; the separator is never read.
+            let mut off = 0;
+            let left = decode_prefix::<PageId>(payload, &mut off)?;
+            let right = decode_prefix::<PageId>(payload, &mut off)?;
+            let _level = decode_prefix::<u8>(payload, &mut off)?;
+            let _copy_start_slot = decode_prefix::<u16>(payload, &mut off)?;
+            let _redo_ref_lsn = decode_prefix::<Lsn>(payload, &mut off)?;
+            let parent = decode_prefix::<PageId>(payload, &mut off)?;
+            let _parent_insert_slot = decode_prefix::<u16>(payload, &mut off)?;
+            let new_root = decode_prefix::<PageId>(payload, &mut off)?;
+            let meta = decode_prefix::<PageId>(payload, &mut off)?;
+            f(left);
+            f(right);
+            if parent != PageId::INVALID {
+                f(parent);
             }
-            if rec.new_root_page != PageId::INVALID {
-                f(rec.new_root_page);
+            if new_root != PageId::INVALID {
+                f(new_root);
             }
-            if rec.meta_page != PageId::INVALID {
-                f(rec.meta_page);
+            if meta != PageId::INVALID {
+                f(meta);
             }
         }
         _ => {}
@@ -799,6 +813,67 @@ mod tests {
             PAGE_MODIFYING.len() + NON_PAGE.len(),
             "the two classification sets must partition every known record type"
         );
+    }
+
+    /// Post-Stage-S fix B5: analysis decodes only the CLR's fixed-size
+    /// prefix. A payload truncated right after the last fixed field (the
+    /// `separator_key` bytes missing entirely) must still yield every
+    /// touched page, while a full decode of the same bytes fails — proving
+    /// the analysis path never reads the variable-length tail.
+    #[test]
+    fn clr_analysis_decodes_only_the_fixed_prefix() {
+        use crate::wal::record::BTreeSplitCLRRecord;
+
+        let rec = BTreeSplitCLRRecord {
+            left_page: PageId(10),
+            right_page: PageId(11),
+            level: 0,
+            copy_start_slot: 113,
+            redo_ref_lsn: Lsn(4_200),
+            parent_page: PageId(12),
+            parent_insert_slot: 57,
+            new_root_page: PageId(13),
+            meta_page: PageId(14),
+            separator_key: vec![1, 2, 3, 4],
+        };
+        let mut record = WalRecord::btree_split_clr(&rec).unwrap();
+        record.lsn = Lsn(64);
+
+        // `separator_key` is the LAST field (layout contract on the struct),
+        // so the fixed-size prefix is the payload minus the separator's own
+        // encoding (length varint + bytes).
+        let sep_len =
+            bincode::serde::encode_to_vec(&rec.separator_key, bincode_config()).unwrap().len();
+        let prefix = record.payload[..record.payload.len() - sep_len].to_vec();
+        assert!(BTreeSplitCLRRecord::decode(&prefix).is_err());
+        record.payload = prefix;
+
+        let mut pages = Vec::new();
+        for_each_touched_page(&record, &mut |p| pages.push(p)).unwrap();
+        assert_eq!(
+            pages,
+            vec![
+                PageId(10),
+                PageId(11),
+                PageId(12),
+                PageId(13),
+                PageId(14)
+            ]
+        );
+
+        // INVALID sentinels are filtered, same as before the fix.
+        let unlink = BTreeSplitCLRRecord {
+            parent_page: PageId::INVALID,
+            new_root_page: PageId::INVALID,
+            meta_page: PageId::INVALID,
+            separator_key: Vec::new(),
+            ..rec
+        };
+        let mut record = WalRecord::btree_split_clr(&unlink).unwrap();
+        record.lsn = Lsn(64);
+        let mut pages = Vec::new();
+        for_each_touched_page(&record, &mut |p| pages.push(p)).unwrap();
+        assert_eq!(pages, vec![PageId(10), PageId(11)]);
     }
 
     #[test]

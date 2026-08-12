@@ -253,6 +253,14 @@ pub struct UndoContext<'a> {
     /// WAL writer for emitting CLR records.
     pub wal_writer: &'a WalWriter,
     /// Commit-status accessor (for stamping aborted XIDs).
+    ///
+    /// Undo handlers stamp ATT members `Aborted` via `set_state` with no WAL
+    /// record and no explicit flush: the marks are in-memory until the first
+    /// post-recovery checkpoint's CLOG flush (`ClogFlush` hook). A crash
+    /// before that checkpoint loses them harmlessly — the next recovery
+    /// re-derives the same ATT from the WAL and re-stamps (the marks are
+    /// idempotent), and a missing CLOG entry already reads `InProgress`,
+    /// i.e. MVCC-invisible (the Stage N "no explicit heap undo" decision).
     pub clog: &'a dyn ClogAccessor,
     /// XIDs of transactions that were active at crash time (the ATT).
     pub att: &'a [TxnId],

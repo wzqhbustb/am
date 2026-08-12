@@ -837,6 +837,11 @@ fn test_undo_cascade_crash_mid_cascade_recovers() {
 /// downlink lands. Constructed deterministically with ~600-byte Text keys
 /// (~13 entries per page at every level); the interior level-1 page is
 /// filled with duplicate keys (distinct TIDs) routing into its range.
+///
+/// Post-Stage-S C2 deep review: the first recovery is additionally crashed
+/// BETWEEN cascade levels via `UNDO_CASCADE_FAILURES` — the level-1 parent's
+/// split CLR is durable while the root's cascade CLR and the leaf's CLR are
+/// not — and the second recovery must re-derive the rest and converge.
 #[test]
 fn test_undo_cascade_multi_level() {
     with_watchdog(|| {
@@ -897,6 +902,25 @@ fn test_undo_cascade_multi_level() {
             (index.meta_page(), (i + dup) as usize)
         };
 
+        // Post-Stage-S C2 deep review: crash BETWEEN cascade levels. The hook
+        // fails the first recovery right after the level-1 page P's split CLR
+        // is durable — P's right page is initialized (init FPI durable) and
+        // stamped by P's CLR, but the root's cascade CLR and the leaf's own
+        // CLR were never written. The second recovery must replay P's CLR as
+        // a no-op, re-derive the leaf's downlink target from the post-cascade
+        // pages, run the remaining root cascade, and converge.
+        pg_am_btree::index::UNDO_CASCADE_FAILURES.with(|f| f.set(1));
+        let crashed = StorageEngine::open_with_redo_handlers(
+            tmp.path(),
+            &config,
+            btree_redo_handlers(),
+            vec![Box::new(HeapUndoHandler), Box::new(BTreeUndoHandler)],
+        );
+        assert!(
+            crashed.is_err(),
+            "the injected inter-level crash must abort the first recovery"
+        );
+
         let (engine, index) = recover(tmp.path(), &config, meta_page);
         // Two cascade levels: P split, then the root split → level 3.
         assert_eq!(
@@ -911,7 +935,8 @@ fn test_undo_cascade_multi_level() {
             .validate()
             .unwrap_or_else(|e| panic!("multi-level cascaded tree must validate: {e}"));
 
-        // Second recovery converges.
+        // Third recovery (the second one replayed the inter-level-crash
+        // state) converges.
         let root = index.root_page();
         std::mem::forget(engine);
         let (engine, index) = recover(tmp.path(), &config, meta_page);

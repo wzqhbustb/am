@@ -58,9 +58,12 @@ impl UndoHandler for BTreeUndoHandler {
         // split's downlink insertion may need to split its parent (the C2
         // cascade), and finishing a parent's own incomplete split first both
         // frees space in it and guarantees `find_parent_page` never returns
-        // a still-`SPLIT_INCOMPLETE` page.
+        // a still-`SPLIT_INCOMPLETE` page. Same-level splits tie-break by
+        // left page id (post-Stage-S fix B4): the tracker is a HashMap, so
+        // without the tiebreaker CLR emission order — and thus the recovered
+        // WAL bytes — would be nondeterministic across recoveries.
         let mut sorted: Vec<_> = splits.into_values().collect();
-        sorted.sort_by_key(|split| std::cmp::Reverse(split.level));
+        sorted.sort_by_key(|split| (std::cmp::Reverse(split.level), split.left_page.0));
 
         for split in sorted {
             let copy_start_slot = match split.copy_start_slot {
@@ -101,6 +104,12 @@ impl UndoHandler for BTreeUndoHandler {
 /// H3: scan allocated pages for `SPLIT_INCOMPLETE` and add every flagged
 /// page the tracker does not already know (redo saw its Prepare) to
 /// `splits`.
+///
+/// Cost: always O(allocated_pages) — the scan runs even when the tracker
+/// already holds every split (tracker-known pages are skipped but still
+/// iterated). Acceptable because recovery is single-threaded and rare, and
+/// the scan takes only read pins; revisit if multi-million-page databases
+/// make recovery I/O audible.
 ///
 /// False-positive analysis: `btpo_flags` lives in `pd_flags` bits 12..15 and
 /// nothing outside the B+Tree AM ever writes those bits — the heap never

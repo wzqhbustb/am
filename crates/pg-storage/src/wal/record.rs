@@ -308,6 +308,18 @@ pub struct BTreeSplitCommitRecord {
 /// Copy→Commit window, so no separator exists) and carries `INVALID` for
 /// parent/new_root/meta — `apply_split_clr` then splices the empty right
 /// page out of the sibling chain and clears only `SPLIT_INCOMPLETE`.
+///
+/// # Field-order invariant (post-Stage-S fix B5)
+///
+/// `separator_key` is deliberately the LAST field. The analysis phase
+/// prefix-decodes only the fixed-size leading fields (page ids, level,
+/// slots, `redo_ref_lsn`) and never touches the variable-length tail:
+/// bincode's standard config imposes no size limit, so a full decode would
+/// trust a corrupt length prefix on a CRC-valid record with an unbounded
+/// allocation. The layout changed after Stage S (the CLR discriminant is new
+/// in Stage S and the project is pre-release, so no on-disk migration is
+/// owed); all producers go through [`WalRecord::btree_split_clr`], and no
+/// test fixture encodes CLR bytes by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BTreeSplitCLRRecord {
     /// The left page of the incomplete split.
@@ -325,8 +337,6 @@ pub struct BTreeSplitCLRRecord {
     /// Parent page receiving the downlink (non-root splits); `INVALID` for
     /// root splits and unlink records.
     pub parent_page: PageId,
-    /// Separator key inserted into the parent. Empty for unlink records.
-    pub separator_key: Vec<u8>,
     /// Slot at which the parent gains the downlink.
     pub parent_insert_slot: u16,
     /// New root page for root splits; `PageId::INVALID` for non-root splits
@@ -334,7 +344,18 @@ pub struct BTreeSplitCLRRecord {
     pub new_root_page: PageId,
     /// Meta page to update for root splits; `PageId::INVALID` for non-root.
     pub meta_page: PageId,
+    /// Separator key inserted into the parent. Empty for unlink records.
+    /// LAST field — see the struct-level field-order invariant.
+    pub separator_key: Vec<u8>,
 }
+
+/// Maximum accepted length of a [`BTreeSplitCLRRecord::separator_key`]
+/// (post-Stage-S fix B5, defense in depth for the remaining full decodes in
+/// redo/undo). Mirrors `pg_am_btree::key::MAX_INDEX_KEY_BYTES`
+/// (`(PAGE_SIZE - 32 - 16) / 3 - 16`, 2698 at 8 KiB pages) plus the 16-byte
+/// index-entry trailer; pg-storage cannot depend on pg-am-btree, so the
+/// formula is re-derived from [`PAGE_SIZE`](crate::types::PAGE_SIZE) here.
+pub const MAX_CLR_SEPARATOR_KEY_BYTES: usize = (crate::types::PAGE_SIZE - 32 - 16) / 3;
 
 /// Payload for a `TxnCommit` record: the transaction whose commit is durable.
 ///
@@ -443,10 +464,25 @@ impl BTreeSplitCommitRecord {
 
 impl BTreeSplitCLRRecord {
     /// Decode a `BTreeSplitCLR` payload (see [`HeapInsertRecord::decode`]).
+    ///
+    /// Defense in depth (post-Stage-S fix B5): the decoded `separator_key` is
+    /// rejected when it exceeds [`MAX_CLR_SEPARATOR_KEY_BYTES`]. bincode's
+    /// standard config has no size limit, so a corrupt length prefix on a
+    /// CRC-valid record must not be trusted blindly; a separator key can
+    /// never legitimately exceed the B+Tree's maximum index key size plus
+    /// its trailer.
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        Ok(bincode::serde::decode_from_slice(payload, bincode_config())
+        let rec: Self = bincode::serde::decode_from_slice(payload, bincode_config())
             .map_err(|e| StorageError::Serialize(e.to_string()))?
-            .0)
+            .0;
+        if rec.separator_key.len() > MAX_CLR_SEPARATOR_KEY_BYTES {
+            return Err(StorageError::Serialize(format!(
+                "BTreeSplitCLR separator_key length {} exceeds maximum {}",
+                rec.separator_key.len(),
+                MAX_CLR_SEPARATOR_KEY_BYTES
+            )));
+        }
+        Ok(rec)
     }
 }
 
@@ -1262,6 +1298,45 @@ mod tests {
             let payload = BTreeSplitCLRRecord::decode(&decoded.payload).unwrap();
             assert_eq!(payload, rec);
         }
+    }
+
+    /// Post-Stage-S fix B5: a full decode rejects a separator key beyond
+    /// [`MAX_CLR_SEPARATOR_KEY_BYTES`] (defense in depth — a corrupt length
+    /// prefix on a CRC-valid record must not be trusted), while a key at the
+    /// bound still roundtrips.
+    #[test]
+    fn btree_split_clr_decode_bounds_separator_key() {
+        let base = BTreeSplitCLRRecord {
+            left_page: PageId(10),
+            right_page: PageId(11),
+            level: 0,
+            copy_start_slot: 113,
+            redo_ref_lsn: Lsn(4_200),
+            parent_page: PageId(12),
+            parent_insert_slot: 57,
+            new_root_page: PageId::INVALID,
+            meta_page: PageId::INVALID,
+            separator_key: Vec::new(),
+        };
+        let at_bound = BTreeSplitCLRRecord {
+            separator_key: vec![0xAA; MAX_CLR_SEPARATOR_KEY_BYTES],
+            ..base.clone()
+        };
+        let payload = bincode::serde::encode_to_vec(&at_bound, bincode_config()).unwrap();
+        assert_eq!(
+            BTreeSplitCLRRecord::decode(&payload).unwrap(),
+            at_bound,
+            "a separator key at the bound must decode"
+        );
+        let over_bound = BTreeSplitCLRRecord {
+            separator_key: vec![0xAA; MAX_CLR_SEPARATOR_KEY_BYTES + 1],
+            ..base
+        };
+        let payload = bincode::serde::encode_to_vec(&over_bound, bincode_config()).unwrap();
+        assert!(
+            BTreeSplitCLRRecord::decode(&payload).is_err(),
+            "a separator key past the bound must be rejected"
+        );
     }
 
     #[test]

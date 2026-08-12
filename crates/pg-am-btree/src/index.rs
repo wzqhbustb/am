@@ -2422,6 +2422,9 @@ pub(crate) fn finish_incomplete_split(
             0,
         ),
         _ if is_root_split => {
+            // 4-bit level bound before allocating the new root (post-Stage-S
+            // C2 deep review; see ensure_root_promotion_fits).
+            ensure_root_promotion_fits(level)?;
             // Reserve the new root page id; its content is written by the
             // apply. `new_page` logs its own PageAlloc, so recovery
             // re-reserves the id.
@@ -2523,6 +2526,23 @@ fn ensure_downlink_slot(
     Ok((target, slot))
 }
 
+/// Hard bound for root promotion during undo (post-Stage-S C2 deep review):
+/// the same 4-bit `btpo_level` contract the online path enforces in
+/// [`BTreeIndex::create_new_root`]. Promoting a level-15 root would write
+/// `16 << 8` into `pd_flags` — overflowing `btpo_level` (bits 8..11) into
+/// the `btpo_flags` nibble (bits 12..15): a flag bit is spuriously set while
+/// `btpo_level` reads back 0, recovery "succeeds", and the next open reads a
+/// corrupt root. Fail loudly instead; a 15-level tree of 8 KiB pages is
+/// unreachable in practice, so refusing is always right.
+fn ensure_root_promotion_fits(level: u8) -> Result<()> {
+    if level >= 0x0F {
+        return Err(BTreeError::Corrupted(format!(
+            "tree level {level} already at the 4-bit maximum; cannot promote the root"
+        )));
+    }
+    Ok(())
+}
+
 /// Complete a FRESH split of `left_page` during undo (C2 cascade): the
 /// downlink insertion of another split's finish found `left_page` without
 /// room. Unlike [`finish_incomplete_split`] there is no Prepare/Copy in the
@@ -2589,6 +2609,9 @@ fn split_page_in_undo(
     let separator_key = entry_key(&right_first, level)?.to_vec();
 
     let (parent_page, new_root_page, meta_page, parent_insert_slot) = if is_root_split {
+        // 4-bit level bound before allocating the new root (post-Stage-S C2
+        // deep review; see ensure_root_promotion_fits).
+        ensure_root_promotion_fits(level)?;
         // Reserve the new root page id; `apply_split_clr` writes its content
         // (a full re-initialization, so no FPI is needed for it).
         let new_root_id = pool.new_page()?.page_id();
@@ -2827,8 +2850,11 @@ pub(crate) fn apply_split_clr(
     }
     // The right page must reach disk before the left page: the left page has
     // given its entries away, so a durable left with a stale right loses
-    // them. (For the NoMove/unlink plans the right page is untouched here —
-    // the flush is a harmless no-op.)
+    // them. The flush is load-bearing in EVERY plan, never a no-op
+    // (post-Stage-S review H4): the NoMove/unlink branches do not move
+    // entries but DO stamp the right page's pd_lsn, and only flushing that
+    // stamp makes recovery converge round-over-round (see the fn-level
+    // comment).
     pool.flush(rec.right_page)?;
 
     // 2. Downlink: a root split creates a new root, a non-root split inserts
@@ -2912,6 +2938,12 @@ fn find_meta_page_for_root(
 
 /// Scan allocated pages for the parent of `child` at `level + 1`. The parent
 /// is an internal page whose downlink set includes `child`.
+///
+/// Cost: O(allocated_pages) per call, so N incomplete splits cost
+/// O(N × allocated_pages) — fine for the typical crash (N = 1–3, and the
+/// 4-bit level bound caps the cascade N); a descending-from-root lookup is
+/// possible but the tree above an incomplete split is exactly where trust
+/// is thinnest during recovery, so the dumb scan is the robust choice.
 fn find_parent_page(
     pool: &BufferPool,
     page_allocator: &Mutex<PageAllocator>,
@@ -2961,4 +2993,25 @@ pub(crate) fn choose_split_slot_readonly(
     let guard = pool.pin(page_id)?;
     let page: &[u8; PAGE_SIZE] = guard.page().try_into().expect("frame is PAGE_SIZE");
     choose_split_slot(page, level, None)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Post-Stage-S C2 deep review: the undo root-promotion guard fails
+    /// loudly at the 4-bit `btpo_level` bound instead of letting level 16
+    /// overflow into the flags nibble (a 15-level tree is not constructible
+    /// in a test, so the guard logic itself is pinned here).
+    #[test]
+    fn undo_root_promotion_refuses_level_overflow() {
+        assert!(ensure_root_promotion_fits(0).is_ok());
+        assert!(ensure_root_promotion_fits(0x0E).is_ok());
+        let err = ensure_root_promotion_fits(0x0F).unwrap_err();
+        assert!(
+            matches!(err, BTreeError::Corrupted(_)),
+            "level 15 must fail loudly, got {err:?}"
+        );
+    }
 }

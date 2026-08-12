@@ -359,6 +359,16 @@ impl StorageEngine {
         // see (post-Stage-S review H3: a split whose Prepare predates the
         // checkpoint's redo start leaves no record in the replay window, but
         // its flag is durable on the page).
+        //
+        // The heap undo handler's `Aborted` CLOG stamps are NOT made durable
+        // here (post-Stage-S review B3): they are `set_state` calls with no
+        // WAL record, flushed only by the first post-recovery checkpoint's
+        // `ClogFlush` hook. A crash before that checkpoint loses them
+        // harmlessly — this recovery path then re-derives the same ATT and
+        // re-stamps (the marks are idempotent), and a missing CLOG entry
+        // reads `InProgress`, already MVCC-invisible (Stage N "no explicit
+        // heap undo" decision; see the analysis module docs and
+        // `UndoContext::clog`).
         {
             let mut undo_ctx = UndoContext {
                 buffer_pool: &buffer_pool,
