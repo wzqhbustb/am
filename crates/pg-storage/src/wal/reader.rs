@@ -72,7 +72,12 @@ impl WalReader {
     ///
     /// Returns `Ok(None)` when the end of the durable WAL is reached. An all-
     /// zero header (uninitialized padding) is treated as a clean end-of-WAL
-    /// marker. Any other decode or CRC failure is returned as an error.
+    /// marker, and so is a CRC-failing record that is provably a torn tail
+    /// (header pins it to this position, nothing but zeros after it — see
+    /// [`Self::is_torn_tail`]): a crash can interrupt the writer mid-record,
+    /// and the preallocated segment makes the unwritten remainder read back
+    /// as zeros instead of a short read. Any other decode or CRC failure is
+    /// returned as an error.
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         let start_lsn = self.current_lsn;
         let mut header = [0u8; WAL_RECORD_HEADER_SIZE];
@@ -122,7 +127,31 @@ impl WalReader {
             buf.extend_from_slice(&rest);
         }
 
-        let (record, consumed) = WalRecord::decode(&buf)?;
+        let decoded = match WalRecord::decode(&buf) {
+            Ok(ok) => ok,
+            Err(e) => {
+                // A CRC mismatch at the very END of the durable log is a torn
+                // record, not corruption: a crash can interrupt the writer's
+                // `write_all` mid-record (kill -9 keeps the page cache, so the
+                // partially written prefix survives), and because segment
+                // files are preallocated the unwritten remainder reads back
+                // as zeros — complete enough to fail the CRC instead of the
+                // short-read check above. `is_torn_tail` accepts this shape
+                // only when the header pins the record to this exact position
+                // AND nothing but zeros follows it, so genuine mid-file
+                // corruption (valid records after the bad one) still
+                // hard-fails. Roll back like any other torn record.
+                let record_end = Lsn(start_lsn.0 + total as u64);
+                if matches!(e, StorageError::WalCorrupted(_))
+                    && self.is_torn_tail(start_lsn, record_end, &header)?
+                {
+                    self.current_lsn = start_lsn;
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        };
+        let (record, consumed) = decoded;
         debug_assert_eq!(consumed, total);
         // current_lsn was already advanced by try_read_exact to the byte
         // immediately following the record.
@@ -228,6 +257,66 @@ impl WalReader {
             read += n;
         }
         Ok(true)
+    }
+
+    /// Decide whether a CRC-failing record at `start_lsn` is a torn tail
+    /// rather than genuine mid-file corruption.
+    ///
+    /// Two conditions must both hold:
+    ///
+    /// - `header` pins the record to this exact position: its self-reported
+    ///   LSN equals `start_lsn`. A crash-torn write keeps the record's
+    ///   leading bytes (record starts are 8-byte aligned and a short
+    ///   `write()` transfers a prefix), so the first 8 bytes — the LSN field
+    ///   — survive whenever the header is readable at all. A mid-file bit
+    ///   flip, in contrast, lands anywhere and usually breaks this check.
+    /// - Every byte from `record_end` (the record's end per its own length
+    ///   prefix) to the end of the durable WAL is zero. A torn record is the
+    ///   last thing the writer touched, so nothing may follow it; a single
+    ///   non-zero byte afterwards means real records exist beyond the bad
+    ///   one and the log is genuinely corrupt.
+    ///
+    /// Reads via the same segment-hopping logic as the sequential path but
+    /// never advances `current_lsn`.
+    fn is_torn_tail(&mut self, start_lsn: Lsn, record_end: Lsn, header: &[u8]) -> Result<bool> {
+        let header_lsn = Lsn(u64::from_le_bytes(header[0..8].try_into().unwrap()));
+        if header_lsn != start_lsn {
+            return Ok(false);
+        }
+
+        let mut pos = record_end.0;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let p = Lsn(pos);
+            let segment_id = p.segment_id(self.segment_size);
+            let offset = p.segment_offset(self.segment_size);
+
+            if segment_id != self.current_segment_id {
+                let path = self.wal_dir.join(wal_filename(segment_id));
+                if !path.exists() {
+                    // No further segments: the durable log ends here.
+                    return Ok(true);
+                }
+                self.current_file = Self::open_segment_file(&self.wal_dir, segment_id)?;
+                self.current_segment_id = segment_id;
+            }
+
+            let chunk = std::cmp::min((self.segment_size - offset) as usize, buf.len());
+            self.current_file
+                .seek(SeekFrom::Start(offset))
+                .map_err(StorageError::Io)?;
+            let n = self
+                .current_file
+                .read(&mut buf[..chunk])
+                .map_err(StorageError::Io)?;
+            if n == 0 {
+                return Ok(true);
+            }
+            if buf[..n].iter().any(|&b| b != 0) {
+                return Ok(false);
+            }
+            pos += n as u64;
+        }
     }
 }
 
@@ -458,5 +547,86 @@ mod tests {
         let mut reader = WalReader::open(tmp.path().join("wal"), cfg.wal_segment_size).unwrap();
         let from_iter: Vec<_> = reader.records().map(|r| r.unwrap().record_type).collect();
         assert_eq!(from_iter, vec![WalRecordType::PageAlloc; 5]);
+    }
+
+    #[test]
+    fn read_torn_tail_record_with_zero_remainder_returns_none() {
+        // Simulates a kill -9 landing mid-`write_all`: the last record's
+        // leading bytes (full header + a payload prefix) are durable, and
+        // because the segment file is preallocated the unwritten remainder
+        // reads back as zeros. The CRC therefore fails on a complete-looking
+        // record — but this is a torn tail and must be a clean end-of-WAL,
+        // not a hard corruption error (Stage T crash-test failure).
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+        let lsn1 = writer
+            .append(WalRecord::page_alloc(PageId(1)).unwrap())
+            .unwrap();
+        let fpi_lsn = writer
+            .append(WalRecord::full_page_image(PageId(2), vec![0xAB; 256]).unwrap())
+            .unwrap();
+        writer.flush_to(fpi_lsn).unwrap();
+        drop(writer);
+
+        // Zero everything from mid-FPI-payload onward: the torn tail shape.
+        let path = tmp.path().join("wal").join("wal-00000001.log");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let torn_from = fpi_lsn.segment_offset(cfg.wal_segment_size)
+            + WAL_RECORD_HEADER_SIZE as u64
+            + 16;
+        let file_len = file.metadata().unwrap().len();
+        assert!(torn_from < file_len);
+        file.seek(SeekFrom::Start(torn_from)).unwrap();
+        file.write_all(&vec![0u8; (file_len - torn_from) as usize])
+            .unwrap();
+        drop(file);
+
+        let mut reader = WalReader::open(tmp.path().join("wal"), cfg.wal_segment_size).unwrap();
+        let first = reader.next_record().unwrap().unwrap();
+        assert_eq!(first.lsn, lsn1);
+        // The torn FPI is discarded as a clean end-of-WAL, rolling the read
+        // position back to its start.
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(reader.current_lsn(), fpi_lsn);
+    }
+
+    #[test]
+    fn read_crc_failure_with_records_after_still_errors() {
+        // A CRC-failing record that is NOT at the tail — valid records follow
+        // it — is genuine mid-file corruption and must remain a hard error.
+        let tmp = TempDir::new().unwrap();
+        let cfg = writer_config(&tmp);
+        let writer = WalWriter::open(tmp.path(), &cfg).unwrap();
+        writer
+            .append(WalRecord::page_alloc(PageId(1)).unwrap())
+            .unwrap();
+        let mid_lsn = writer
+            .append(WalRecord::page_alloc(PageId(2)).unwrap())
+            .unwrap();
+        writer
+            .append(WalRecord::page_alloc(PageId(3)).unwrap())
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        // Flip one padding byte of the middle record (header stays intact).
+        let path = tmp.path().join("wal").join("wal-00000001.log");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let offset = mid_lsn.segment_offset(cfg.wal_segment_size) + WAL_RECORD_HEADER_SIZE as u64;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        drop(file);
+
+        let mut reader = WalReader::open(tmp.path().join("wal"), cfg.wal_segment_size).unwrap();
+        assert!(reader.next_record().unwrap().is_some());
+        assert!(reader.next_record().is_err());
     }
 }

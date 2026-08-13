@@ -983,8 +983,10 @@ fn m2b_crash_rounds_concurrent() {
 }
 
 fn verify_conc_round(round: u64, data_dir: &Path, threads: usize) {
-    let engine = Engine::open(data_dir, EngineConfig::new(data_dir))
-        .unwrap_or_else(|e| panic!("round {round}: engine failed to reopen: {e}"));
+    let engine = Engine::open(data_dir, EngineConfig::new(data_dir)).unwrap_or_else(|e| {
+        preserve_repro_dir(round, data_dir);
+        panic!("round {round}: engine failed to reopen: {e}")
+    });
 
     for t in 0..threads {
         let expectation_path = data_dir.join(conc_expectation_file(t));

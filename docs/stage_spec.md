@@ -241,8 +241,9 @@ split 的 Copy redo 语义是"从既有左页重算搬运"，bulk load 的页是
 - 恢复三遍全量扫描可合并（find_latest 可短路）
 - both-past 跳过的回归测试输入不含 post-copy 插入，对新旧行为不可区分（待补强）
 - 测试缺口：小段 + 段回收、快照 CRC 损坏降级、孤儿快照、checkpoint 介入 split 三步、恢复中二次崩溃
-- `evict_frame` 刷盘失败帧泄漏（pre-existing，非本 stage 引入）
+- `evict_frame` 刷盘失败帧泄漏（pre-existing，非本 stage 引入）→ **已修复**（Stage Q 终审：改为先刷盘后摘映射）
 - coding plan Stage N 表格 `flags >> 12` 系笔误（实现为 `>> 4`），待回写
+- ~~kill -9 撕裂尾部被误判 WAL corrupted~~ **已修复（Stage T 压测抓出）**：writer 被 kill 时记录只写了前缀、预分配段的未写部分读回全零 → CRC 失败被当中段损坏。修复：`is_torn_tail` 双重判定（header LSN == 读取位置 + 记录之后全零）放行撕裂尾部，中段真损坏维持硬报错；真实现场前后对照验证 + 两个确定性单测
 
 ---
 
@@ -502,6 +503,9 @@ loom 的 `Arc` 在 stable 上无法做 `Arc<dyn Trait>` 协变，强行别名会
 
 - loom 模型未覆盖多级树的父页递归 split（状态空间限制；由线程压力测试覆盖）→ 需要时专项模型
 - 1h soak 未实际执行（60s smoke 通过；命令已文档化 `BTREE_SOAK_SECS=3600`）
+- **insert 左跳越界修复（Stage T 压测抓出）**：insert 下降/落叶的左跳曾不受限，可把新条目写过分隔键到左侧页——churn 负载下孪生页被抽干成"黑洞空页"，探测在空页终止返回假 EntryNotFound。修复：insert 专用下降（`descend_to_leaf_for_insert` / `position_for_insert`），左跳限制在同键 run 内；定位型操作（lookup/delete）保持全左跳。回归测试 `btree_insert_left_hop.rs`（红→绿）
+- `btpo_prev` 链接陈旧（split 不更新 `old_next.prev`，prev 恒指最旧左页）：右链是 ground truth 所以无正确性影响，但"born-left 重复键 + 空孪生"极端组合下读路径可能漏条目 → 后续 stage 评估
+- 叶页死空间永不回收（`remove_entry_at` 只缩 LP 数组）：churn 负载下叶页因死空间反复分裂（上述左跳 bug 的放大器）→ 压缩回收涉及 slotted-page/WAL 不变式，单独评估
 - stale 内部分隔键间隙（内部最左子被 delete 抬高 + probe 落间隙）→ 预算耗尽响亮 Unsupported，不自愈 → Known limitation，根治归 Stage S（CLR/分隔键维护）
 - validate 的盲区：同父页下相等分隔键的两个子树被对调时不报警（无代码路径能产生；查找经链 hop 自愈）→ 接受
 - commit barrier 写 guard 覆盖整个 checkpoint（commit 停顿随 split 脏页增多拉长；文档已对齐，收窄归 Phase 7b）

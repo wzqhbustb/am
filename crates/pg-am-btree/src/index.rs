@@ -28,6 +28,18 @@
 //!   only ever caused by a stale separator key, which can only send the
 //!   walk *left of* the target, and the subsequent right walk over
 //!   `btpo_next` (the ground truth) re-establishes the exact position.
+//!   INSERT positioning is the exception: a new entry must land on the leaf
+//!   whose separator range contains its key, so insert descents hop left
+//!   only WITHIN the probe key's own duplicate run (exact `(key, tid)`
+//!   placement, `DuplicateKey` detection) and never past the run's first
+//!   key — otherwise update churn (delete old entry + insert same key)
+//!   migrates the boundary key's entry left of its separator on every pass,
+//!   drains the owning leaf into an empty-page black hole, and eventually
+//!   breaks the chain's key order (Stage T deadlock-stress finding; see
+//!   [`BTreeIndex::descend_to_leaf_for_insert`]). Lookups and deletes keep
+//!   the unrestricted left walk: they LOCATE an existing entry, which a
+//!   split-boundary duplicate run can legitimately place on either side of
+//!   a separator.
 //! - **Optimistic writes** (`insert`/`delete`): the descent runs under read
 //!   latches; only the target leaf is then taken exclusive, and its
 //!   ownership of the probe is **re-validated under the write latch** — a
@@ -523,7 +535,7 @@ impl BTreeIndex {
             page_id: PageId::INVALID,
             slot_id: 0,
         };
-        let (mut guard, _, _) = self.descend_to_leaf_guard(key, &probe_tid)?;
+        let (mut guard, _, _) = self.descend_to_leaf_guard(key, &probe_tid, false)?;
         let mut slot = leaf_lower_bound(as_page(&guard), key, &probe_tid)? as u16;
         // The entry that lower_bound points at is the global first entry
         // `>= (key, -infinity)`; when the page is exhausted it is the first
@@ -569,7 +581,7 @@ impl BTreeIndex {
             page_id: PageId::INVALID,
             slot_id: 0,
         };
-        let (mut guard, _, _) = self.descend_to_leaf_guard(key, &probe_tid)?;
+        let (mut guard, _, _) = self.descend_to_leaf_guard(key, &probe_tid, false)?;
         let mut slot = leaf_lower_bound(as_page(&guard), key, &probe_tid)? as u16;
         // Same walk as `lookup`, but collecting while the entry key matches
         // and stopping at the first greater key (duplicates are adjacent in
@@ -622,7 +634,7 @@ impl BTreeIndex {
             page_id: PageId::INVALID,
             slot_id: 0,
         };
-        let (mut guard, _, _) = self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid)?;
+        let (mut guard, _, _) = self.descend_to_leaf_guard(start.unwrap_or(&[]), &probe_tid, false)?;
         let mut slot = match start {
             Some(s) => leaf_lower_bound(as_page(&guard), s, &probe_tid)? as u16,
             None => 0,
@@ -674,9 +686,44 @@ impl BTreeIndex {
     /// inserts/deletes probe with the entry's real TID.
     ///
     /// This is the PageId view of `BTreeIndex::descend_to_leaf_guard` for
-    /// callers (insert, validate) that re-latch the leaf themselves.
+    /// callers (delete, validate) that re-latch the leaf themselves.
     pub fn descend_to_leaf(&self, key: &[u8], tid: &Tid) -> Result<(PageId, Vec<PageId>, bool)> {
-        let (guard, path, hopped) = self.descend_to_leaf_guard(key, tid)?;
+        let (guard, path, hopped) = self.descend_to_leaf_guard(key, tid, false)?;
+        Ok((guard.page_id(), path, hopped))
+    }
+
+    /// The INSERT positioning descent (Stage T deadlock-stress fix): like
+    /// [`BTreeIndex::descend_to_leaf`], but left hops are restricted to the
+    /// probe key's OWN duplicate run — the walk moves left only while the
+    /// current leaf's first entry carries the probe's key and sorts above
+    /// the probe (exact `(key, tid)` placement inside a run that spans
+    /// siblings, e.g. for `DuplicateKey` detection). It NEVER hops left
+    /// merely because the leaf's first KEY is greater: a new entry must
+    /// land on the leaf whose separator range contains its key — the leaf
+    /// `find_child` selects, adjusted by right hops (the Blink mechanism
+    /// for splits whose downlink is still in flight). The unrestricted
+    /// `(key, tid)` left hop placed the entry LEFT of the separator that
+    /// owns its key: the boundary key's entry migrated left every time an
+    /// update's delete-then-insert passed through (the delete raises the
+    /// right leaf's first entry above the probe, which the dominated check
+    /// reads as "sorts before this page"), draining the right leaf until it
+    /// was EMPTY. An empty leaf terminates every ownership walk (it is
+    /// never dominated and owns nothing rightward), so later probes for the
+    /// migrated key black-holed on the empty page — lookups missed the
+    /// entry sitting on the left leaf and deletes returned a spurious
+    /// `EntryNotFound`. Worse, once the left leaf holds keys from its right
+    /// sibling's range, ITS next split splices a twin whose key range
+    /// overlaps the older twins — the sibling chain falls out of key order
+    /// and the tree degrades beyond local repair. Locating an EXISTING
+    /// entry (lookup/delete) keeps the unrestricted left walk:
+    /// split-boundary duplicates can legitimately sit on either side of a
+    /// separator.
+    fn descend_to_leaf_for_insert(
+        &self,
+        key: &[u8],
+        tid: &Tid,
+    ) -> Result<(PageId, Vec<PageId>, bool)> {
+        let (guard, path, hopped) = self.descend_to_leaf_guard(key, tid, true)?;
         Ok((guard.page_id(), path, hopped))
     }
 
@@ -688,7 +735,7 @@ impl BTreeIndex {
         key: &[u8],
         tid: &Tid,
     ) -> Result<(PageId, Vec<PageId>, bool)> {
-        let (guard, path, hopped) = self.descend_to_leaf_guard_from(root, key, tid)?;
+        let (guard, path, hopped) = self.descend_to_leaf_guard_from(root, key, tid, false)?;
         Ok((guard.page_id(), path, hopped))
     }
 
@@ -703,18 +750,27 @@ impl BTreeIndex {
         &'a self,
         key: &[u8],
         tid: &Tid,
+        position_for_insert: bool,
     ) -> Result<(PageGuard<'a>, Vec<PageId>, bool)> {
-        self.descend_to_leaf_guard_from(self.root_page, key, tid)
+        self.descend_to_leaf_guard_from(self.root_page, key, tid, position_for_insert)
     }
 
     /// `BTreeIndex::descend_to_leaf_guard` starting from an explicit root
     /// (used by `validate`, which re-reads the authoritative root from the
     /// meta page instead of trusting the handle's cache — review M2).
+    ///
+    /// `position_for_insert` selects POSITION semantics (`true`: where a NEW
+    /// entry must go — left hops stay inside the probe key's duplicate run;
+    /// see [`BTreeIndex::descend_to_leaf_for_insert`]) versus LOCATE
+    /// semantics (`false`: find where an existing entry may sit —
+    /// split-boundary duplicates can live left of their separator, so the
+    /// left walk is unrestricted).
     fn descend_to_leaf_guard_from<'a>(
         &'a self,
         root: PageId,
         key: &[u8],
         tid: &Tid,
+        position_for_insert: bool,
     ) -> Result<(PageGuard<'a>, Vec<PageId>, bool)> {
         let mut path = Vec::new();
         let mut hopped = false;
@@ -727,7 +783,8 @@ impl BTreeIndex {
             // can span siblings), so the exact page is found by walking the
             // sibling chain both ways. Right hops are the Blink mechanism
             // (§13.2); left hops cover stale separators.
-            guard = self.walk_to_position_guard(guard, key, tid, level, &mut hopped)?;
+            guard =
+                self.walk_to_position_guard(guard, key, tid, level, &mut hopped, position_for_insert)?;
             if level == 0 {
                 return Ok((guard, path, hopped));
             }
@@ -759,6 +816,13 @@ impl BTreeIndex {
     /// can only send the walk left of the target, and the right walk is the
     /// ground-truth mechanism that re-establishes the position. An empty
     /// sibling (Prepare without Copy) owns no keys and is never hopped onto.
+    ///
+    /// `position_for_insert = true` (insert positioning) restricts left hops
+    /// to the probe key's OWN duplicate run: the walk moves left only while
+    /// the current leaf's first entry carries the probe's key and sorts
+    /// above the probe. Hopping left of the key's run would strand the new
+    /// entry left of the separator that owns its key (see
+    /// [`BTreeIndex::descend_to_leaf_for_insert`]).
     fn walk_to_position_guard<'a>(
         &'a self,
         mut guard: PageGuard<'a>,
@@ -766,6 +830,7 @@ impl BTreeIndex {
         tid: &Tid,
         level: u8,
         hopped: &mut bool,
+        position_for_insert: bool,
     ) -> Result<PageGuard<'a>> {
         let mut hops = 0usize;
         loop {
@@ -774,14 +839,19 @@ impl BTreeIndex {
             // Left: if cur's first entry is greater than the probe, the
             // probe sorts before cur (stale separator or duplicate run).
             // Leaves compare the full `(key, tid)` order; internal pages
-            // compare keys strictly.
+            // compare keys strictly. Insert positioning hops left only
+            // within the probe key's own duplicate run (see the fn doc).
             let prev = {
                 let page = as_page(&guard);
                 let dominated = if SlottedPage::slot_count(page) == 0 {
                     false
                 } else if level == 0 {
                     let (fk, ft) = page::decode_leaf_entry(entry_bytes(page, 0)?)?;
-                    (fk, ft) > (key, *tid)
+                    if position_for_insert {
+                        fk == key && ft > *tid
+                    } else {
+                        (fk, ft) > (key, *tid)
+                    }
                 } else {
                     let (fk, _) = page::decode_internal_entry(entry_bytes(page, 0)?)?;
                     fk > key
@@ -888,8 +958,12 @@ impl BTreeIndex {
                 self.refresh_root_from_meta()?;
             }
             // ---- optimistic attempt ----
-            let (leaf, _path, _hopped) = self.descend_to_leaf(key, &tid)?;
-            let (mut guard, _hopped_revalidated) = self.pin_leaf_for_write(leaf, key, &tid)?;
+            // POSITION semantics (left hops only within the probe key's own
+            // duplicate run): the new entry must land on the leaf that owns
+            // its key range — see `descend_to_leaf_for_insert`.
+            let (leaf, _path, _hopped) = self.descend_to_leaf_for_insert(key, &tid)?;
+            let (mut guard, _hopped_revalidated) =
+                self.pin_leaf_for_write(leaf, key, &tid, true)?;
             let fits_at = {
                 let page = as_page_mut(&mut guard);
                 let pos = leaf_insert_slot(page, key, &tid)?;
@@ -939,6 +1013,15 @@ impl BTreeIndex {
     /// and the write descent there decides via the parent-downlink check
     /// whether a twin may be split (see [`BTreeIndex::insert`]).
     ///
+    /// `position_for_insert` mirrors the descent mode: `false` for DELETE
+    /// (locate an existing entry — split-boundary duplicates can sit left of
+    /// their separator, so the left walk is unrestricted), `true` for INSERT
+    /// (position a new entry — left hops stay inside the probe key's
+    /// duplicate run; hopping left of the run would strand the entry left of
+    /// the separator that owns its key, draining the owning leaf into an
+    /// empty-page black hole; see
+    /// [`BTreeIndex::descend_to_leaf_for_insert`]).
+    ///
     /// # SPLIT_INCOMPLETE / FPI discipline (Stage T P0 residual)
     ///
     /// In-window writes on a page whose split Commit is in flight are a
@@ -967,6 +1050,7 @@ impl BTreeIndex {
         leaf: PageId,
         key: &[u8],
         tid: &Tid,
+        position_for_insert: bool,
     ) -> Result<(PageGuardMut<'_>, bool)> {
         let mut guard = self.buffer_pool.pin_mut_without_fpi(leaf)?;
         let mut hopped = false;
@@ -980,14 +1064,20 @@ impl BTreeIndex {
                 self.buffer_pool.ensure_fpi(&mut guard)?;
             }
             // Left edge: the first entry sorts above the probe (stale
-            // separator, or concurrent physical deletes).
+            // separator, or concurrent physical deletes). Insert
+            // positioning hops left only within the probe key's own
+            // duplicate run (see the fn doc).
             let prev = {
                 let page = as_page_mut(&mut guard);
                 let dominated = if SlottedPage::slot_count(page) == 0 {
                     false
                 } else {
                     let (fk, ft) = page::decode_leaf_entry(entry_bytes(page, 0)?)?;
-                    (fk, ft) > (key, *tid)
+                    if position_for_insert {
+                        fk == key && ft > *tid
+                    } else {
+                        (fk, ft) > (key, *tid)
+                    }
                 };
                 if dominated {
                     Some(BtreePage::prev(page)?)
@@ -1159,7 +1249,18 @@ impl BTreeIndex {
                     false
                 } else if BtreePage::level(page)? == 0 {
                     let (fk, ft) = page::decode_leaf_entry(entry_bytes(page, 0)?)?;
-                    (fk, ft) > (key, *tid)
+                    // Insert positioning (Stage T deadlock-stress fix): a
+                    // leaf dominates the probe only WITHIN the probe key's
+                    // own duplicate run. A first entry with a GREATER key
+                    // does not send the walk left — the probe's key belongs
+                    // to this leaf's separator range even when no entry with
+                    // the key is currently present (e.g. an update's delete
+                    // just removed the boundary key's last entry); hopping
+                    // left there strands the new entry left of its
+                    // separator, and the repeated delete-then-insert of
+                    // update churn drains the owning leaf into an empty-page
+                    // black hole (see `descend_to_leaf_for_insert`).
+                    fk == key && ft > *tid
                 } else {
                     let (fk, _) = page::decode_internal_entry(entry_bytes(page, 0)?)?;
                     fk > key
@@ -1200,10 +1301,11 @@ impl BTreeIndex {
                     // Stage Q limitation (module doc), not silent corruption.
                     return Ok(None);
                 }
-                // Leaf-level left hop: safe to walk. The internal levels
-                // above already placed the probe inside the stack-top's
-                // range, and the leaf chain is contiguous across parents,
-                // so the walked-to leaf stays under the same parent.
+                // Leaf-level left hop within the probe key's duplicate run
+                // (see the dominated computation above): safe to walk. The
+                // internal levels above already placed the probe inside the
+                // stack-top's range, and the leaf chain is contiguous across
+                // parents, so the walked-to leaf stays under the same parent.
                 drop(guard);
                 guard = pool.pin_mut_without_fpi(prev)?;
                 hops += 1;
@@ -1855,8 +1957,10 @@ impl BTreeIndex {
         // A SPLIT_INCOMPLETE leaf (its Commit in flight) is deleted from
         // normally — an in-window write is a designed Stage S case; only
         // the page's cycle FPI is suppressed for this hold (see
-        // `pin_leaf_for_write`).
-        let (mut guard, _) = self.pin_leaf_for_write(leaf, key, &tid)?;
+        // `pin_leaf_for_write`). LOCATE semantics: left hops stay enabled —
+        // the entry being deleted may be a split-boundary duplicate sitting
+        // left of its separator.
+        let (mut guard, _) = self.pin_leaf_for_write(leaf, key, &tid, false)?;
         // The WAL record must name the page the delete is APPLIED to — the
         // re-validated guard's page, which is not necessarily the descent's
         // `leaf` (a hop moved us to a right twin). Logging the stale id
