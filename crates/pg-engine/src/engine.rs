@@ -144,7 +144,9 @@ use pg_storage::clog::ClogFlush;
 use pg_storage::config::StorageConfig;
 use pg_storage::engine::StorageEngine;
 use pg_storage::recovery::{AttProvider, UndoHandler};
-use pg_storage::types::{Oid, PageId, Tid, TxnId, PAGE_SIZE};
+use pg_storage::types::{Lsn, Oid, PageId, Tid, TxnId, PAGE_SIZE};
+use pg_storage::wal::reader::WalReader;
+use pg_storage::wal::record::{HeapDeleteRecord, HeapUpdateRecord, WalRecord, WalRecordType};
 use pg_storage::wal::WalWriter;
 use pg_txn::{
     is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, DeadlockDetector,
@@ -717,7 +719,7 @@ impl Engine {
             config.deadlock_detector_interval,
         );
 
-        Ok(Self {
+        let engine = Self {
             storage,
             catalog,
             heap,
@@ -730,7 +732,27 @@ impl Engine {
             ddl_lock: Mutex::new(()),
             instance_id: NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             index_undo: Arc::new(Mutex::new(HashMap::new())),
-        })
+        };
+
+        // 7c. Recovery-time index compensation for loser transactions
+        //     (Stage T stress finding): index maintenance WAL records are
+        //     physical (xid=0), so the CLOG/MVCC filtering that hides a
+        //     loser transaction's heap tuples does NOT cover the index. A
+        //     crash between a transaction's index maintenance and its
+        //     commit/abort record leaves the index physically updated
+        //     while the heap side stays invisible:
+        //
+        //     - loser-INSERTED entries point at invisible tuples — masked
+        //       by `index_lookup`'s visibility filter, no action needed;
+        //     - loser-DELETED entries (delete / non-HOT update old side)
+        //       leave a still-visible row with NO index entry — not
+        //       recoverable by filtering; compensated here by re-inserting
+        //       `(key, tid)` recomputed from the row's on-page bytes.
+        //
+        //     Idempotent across repeated recoveries: each re-insert is
+        //     preceded by an exact `(key, tid)` existence check.
+        engine.compensate_loser_index_entries(data_dir)?;
+        Ok(engine)
     }
 
     /// Rebuild the table registry from the catalog snapshot.
@@ -1773,6 +1795,220 @@ impl Engine {
         debug_assert_eq!(values.len(), entry.columns.len());
         Ok(values)
     }
+
+/// Find the first WAL record whose start lies inside segment `segment_id`
+/// by probing 8-byte-aligned offsets from the segment start with a
+/// CRC-checked decode (WAL records may straddle segment boundaries, so a
+/// segment start is NOT itself a record boundary). Used by the loser index
+/// compensation to extend its scan to the front of the retained segment.
+/// Returns `None` when nothing decodes within one maximum record length of
+/// the segment start, or when the first record starts at/after
+/// `upper_bound` (nothing to gain by rewinding).
+fn first_record_lsn_in_segment(
+    wal_dir: &Path,
+    segment_size: u64,
+    segment_id: u64,
+    upper_bound: Lsn,
+) -> Option<Lsn> {
+    use std::io::{Read, Seek, SeekFrom};
+    // pg-storage wal/segment.rs filename layout: wal-{segment_id + 1:08}.log.
+    let path = wal_dir.join(format!("wal-{:08}.log", segment_id + 1));
+    let mut file = std::fs::File::open(path).ok()?;
+    const HEADER: u64 = 32; // wal/record.rs fixed record header
+    const MAX_RECORD: u64 = HEADER + u16::MAX as u64 + 8; // length prefix is u16
+    // The segment FILE holds the segment's bytes at file offset 0 (file
+    // offset = global LSN - segment start).
+    let seg_start = segment_id * segment_size;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    // Probe window: one max record for a straddling record's tail, plus one
+    // max record so the candidate itself can be decoded fully.
+    let window_len = (2 * MAX_RECORD).min(segment_size);
+    let mut window = Vec::new();
+    file.by_ref()
+        .take(window_len)
+        .read_to_end(&mut window)
+        .ok()?;
+    // WAL records are 8-byte aligned (pg-storage LSN_ALIGNMENT); the
+    // resync probe steps by it.
+    const PROBE_STEP: usize = 8;
+    let mut off = 0usize;
+    while off as u64 <= MAX_RECORD && off + HEADER as usize <= window.len() {
+        let payload_len =
+            u16::from_le_bytes(window[off + 26..off + 28].try_into().unwrap()) as u64;
+        let total = (HEADER + payload_len).next_multiple_of(8);
+        let end = off + total as usize;
+        if end <= window.len() {
+            if let Ok((rec, _)) = WalRecord::decode(&window[off..end]) {
+                // CRC passed; the position check pins the candidate to its
+                // header LSN, ruling out a coincidental decode of tail bytes.
+                if rec.lsn.0 == seg_start + off as u64 {
+                    let found = Lsn(seg_start + off as u64);
+                    return (found < upper_bound).then_some(found);
+                }
+            }
+        }
+        off += PROBE_STEP;
+    }
+    None
+}
+
+    /// Recovery-time index compensation for loser transactions (see the
+    /// `Engine::open` step 7c note). Scans the post-redo-point WAL for
+    /// `HeapDelete` / non-HOT `HeapUpdate` records of transactions that
+    /// never reached a terminal record, and re-inserts the index entries
+    /// those records physically removed. The removal is replayed
+    /// unconditionally by redo (index records carry xid=0), while the heap
+    /// side stays visible through the CLOG — without this step a committed,
+    /// visible row can lose its index entry whenever a crash lands inside
+    /// an in-flight delete/update.
+    ///
+    /// Idempotent: an entry is re-inserted only if the exact `(key, tid)`
+    /// pair is absent, so a crash mid-compensation re-runs cleanly, and a
+    /// second recovery after a clean one is a no-op.
+    ///
+    /// Boundary (documented): a loser whose delete/update record sits in a
+    /// WAL segment that checkpoint recycling has already dropped is not
+    /// compensable from the retained WAL. The scan rewinds to the first
+    /// record starting inside the redo start's segment (CRC-checked
+    /// resync), so the record must predate every segment that survived the
+    /// last checkpoint — only reachable with hand-held multi-checkpoint
+    /// transactions.
+    fn compensate_loser_index_entries(&self, data_dir: &Path) -> Result<()> {
+        let losers: HashSet<TxnId> = self
+            .storage
+            .recovered_active_xids()
+            .iter()
+            .copied()
+            .collect();
+        if losers.is_empty() {
+            return Ok(());
+        }
+
+        // Collect the loser transactions' victim row versions: each of
+        // these records physically removed the version's index entries.
+        //
+        // Scan-start choice (post-Stage-T review): the loser's delete may
+        // predate `recovered_redo_start` — the redo start is pulled back
+        // only for pages still DIRTY at the checkpoint's DPT sample, so a
+        // victim page flushed earlier (e.g. evicted under pool pressure)
+        // anchors nothing, and its delete record can sit in the same
+        // retained segment but BEFORE the redo start. WAL records may
+        // straddle segments, so a bare segment start is NOT a usable
+        // boundary; instead the scan rewinds to the first record starting
+        // inside the redo start's segment, found by a CRC-checked resync
+        // probe (`first_record_lsn_in_segment`). Once recycling has dropped
+        // the segment holding a loser's delete, the shape is no longer
+        // compensable from the retained WAL — the documented boundary (see
+        // fn doc).
+        let seg = self.storage.config().wal_segment_size;
+        let redo_start = self.storage.recovered_redo_start();
+        let wal_dir = data_dir.join("wal");
+        // A redo start in segment 0 scans from Lsn::FIRST: records begin at
+        // offset 8 there, not at the segment's byte 0.
+        let scan_start = if redo_start.segment_id(seg) == 0 {
+            Lsn::FIRST
+        } else {
+            redo_start
+        };
+        // Recovery's own replay opened at redo_start successfully, so this
+        // segment necessarily survives recycling.
+        let mut reader = WalReader::open_at(&wal_dir, seg, scan_start)?;
+        if scan_start != Lsn::FIRST {
+            if let Some(first) = Self::first_record_lsn_in_segment(
+                &wal_dir,
+                seg,
+                scan_start.segment_id(seg),
+                scan_start,
+            ) {
+                reader = WalReader::open_at(&wal_dir, seg, first)?;
+            }
+        }
+        let mut victim_tids: Vec<Tid> = Vec::new();
+        while let Some(rec) = reader.next_record()? {
+            if !losers.contains(&rec.txn_id) {
+                continue;
+            }
+            match rec.record_type {
+                WalRecordType::HeapDelete => {
+                    victim_tids.push(HeapDeleteRecord::decode(&rec.payload)?.tid);
+                }
+                WalRecordType::HeapUpdate => {
+                    // HeapHotUpdate never touches the index (key columns
+                    // unchanged by definition); a non-HOT HeapUpdate is
+                    // always paired with index delete+insert online.
+                    victim_tids.push(HeapUpdateRecord::decode(&rec.payload)?.old_tid);
+                }
+                _ => {}
+            }
+        }
+        if victim_tids.is_empty() {
+            return Ok(());
+        }
+        victim_tids.sort_by_key(|t| (t.page_id.0, t.slot_id));
+        victim_tids.dedup();
+
+        // page → owning table map (chain walk per live table).
+        let mut tables: Vec<(TableEntry, Vec<ColumnType>, HashSet<PageId>)> = Vec::new();
+        {
+            let registry = self.registry.read();
+            for entry in registry.values() {
+                let col_types = column_types(entry);
+                let pages: HashSet<PageId> = self
+                    .heap
+                    .relation_pages(&relation_desc(entry, &col_types))?
+                    .into_iter()
+                    .collect();
+                tables.push((entry.clone(), col_types, pages));
+            }
+        }
+
+        let mut compensated = 0usize;
+        for tid in victim_tids {
+            let Some((entry, col_types, _)) =
+                tables.iter().find(|(_, _, pages)| pages.contains(&tid.page_id))
+            else {
+                // The page belongs to no live table (dropped-table remnant
+                // or freelist reuse) — nothing live can reference the row.
+                tracing::warn!(
+                    page = tid.page_id.0,
+                    slot = tid.slot_id,
+                    "loser index compensation: no live table owns this page; skipping"
+                );
+                continue;
+            };
+            let indexes = self.indexes_of(entry);
+            if indexes.is_empty() {
+                continue;
+            }
+            // The row version's bytes are intact on its page (redo at most
+            // stamped the loser's xmax). Same chain-root rule as the online
+            // delete/update paths: HOT descendants never own entries.
+            let old_values = self.read_row_by_tid(entry, col_types, tid)?;
+            let index_tid = self.hot_chain_root(tid)?;
+            for (idx, col_index) in &indexes {
+                let Some(old_datum) = &old_values[*col_index] else {
+                    continue; // NULL keys carry no entry (online rule)
+                };
+                let key = encode_key(old_datum)?;
+                let mut index = self.open_btree(idx)?;
+                if index.lookup_all(&key)?.contains(&index_tid) {
+                    continue; // idempotent re-run
+                }
+                index.insert_with_budget(&key, index_tid, UNDO_INSERT_RESTART_BUDGET)?;
+                compensated += 1;
+            }
+        }
+        if compensated > 0 {
+            tracing::warn!(
+                compensated,
+                losers = losers.len(),
+                "recovery compensated loser transactions' index deletes \
+                 (crash inside an in-flight delete/update)"
+            );
+        }
+        Ok(())
+    }
+
 
     /// Begin an explicit transaction, returning a [`TxnHandle`] for
     /// commit/abort control (§21 M2b API). The snapshot is taken at this

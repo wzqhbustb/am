@@ -251,7 +251,11 @@ impl HeapAM {
 
     /// Return a snapshot of the pages tracked for `rel`, seeding the cache
     /// from the on-disk chain on first touch.
-    fn relation_pages(&self, rel: &RelationDesc<'_>) -> Result<Vec<PageId>> {
+    ///
+    /// Pub for pg-engine's recovery-time loser compensation (it maps heap
+    /// pages back to their owning table); ordinary callers should go
+    /// through the AM operations.
+    pub fn relation_pages(&self, rel: &RelationDesc<'_>) -> Result<Vec<PageId>> {
         if let Some(pages) = self
             .pages
             .lock()

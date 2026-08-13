@@ -56,6 +56,67 @@
 //!   re-latch of `st.left` is a plain down-acquisition. A parent without
 //!   room for the downlink is split recursively under the same discipline.
 //!
+//! # FPI-before-commit (Stage T P0)
+//!
+//! A `BTreeSplitCommit` record modifies two pages (parent downlink, left
+//! flag clear). If a checkpoint opened a new FPI cycle between the split's
+//! Copy and its Commit, the `pin_mut` that applies the Commit fires the
+//! page's cycle FPI — and because the Commit record is appended FIRST, that
+//! FPI lands AFTER the Commit while capturing a PRE-commit image
+//! (`SPLIT_INCOMPLETE` still set / downlink still missing). Recovery
+//! replays an FPI unconditionally and patches `pd_lsn` to the FPI's LSN, so
+//! the Commit redo's `pd_lsn` guard then skips its page effects: the
+//! already-committed split is rolled back to "incomplete", and the
+//! undo-time page scan emits a spurious finishing CLR with a duplicate
+//! parent downlink. (Stage T stress finding; forensic dump
+//! /tmp/conc_repro_35: FPI @1209856 with pre-commit image for a Commit
+//! @1209304.)
+//!
+//! The fix keeps the latch choreography exactly as above (holding the left
+//! latch across the append/parent touch deadlocks against the optimistic
+//! right-hop/coupling paths) and instead splits the acquisition in two:
+//!
+//! 1. **Pre-touch**: before the Commit record's WAL position is fixed, a
+//!    scoped `pin_mut` of each page the Commit modifies (parent before
+//!    left, down the tree) emits any due cycle FPI — necessarily at an LSN
+//!    below the Commit's.
+//! 2. **Apply**: after the append, the page is re-pinned with
+//!    [`BufferPool::pin_mut_without_fpi`], which cannot fire a second FPI
+//!    if a checkpoint published in the pre-touch → re-pin window. The
+//!    suppressed FPI is redo-safe (the Commit's LSN exceeds that
+//!    checkpoint's begin, so replay re-applies it); the residual exposure
+//!    is torn-write-only — see the method's doc.
+//!
+//! # Third-party FPI interposition (Stage T P0 residual)
+//!
+//! The pre-touch/apply split leaves one window: between the Commit's append
+//! and its flag-clearing apply, `st.left` is unlatched and still carries
+//! `SPLIT_INCOMPLETE`. A THIRD PARTY write-latching the page in that window
+//! with a plain `pin_mut` could fire the page's cycle FPI (if a checkpoint
+//! published after the pre-touch) — again a post-Commit FPI with a
+//! pre-Commit image. In-window writes on such a page are a DESIGNED Stage S
+//! feature (the undo CLR's NoMove truncation accounts for them), so the
+//! leaf write paths must neither refuse the page nor emit that FPI:
+//!
+//! - `pin_leaf_for_write` (optimistic insert + delete) and
+//!   `descend_write_path` (pessimistic insert) acquire via
+//!   `pin_mut_without_fpi`, then call [`BufferPool::ensure_fpi`] under the
+//!   held latch ONLY when the page is not `SPLIT_INCOMPLETE`. The flag is
+//!   stable under the held latch (Prepare sets it, the Commit's apply
+//!   clears it — both need this latch), so the check is race-free; a
+//!   flagged page proceeds FPI-free (the in-window record replays
+//!   normally — redo-safe by the same argument as `pin_mut_without_fpi`,
+//!   torn-write-only residual). Deliberately there is NO "is an FPI due?"
+//!   probe feeding the decision: such a probe would TOCTOU against a
+//!   checkpoint publishing between the probe and `ensure_fpi`'s own gate
+//!   read (post-Stage-T-review item 2). The pessimistic descent still
+//!   restarts on the flag as before (the path above a flagged page cannot
+//!   be trusted) — it just no longer emits an FPI for it on the way out.
+//!
+//! The split protocol's own steps are unaffected: Prepare/Copy/parent
+//! downlink FPIs all fire before their records' WAL positions are fixed
+//! (guards held from before the append, or the step API's natural order).
+//!
 //! Every pessimistic pass holds the root write latch from its descent
 //! through its Commit, so online splits are serialized against each other;
 //! readers and optimistic leaf inserts still proceed concurrently.
@@ -217,6 +278,17 @@ thread_local! {
     /// tests.
     #[doc(hidden)]
     pub static UNDO_CASCADE_FAILURES: Cell<usize> = const { Cell::new(0) };
+
+    /// Test hook (post-Stage-T P0 review, `test-hooks` feature): when true
+    /// **in the current thread**, the guarded root-split Commit simulates a
+    /// checkpoint landing in the (create_new_root, Commit append) window —
+    /// it flushes every dirty page (so the brand-new root gets an on-disk
+    /// image, `needs_fpi = true`) and publishes the current LSN as the
+    /// checkpoint LSN — right before the Commit's pre-touch. Lets tests
+    /// force the exact FPI-before-commit interleaving on the online path.
+    /// One-shot (auto-clears). Never set outside tests.
+    #[doc(hidden)]
+    pub static SPLIT_COMMIT_ROOT_CKPT_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Consume one injected undo-cascade failure (see [`UNDO_CASCADE_FAILURES`]);
@@ -866,16 +938,47 @@ impl BTreeIndex {
     /// the leaf. A full leaf escalates to the pessimistic pass regardless,
     /// and the write descent there decides via the parent-downlink check
     /// whether a twin may be split (see [`BTreeIndex::insert`]).
+    ///
+    /// # SPLIT_INCOMPLETE / FPI discipline (Stage T P0 residual)
+    ///
+    /// In-window writes on a page whose split Commit is in flight are a
+    /// DESIGNED Stage S feature (the undo CLR's NoMove truncation accounts
+    /// for them), so this path never refuses `SPLIT_INCOMPLETE` pages. The
+    /// one thing it must never do is emit the page's cycle FPI while the
+    /// Commit is in flight (record appended, flag clear not yet applied):
+    /// that FPI would land after the Commit record with a pre-commit
+    /// image, and recovery's unconditional FPI replay would roll the page
+    /// back past the Commit (resurrected `SPLIT_INCOMPLETE` → spurious undo
+    /// CLR → duplicate downlink). So acquisitions go through
+    /// [`BufferPool::pin_mut_without_fpi`], and [`BufferPool::ensure_fpi`]
+    /// is called ONLY for pages without a Commit in flight: the flag is
+    /// stable under the held write latch (Prepare sets it and the Commit's
+    /// apply clears it, both needing this latch), so checking it once per
+    /// acquisition is race-free — and skipping the FPI for a flagged page
+    /// is redo-safe by the same argument as `pin_mut_without_fpi` (the
+    /// in-window modification's record LSN exceeds any intervening
+    /// checkpoint's begin, so replay re-applies it; the residual exposure
+    /// is torn-write-only). Skipping the gate evaluation entirely for
+    /// flagged pages also removes the check-then-emit TOCTOU a two-step
+    /// "is an FPI due?" probe would have against a concurrent checkpoint
+    /// publication.
     fn pin_leaf_for_write(
         &self,
         leaf: PageId,
         key: &[u8],
         tid: &Tid,
     ) -> Result<(PageGuardMut<'_>, bool)> {
-        let mut guard = self.buffer_pool.pin_mut(leaf)?;
+        let mut guard = self.buffer_pool.pin_mut_without_fpi(leaf)?;
         let mut hopped = false;
         let mut hops = 0usize;
         loop {
+            // See the fn doc: emit the cycle FPI only when no split Commit
+            // is in flight for this page.
+            let split_incomplete =
+                BtreePage::flags(as_page_mut(&mut guard))? & BTREE_FLAG_SPLIT_INCOMPLETE != 0;
+            if !split_incomplete {
+                self.buffer_pool.ensure_fpi(&mut guard)?;
+            }
             // Left edge: the first entry sorts above the probe (stale
             // separator, or concurrent physical deletes).
             let prev = {
@@ -895,7 +998,7 @@ impl BTreeIndex {
             if let Some(prev) = prev {
                 if prev != PageId::INVALID {
                     drop(guard);
-                    guard = self.buffer_pool.pin_mut(prev)?;
+                    guard = self.buffer_pool.pin_mut_without_fpi(prev)?;
                     hops += 1;
                     if hops > MAX_CHAIN_HOPS {
                         return Err(BTreeError::Corrupted(
@@ -928,7 +1031,7 @@ impl BTreeIndex {
                 return Ok((guard, hopped));
             }
             // Coupled right hop under write latches.
-            let next_guard = self.buffer_pool.pin_mut(next)?;
+            let next_guard = self.buffer_pool.pin_mut_without_fpi(next)?;
             drop(guard);
             guard = next_guard;
             hopped = true;
@@ -1036,7 +1139,11 @@ impl BTreeIndex {
         tid: &Tid,
     ) -> Result<Option<Vec<PageGuardMut<'a>>>> {
         let mut stack: Vec<PageGuardMut<'_>> = Vec::new();
-        let mut guard = pool.pin_mut(root_page)?;
+        // Acquisitions go through `pin_mut_without_fpi`; the cycle FPI is
+        // emitted by `ensure_fpi` only AFTER the per-page checks below pass
+        // (see the split_incomplete arm for why a plain `pin_mut` here could
+        // emit a stale post-Commit FPI — Stage T P0 residual).
+        let mut guard = pool.pin_mut_without_fpi(root_page)?;
         {
             let page = as_page_mut(&mut guard);
             if BtreePage::flags(page)? & BTREE_FLAG_ROOT == 0 {
@@ -1068,9 +1175,16 @@ impl BTreeIndex {
             if split_incomplete {
                 // Another split's Commit is in flight (only observable in
                 // the root-split commit window) or was lost (post-crash).
-                // Restart; the budget distinguishes the two.
+                // Restart; the budget distinguishes the two. The guard was
+                // taken WITHOUT an FPI on purpose: firing the cycle FPI
+                // here could land it after the in-flight Commit record with
+                // a pre-Commit image (Stage T P0 residual — recovery's
+                // unconditional FPI replay would resurrect the flag).
                 return Ok(None);
             }
+            // The page passed the abort checks and stays on the path: emit
+            // its due cycle FPI before anything can modify it.
+            pool.ensure_fpi(&mut guard)?;
             if dominated && prev != PageId::INVALID {
                 if level != 0 {
                     // INTERNAL-level left hop = the probe fell into a stale
@@ -1091,7 +1205,7 @@ impl BTreeIndex {
                 // range, and the leaf chain is contiguous across parents,
                 // so the walked-to leaf stays under the same parent.
                 drop(guard);
-                guard = pool.pin_mut(prev)?;
+                guard = pool.pin_mut_without_fpi(prev)?;
                 hops += 1;
                 if hops > MAX_CHAIN_HOPS {
                     return Err(BTreeError::Corrupted(
@@ -1145,7 +1259,7 @@ impl BTreeIndex {
                     // `next` in the drop window, but the re-validation
                     // always runs on the page actually latched.
                     drop(guard);
-                    guard = pool.pin_mut(next)?;
+                    guard = pool.pin_mut_without_fpi(next)?;
                     hops += 1;
                     if hops > MAX_CHAIN_HOPS {
                         return Err(BTreeError::Corrupted(
@@ -1162,7 +1276,7 @@ impl BTreeIndex {
             let child = find_child(as_page_mut(&mut guard), key)?;
             // Write crabbing: the child's write latch is acquired while the
             // parent's is still held.
-            let child_guard = pool.pin_mut(child)?;
+            let child_guard = pool.pin_mut_without_fpi(child)?;
             stack.push(guard);
             guard = child_guard;
         }
@@ -1199,16 +1313,36 @@ impl BTreeIndex {
                 )));
             }
             let new_root = self.create_new_root(st)?;
+            // Test hook (see SPLIT_COMMIT_ROOT_CKPT_HOOK): simulate a
+            // checkpoint publishing + flushing the brand-new root in the
+            // (create_new_root, Commit append) window.
+            #[cfg(feature = "test-hooks")]
+            if SPLIT_COMMIT_ROOT_CKPT_HOOK.with(|c| c.replace(false)) {
+                for page in self.buffer_pool.dirty_page_ids() {
+                    self.buffer_pool.flush(page)?;
+                }
+                let ckpt = self.wal_writer.current_lsn();
+                self.buffer_pool.set_checkpoint_lsn(ckpt);
+            }
+            // FPI-before-commit pre-touch (module doc): emit the cycle FPI,
+            // if due, of BOTH pages this Commit modifies — new_root first
+            // (parent), then st.left — BEFORE the record's WAL position is
+            // fixed. new_root is fresh (needs_fpi=false), so its pre-touch
+            // is normally a no-op; it matters when a checkpoint flushed the
+            // new root in the window above (needs_fpi=true, pd_lsn=seed <
+            // begin) — the applies below re-pin with the FPI suppressed.
+            drop(self.buffer_pool.pin_mut(new_root)?);
+            drop(self.buffer_pool.pin_mut(st.left)?);
             let rec = WalRecord::btree_split_commit(st.left, st.right, new_root, separator, 1)?;
             let lsn = self.wal_writer.append(rec)?;
             {
-                let mut guard = self.buffer_pool.pin_mut(new_root)?;
+                let mut guard = self.buffer_pool.pin_mut_without_fpi(new_root)?;
                 let page = as_page_mut(&mut guard);
                 BtreePage::insert_entry_at(page, 1, &downlink)?;
                 stamp_pd_lsn(page, lsn);
             }
             {
-                let mut guard = self.buffer_pool.pin_mut(st.left)?;
+                let mut guard = self.buffer_pool.pin_mut_without_fpi(st.left)?;
                 let page = as_page_mut(&mut guard);
                 BtreePage::apply_commit_left(page)?;
                 stamp_pd_lsn(page, lsn);
@@ -1237,6 +1371,11 @@ impl BTreeIndex {
             let parent = parent_guard.page_id();
             let slot = internal_lower_bound(as_page_mut(&mut parent_guard), &separator, st.right)?
                 as u16;
+            // FPI-before-commit pre-touch (module doc): emit `st.left`'s
+            // cycle FPI, if due, BEFORE the Commit record's WAL position is
+            // fixed; the apply below re-pins with the FPI suppressed. A
+            // plain down-acquisition below the held path.
+            drop(self.buffer_pool.pin_mut(st.left)?);
             let rec = WalRecord::btree_split_commit(st.left, st.right, parent, separator, slot)?;
             let lsn = self.wal_writer.append(rec)?;
             {
@@ -1247,7 +1386,7 @@ impl BTreeIndex {
             drop(parent_guard);
             // Flag clear on `st.left`: a plain down re-acquisition below the
             // latched path (never held while the parent level was touched).
-            let mut guard = self.buffer_pool.pin_mut(st.left)?;
+            let mut guard = self.buffer_pool.pin_mut_without_fpi(st.left)?;
             let page = as_page_mut(&mut guard);
             BtreePage::apply_commit_left(page)?;
             stamp_pd_lsn(page, lsn);
@@ -1285,6 +1424,10 @@ impl BTreeIndex {
         let mut target_guard = self.buffer_pool.pin_mut(target)?;
         let slot =
             internal_lower_bound(as_page_mut(&mut target_guard), &separator, st.right)? as u16;
+        // FPI-before-commit pre-touch (module doc): emit `st.left`'s cycle
+        // FPI, if due, BEFORE the Commit record's WAL position is fixed; the
+        // apply below re-pins with the FPI suppressed.
+        drop(self.buffer_pool.pin_mut(st.left)?);
         let rec = WalRecord::btree_split_commit(st.left, st.right, target, separator, slot)?;
         let lsn = self.wal_writer.append(rec)?;
         {
@@ -1293,7 +1436,7 @@ impl BTreeIndex {
             stamp_pd_lsn(page, lsn);
         }
         drop(target_guard);
-        let mut guard = self.buffer_pool.pin_mut(st.left)?;
+        let mut guard = self.buffer_pool.pin_mut_without_fpi(st.left)?;
         let page = as_page_mut(&mut guard);
         BtreePage::apply_commit_left(page)?;
         stamp_pd_lsn(page, lsn);
@@ -1582,16 +1725,26 @@ impl BTreeIndex {
             (parent, slot)
         };
 
+        // FPI-before-commit pre-touch (module doc, Stage T P0): emit any due
+        // cycle FPI for BOTH pages this record modifies — parent before
+        // left, down the tree — BEFORE the record's WAL position is fixed.
+        // An FPI landing after the Commit with a pre-commit image would be
+        // replayed unconditionally by recovery and roll the page back past
+        // this Commit (resurrected SPLIT_INCOMPLETE → spurious undo CLR with
+        // a duplicate downlink). The applies below re-pin with the FPI
+        // suppressed.
+        drop(self.buffer_pool.pin_mut(parent)?);
+        drop(self.buffer_pool.pin_mut(st.left)?);
         let rec = WalRecord::btree_split_commit(st.left, st.right, parent, separator, slot)?;
         let lsn = self.wal_writer.append(rec)?;
         {
-            let mut guard = self.buffer_pool.pin_mut(parent)?;
+            let mut guard = self.buffer_pool.pin_mut_without_fpi(parent)?;
             let page = as_page_mut(&mut guard);
             BtreePage::insert_entry_at(page, slot, &downlink)?;
             stamp_pd_lsn(page, lsn);
         }
         {
-            let mut guard = self.buffer_pool.pin_mut(st.left)?;
+            let mut guard = self.buffer_pool.pin_mut_without_fpi(st.left)?;
             let page = as_page_mut(&mut guard);
             BtreePage::apply_commit_left(page)?;
             stamp_pd_lsn(page, lsn);
@@ -1699,6 +1852,10 @@ impl BTreeIndex {
         let (leaf, _, _) = self.descend_to_leaf(key, &tid)?;
         // Re-validate ownership under the write latch: a concurrent split
         // may have moved the entry to a right sibling since the descent.
+        // A SPLIT_INCOMPLETE leaf (its Commit in flight) is deleted from
+        // normally — an in-window write is a designed Stage S case; only
+        // the page's cycle FPI is suppressed for this hold (see
+        // `pin_leaf_for_write`).
         let (mut guard, _) = self.pin_leaf_for_write(leaf, key, &tid)?;
         // The WAL record must name the page the delete is APPLIED to — the
         // re-validated guard's page, which is not necessarily the descent's

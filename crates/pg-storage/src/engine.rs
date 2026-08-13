@@ -58,6 +58,11 @@ pub struct StorageEngine {
     /// previous instance stopped, rebuilt by the analysis phase (M2b Stage N;
     /// tech-selection §11.1). Empty on a freshly created database.
     recovered_att: Vec<TxnId>,
+    /// The WAL position this recovery's redo scan started from
+    /// (`AnalysisResult::redo_start`): a guaranteed record boundary in a
+    /// retained segment. [`Lsn::FIRST`] for a freshly created database.
+    /// pg-engine's loser-transaction index compensation scans from here.
+    recovered_redo_start: Lsn,
 }
 
 impl StorageEngine {
@@ -184,6 +189,7 @@ impl StorageEngine {
             txn_id_clock,
             clog,
             recovered_att: Vec::new(),
+            recovered_redo_start: Lsn::FIRST,
         })
     }
 
@@ -453,6 +459,7 @@ impl StorageEngine {
             txn_id_clock,
             clog,
             recovered_att,
+            recovered_redo_start: replay_start,
         })
     }
 
@@ -697,6 +704,14 @@ impl StorageEngine {
     /// decision.
     pub fn recovered_active_xids(&self) -> &[TxnId] {
         &self.recovered_att
+    }
+
+    /// The WAL position the just-completed recovery's redo scan started
+    /// from (a guaranteed record boundary in a retained segment).
+    /// [`Lsn::FIRST`] on a freshly created database. pg-engine uses this to
+    /// bound its loser-transaction WAL scan (index-entry compensation).
+    pub fn recovered_redo_start(&self) -> Lsn {
+        self.recovered_redo_start
     }
 
     /// Return the `next_oid` currently recorded in the superblock.

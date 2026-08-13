@@ -51,6 +51,10 @@ proptest = "~1.4"
 # integration tests drive a real StorageEngine on a temp data dir
 tempfile = "3"
 
+# the split-commit FPI-ordering regression test decodes WAL payloads
+# (FullPageImageRecord) directly; same bincode 2.x API note as pg-storage
+bincode = { version = "2.0.1", features = ["serde"] }
+
 # the create_index bench drives the full engine (heap source table +
 # Engine::create_index); dev-dependencies are allowed to cycle back through
 # pg-engine's normal dependency on this crate
@@ -73,3 +77,7 @@ harness = false
 name = "btree_loom"
 path = "tests/btree_loom.rs"
 required-features = ["loom"]
+
+[[bench]]
+name = "btree_split"
+harness = false

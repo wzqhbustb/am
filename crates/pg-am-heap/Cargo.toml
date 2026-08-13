@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "txn_commit_concurrent"
 harness = false
+
+[[bench]]
+name = "heap_mixed"
+harness = false

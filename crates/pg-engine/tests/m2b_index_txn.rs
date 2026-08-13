@@ -150,3 +150,174 @@ fn sql_exec_insert_abort_index_consistent() {
         other => panic!("expected Rows, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Stage T stress finding: recovery-time loser index compensation
+// ---------------------------------------------------------------------
+
+/// Crash with an in-flight DELETE (no commit/abort record) after a
+/// checkpoint made its records durable. The heap side stays visible
+/// through the CLOG (the xid reads InProgress), but the index delete is
+/// physical (xid=0) and replays unconditionally — without compensation the
+/// still-visible row loses its index entry. Recovery must re-insert it.
+#[test]
+fn crash_mid_delete_compensates_index_entry() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let engine = open(tmp.path());
+        engine.exec(None, "CREATE TABLE t (id INT)").unwrap();
+        engine.exec(None, "CREATE INDEX ON t (id)").unwrap();
+        engine.exec(None, "INSERT INTO t VALUES (1)").unwrap();
+
+        let txn = engine.begin_txn().unwrap();
+        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+        // Durability barrier: the in-flight delete's records (heap xmax
+        // stamp + index delete) must survive the kill; the checkpoint's
+        // ATT snapshot also records the loser as active.
+        engine.checkpoint().unwrap();
+        // kill -9 with the transaction in flight: forget the handle
+        // WITHOUT aborting, then abandon the engine mid-transaction.
+        std::mem::forget(txn);
+        std::mem::forget(engine);
+    }
+
+    let engine = open(tmp.path());
+    assert_eq!(
+        scan_count(&engine),
+        1,
+        "the uncommitted delete must stay invisible (row still present)"
+    );
+    assert!(
+        lookup(&engine, 1),
+        "recovery must compensate the loser's index delete (P0 forensic: \
+         row reachable in the heap but not through the index)"
+    );
+
+    // Idempotency: crash again right after recovery (compensation records
+    // may be unsynced) and re-verify — a second run must not duplicate the
+    // entry or lose it.
+    std::mem::forget(engine);
+    let engine = open(tmp.path());
+    assert_eq!(scan_count(&engine), 1);
+    assert!(lookup(&engine, 1), "second recovery must converge");
+}
+
+/// Same shape through a non-HOT UPDATE (the indexed column changes): the
+/// in-flight update's index maintenance is delete-old-key + insert-new-key;
+/// after the crash the OLD key's entry must be restored (the heap keeps
+/// the old version visible) and the new key's entry is masked by
+/// visibility. This is the exact /tmp/conc_repro_round2 forensic shape.
+#[test]
+fn crash_mid_update_compensates_index_entry() {
+    let tmp = TempDir::new().unwrap();
+    {
+        let engine = open(tmp.path());
+        engine
+            .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine.exec(None, "CREATE INDEX ON t (name)").unwrap();
+        engine.exec(None, "INSERT INTO t VALUES (1, 'old')").unwrap();
+
+        let txn = engine.begin_txn().unwrap();
+        engine
+            .exec(Some(&txn), "UPDATE t SET name = 'new' WHERE id = 1")
+            .unwrap();
+        engine.checkpoint().unwrap();
+        std::mem::forget(txn);
+        std::mem::forget(engine);
+    }
+
+    let engine = open(tmp.path());
+    let rows = engine.scan("t", None).unwrap();
+    assert_eq!(rows.len(), 1, "the uncommitted update stays invisible");
+    assert!(
+        engine
+            .index_lookup("t", "name", &Datum::Text("old".to_string()))
+            .unwrap()
+            .is_some(),
+        "recovery must restore the old key's index entry"
+    );
+    assert!(
+        engine
+            .index_lookup("t", "name", &Datum::Text("new".to_string()))
+            .unwrap()
+            .is_none(),
+        "the loser's new-key entry points at an invisible tuple (masked)"
+    );
+}
+
+/// Loser-compensation scan boundary (post-Stage-T review, item 3): a loser
+/// whose delete record PREDATES the recovery redo start must still be
+/// compensated when the record is readable. Construction: the victim table's
+/// pages are evicted (flushed) between the in-flight delete and the next
+/// checkpoint, so they anchor no DPT entry and the redo start lands AFTER
+/// the delete record; the checkpoint's begin (a record boundary in a
+/// retained segment) still precedes it. Pre-fix the compensation scan
+/// started at the redo start and silently skipped the delete.
+#[test]
+fn crash_loser_delete_before_redo_start_compensated() {
+    let tmp = TempDir::new().unwrap();
+    let tmp = tmp.path();
+    let mut config = EngineConfig::new(tmp);
+    // Small segments (multi-segment WAL) and a tiny pool (evictions).
+    config.storage.wal_segment_size = 32 * 1024;
+    config.storage.buffer_pool_size = 8 * 8192;
+
+    {
+        let engine = Engine::open(tmp, config.clone()).unwrap();
+        engine
+            .exec(None, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine.exec(None, "CREATE INDEX ON t (name)").unwrap();
+        engine
+            .exec(None, "INSERT INTO t VALUES (1, 'victim')")
+            .unwrap();
+        // A pad table with enough wide rows to churn the 8-frame pool.
+        engine
+            .exec(None, "CREATE TABLE pad (id INT, name TEXT)")
+            .unwrap();
+        let wide = "y".repeat(2000);
+        for i in 0..60 {
+            engine
+                .exec(None, &format!("INSERT INTO pad VALUES ({i}, '{wide}')"))
+                .unwrap();
+        }
+        // Checkpoint A: everything durable; att-A snapshot retained.
+        engine.checkpoint().unwrap();
+
+        // The loser: an in-flight DELETE. Its records (heap xmax stamp +
+        // index delete) sit AFTER begin_A.
+        let txn = engine.begin_txn().unwrap();
+        engine.exec(Some(&txn), "DELETE FROM t WHERE id = 1").unwrap();
+
+        // Churn the pool with read-only scans of pad: t's dirty pages get
+        // evicted and flushed BEFORE checkpoint B's DPT sample, so they
+        // anchor no rec_lsn and the redo start lands past the delete.
+        for _ in 0..3 {
+            assert_eq!(engine.scan("pad", None).unwrap().len(), 60);
+        }
+
+        // Checkpoint B: begin_B > delete LSN; begin_A's segment == begin_B's
+        // (only the small delete records in between), so it is retained.
+        engine.checkpoint().unwrap();
+
+        // kill -9 with the transaction in flight.
+        std::mem::forget(txn);
+        std::mem::forget(engine);
+    }
+
+    let engine = Engine::open(tmp, config).unwrap();
+    assert_eq!(
+        engine.scan("t", None).unwrap().len(),
+        1,
+        "the uncommitted delete must stay invisible (row still present)"
+    );
+    assert!(
+        engine
+            .index_lookup("t", "name", &Datum::Text("victim".to_string()))
+            .unwrap()
+            .is_some(),
+        "the loser's pre-redo-start index delete must be compensated \
+         (scan starts at the oldest retained checkpoint begin)"
+    );
+}

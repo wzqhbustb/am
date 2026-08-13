@@ -261,6 +261,96 @@ impl BufferPool {
     /// `FullPageImage` WAL record before the guard is returned. Subsequent
     /// modifications within the same residency do not write additional FPIs.
     pub fn pin_mut(&self, page_id: PageId) -> Result<PageGuardMut<'_>> {
+        let mut guard = self.pin_mut_without_fpi(page_id)?;
+        self.ensure_fpi(&mut guard)?;
+        Ok(guard)
+    }
+
+    /// Emit the page's per-checkpoint-cycle `FullPageImage` under an
+    /// already-held write guard, if the FPI gate says one is due.
+    ///
+    /// This is the FPI block of [`Self::pin_mut`], split out so a caller can
+    /// inspect the page under the write latch BEFORE the FPI is emitted.
+    /// The B+Tree leaf write path uses this to SKIP the FPI for a page
+    /// whose split Commit is in flight: an FPI emitted for a
+    /// `SPLIT_INCOMPLETE` page in the (Commit append, Commit apply) window
+    /// would capture a pre-commit image at a WAL position after the Commit
+    /// record, and recovery's unconditional FPI replay would roll the page
+    /// back past the Commit (Stage T P0; see the pg-am-btree module doc).
+    /// The skip is redo-safe by the same argument as
+    /// [`Self::pin_mut_without_fpi`].
+    ///
+    /// Must be called before the caller's first modification (and before its
+    /// WAL record is appended): the image must reflect the exact state just
+    /// before this modification. The gate is the same one `pin_mut` uses, so
+    /// a second call in the same checkpoint cycle is a no-op.
+    pub fn ensure_fpi(&self, guard: &mut PageGuardMut<'_>) -> Result<()> {
+        let frame_id = guard.frame_id;
+        let content_guard = guard.content_guard.as_mut().expect("guard is active");
+
+        // Same gate as `pin_mut` (see there for the full rationale):
+        // `needs_fpi` means the page has an on-disk image, and `pd_lsn <
+        // checkpoint_lsn` means it has not yet been modified in the current
+        // checkpoint cycle.
+        let needs_fpi = { self.frames[frame_id.0].meta.lock().needs_fpi };
+        let checkpoint_lsn = self.checkpoint_lsn();
+        let page_lsn = page_pd_lsn(&content_guard[..]);
+        if !(needs_fpi && checkpoint_lsn.is_valid() && page_lsn < checkpoint_lsn) {
+            return Ok(());
+        }
+
+        let image = content_guard.to_vec();
+        let fpi_record = WalRecord::full_page_image(guard.page_id, image)?;
+        let fpi_lsn = self.wal_writer.append(fpi_record)?;
+
+        // Publish the FPI LSN into the page itself (authoritative) and mirror
+        // it into the frame cache. The FPI image keeps the *old* pd_lsn;
+        // recovery patches it to the record's own LSN.
+        set_page_pd_lsn(&mut content_guard[..], fpi_lsn);
+        let mut meta = self.frames[frame_id.0].meta.lock();
+        meta.cached_lsn = fpi_lsn;
+        // DPT anchor (§11.1): the FPI LSN is this checkpoint cycle's first
+        // modification of the page. Only set it when no first-dirty LSN is
+        // recorded yet: a page re-dirtied after a mid-cycle flush keeps the
+        // (older, conservative) anchor of its current dirty epoch.
+        if meta.first_dirty_lsn == Lsn::INVALID {
+            meta.first_dirty_lsn = fpi_lsn;
+        }
+        meta.dirty = true;
+        Ok(())
+    }
+
+    /// Pin a page for write access WITHOUT emitting a `FullPageImage`, even
+    /// if the per-checkpoint-cycle FPI gate says one is due.
+    ///
+    /// # Contract (FPI-before-commit, Stage T P0)
+    ///
+    /// The caller MUST guarantee one of:
+    ///
+    /// - the page's cycle FPI — if one was due — was already emitted earlier
+    ///   in this checkpoint cycle at a WAL position preceding every record
+    ///   this modification belongs to (the B+Tree split Commit pre-touches
+    ///   the page with a regular `pin_mut` BEFORE the `BTreeSplitCommit`
+    ///   record's WAL position is fixed, then re-pins here to apply the
+    ///   commit's page effects; a regular `pin_mut` at re-pin time could
+    ///   fire a SECOND FPI if a checkpoint published in the pre-touch →
+    ///   re-pin window, capturing a pre-commit image after the Commit
+    ///   record); or
+    /// - the caller will run [`Self::ensure_fpi`] under the guard before
+    ///   modifying the page (the B+Tree leaf write path checks
+    ///   `SPLIT_INCOMPLETE` between the two and skips the FPI for a page
+    ///   whose split Commit is in flight — its in-window modification is
+    ///   redo-safe per the argument below); or
+    /// - the caller establishes by AM-level means that no cycle FPI is owed
+    ///   for this hold AND no stale image can result (same argument).
+    ///
+    /// Suppressing a due FPI is redo-safe in these shapes because the
+    /// modifying record's LSN exceeds any intervening checkpoint's begin
+    /// LSN, so replay from that checkpoint re-applies it under the usual
+    /// `pd_lsn` guard. The residual exposure is torn-write-only — and for
+    /// the split-Commit re-pin, the same class as the accepted Stage B
+    /// publication window; kill -9 testing cannot tear a page-cache pwrite.
+    pub fn pin_mut_without_fpi(&self, page_id: PageId) -> Result<PageGuardMut<'_>> {
         if page_id == PageId::INVALID {
             return Err(StorageError::InvalidConfig(
                 "cannot pin_mut PageId::INVALID".to_string(),
@@ -270,39 +360,11 @@ impl BufferPool {
         // `locate_or_load` returns a frame that is already pinned and referenced.
         let frame_id = self.locate_or_load(page_id)?;
 
-        // Acquire the write lock before writing the FPI so the image reflects
-        // the exact state just before this modification.
-        let mut content_guard = self.frames[frame_id.0].content.write();
+        // Acquire the write lock before any FPI/modification so the page
+        // state observed reflects exactly this hold.
+        let content_guard = self.frames[frame_id.0].content.write();
 
-        // Write FPI if this page has a prior on-disk version and has not yet
-        // been modified in the current checkpoint cycle. `needs_fpi` means "this
-        // page has an on-disk image": true for pages loaded from disk and for
-        // pages flushed in place at a checkpoint (still resident), false for
-        // freshly allocated pages that have never been flushed. The page's own
-        // `pd_lsn` (authoritative, `page[0..8]`) tells us whether the page was
-        // last modified in the current checkpoint cycle.
-        //
-        // If no checkpoint has ever run (`checkpoint_lsn` is invalid), we skip
-        // the FPI. This is correct because pages allocated before the first
-        // checkpoint have no prior on-disk version that needs protecting.
-        //
-        // `needs_fpi` is NOT cleared after writing an FPI: the `pd_lsn <
-        // checkpoint_lsn` gate alone decides whether an FPI is due. After we
-        // stamp the page's pd_lsn to the FPI LSN below, a second modification in
-        // the same cycle sees `pd_lsn >= checkpoint_lsn` and skips the FPI; once
-        // a later checkpoint advances `checkpoint_lsn` past that pd_lsn, the
-        // next modification re-fires the FPI. Because `flush_frame` re-sets
-        // `needs_fpi`, this holds whether the page was evicted+reloaded or
-        // stayed resident across the checkpoint (Stage I, Step 7).
-        let needs_fpi = {
-            let meta = self.frames[frame_id.0].meta.lock();
-            meta.needs_fpi
-        };
-        let checkpoint_lsn = self.checkpoint_lsn();
-        let page_lsn = page_pd_lsn(&content_guard[..]);
-        let should_write_fpi = needs_fpi && checkpoint_lsn.is_valid() && page_lsn < checkpoint_lsn;
-
-        // Mark the frame dirty NOW, at pin_mut time — not at guard drop.
+        // Mark the frame dirty NOW, at pin time — not at guard drop.
         // pin_mut means write intent, and a fuzzy checkpoint that collects
         // `dirty_page_ids()` while this guard is still held MUST see the
         // page: its WAL record may already sit before the checkpoint's
@@ -314,46 +376,8 @@ impl BufferPool {
         // safe. `first_dirty_lsn` keeps its drop-time semantics: the
         // modifying record's LSN only exists once the AM has appended it.
         // (content.write → meta is the sanctioned nesting order, same as
-        // the FPI block below.)
+        // the FPI block in `ensure_fpi`.)
         self.frames[frame_id.0].meta.lock().dirty = true;
-
-        if should_write_fpi {
-            let image = content_guard.to_vec();
-            let fpi_record = match WalRecord::full_page_image(page_id, image) {
-                Ok(rec) => rec,
-                Err(e) => {
-                    // The caller will not receive a guard, so release the pin
-                    // that locate_or_load acquired.
-                    drop(content_guard);
-                    self.unpin(frame_id);
-                    return Err(e);
-                }
-            };
-            let fpi_lsn = match self.wal_writer.append(fpi_record) {
-                Ok(lsn) => lsn,
-                Err(e) => {
-                    drop(content_guard);
-                    self.unpin(frame_id);
-                    return Err(e);
-                }
-            };
-
-            // Publish the FPI LSN into the page itself (authoritative) and
-            // mirror it into the frame cache. The FPI image keeps the *old*
-            // pd_lsn; recovery patches it to the record's own LSN.
-            set_page_pd_lsn(&mut content_guard[..], fpi_lsn);
-            let mut meta = self.frames[frame_id.0].meta.lock();
-            meta.cached_lsn = fpi_lsn;
-            // DPT anchor (§11.1): the FPI LSN is this checkpoint cycle's
-            // first modification of the page, so it is exactly the rec_lsn
-            // semantics require. Only set it when no first-dirty LSN is
-            // recorded yet: a page re-dirtied after a mid-cycle flush keeps
-            // the (older, conservative) anchor of its current dirty epoch.
-            if meta.first_dirty_lsn == Lsn::INVALID {
-                meta.first_dirty_lsn = fpi_lsn;
-            }
-            meta.dirty = true;
-        }
 
         Ok(PageGuardMut {
             frame_id,

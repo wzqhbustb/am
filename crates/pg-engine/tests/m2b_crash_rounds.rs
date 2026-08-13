@@ -50,11 +50,53 @@
 //! ```sh
 //! M2B_CRASH_ROUNDS=1000 cargo test -p pg-engine --test m2b_crash_rounds -- --nocapture
 //! ```
+//!
+//! # Stage T upgrade: concurrent-write rounds
+//!
+//! `m2b_crash_rounds_concurrent` (below) is the Stage T variant: the child
+//! runs `M2B_CRASH_CONC_THREADS` (default 4) writer threads CONCURRENTLY —
+//! each owning a heap-only table `ct{t}` and an indexed table `cix{t}`
+//! whose wide keys keep B+Tree splits in flight. The op mix per thread
+//! covers heap inserts, indexed inserts (splits), HOT updates, non-HOT
+//! updates (index maintenance) and deletes, all auto-committed; every
+//! thread rewrites its own atomic expectation file `expectation-{t}.txt`
+//! after each committed op. The parent kills SIGKILL either at a
+//! seed-derived PROGRESS point (rounds 1,2,3 mod 4 — a kill
+//! mid-concurrent-write) or after the full workload (round 0 mod 4).
+//!
+//! A checkpoint thread fires checkpoints every 150ms under the write load,
+//! so a kill can land between CheckpointBegin/End with splits in flight.
+//! It is ON by default (the Stage T checkpoint/FPI P0 — a split Commit's
+//! cycle FPI landing after the Commit record — is fixed in pg-am-btree;
+//! see `run_conc_child`). Setting `M2B_CRASH_CONC_CKPT=1` switches to an
+//! aggressive 20ms interval for extra stress.
+//!
+//! Verification per thread file:
+//!
+//! - full mode: exact match, as in the single-threaded harness;
+//! - mid mode: the recovered state may diverge from the expectation by AT
+//!   MOST ONE in-flight op per thread — i.e. ≤1 missing row AND ≤1 extra
+//!   row (a committed-but-unrecorded insert shows as 1 extra, a delete as
+//!   1 missing, an update as 1+1);
+//! - every `cix{t}` index validates, and every row present in BOTH the
+//!   expectation and the recovered scan is reachable through its index.
+//!
+//! CI default is `M2B_CRASH_CONC_ROUNDS=4` (one full-completion round +
+//! three mid-write kills). The Stage T acceptance configuration — 1000
+//! rounds including mid-concurrent-write kills — is a manual run
+//! (~30-60 min):
+//!
+//! ```sh
+//! M2B_CRASH_CONC_ROUNDS=1000 cargo test -p pg-engine --test m2b_crash_rounds \
+//!   m2b_crash_rounds_concurrent -- --nocapture
+//! ```
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -408,17 +450,21 @@ fn parse_expectation(text: &str) -> Expectation {
     }
 }
 
-fn spawn_child(data_dir: &Path, seed: u64) -> std::process::Child {
+fn spawn_child_at(data_dir: &Path, seed: u64, env_var: &str, test_name: &str) -> std::process::Child {
     let mut cmd = Command::new(std::env::current_exe().expect("test binary path"));
     cmd.arg("--test-threads=1")
-        .arg(CHILD_TEST_NAME)
-        .env(CHILD_ENV_VAR, "1")
+        .arg(test_name)
+        .env(env_var, "1")
         .env(DIR_ENV_VAR, data_dir.as_os_str())
         .env(SEED_ENV_VAR, seed.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn().expect("failed to spawn crash child")
+}
+
+fn spawn_child(data_dir: &Path, seed: u64) -> std::process::Child {
+    spawn_child_at(data_dir, seed, CHILD_ENV_VAR, CHILD_TEST_NAME)
 }
 
 fn wait_for_marker(data_dir: &Path, timeout: Duration) -> bool {
@@ -595,3 +641,480 @@ fn verify_index(round: u64, engine: &Engine, expectation: &Expectation) {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage T: concurrent-write crash rounds
+// ---------------------------------------------------------------------------
+
+const CHILD_CONC_ENV_VAR: &str = "M2B_CRASH_CHILD_CONC";
+const CONC_ROUNDS_ENV_VAR: &str = "M2B_CRASH_CONC_ROUNDS";
+const CONC_THREADS_ENV_VAR: &str = "M2B_CRASH_CONC_THREADS";
+const CONC_OPS_ENV_VAR: &str = "M2B_CRASH_CONC_OPS";
+const CONC_CHILD_TEST_NAME: &str = "m2b_crash_child_concurrent_entry";
+
+/// Per-thread expectation files: `expectation-{t}.txt` / `expectation-{t}.tmp`.
+fn conc_expectation_file(t: usize) -> String {
+    format!("expectation-{t}.txt")
+}
+
+fn conc_expectation_tmp(t: usize) -> String {
+    format!("expectation-{t}.tmp")
+}
+
+fn conc_heap_table(t: usize) -> String {
+    format!("ct{t}")
+}
+
+fn conc_index_table(t: usize) -> String {
+    format!("cix{t}")
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Concurrent child entry point: multi-threaded writers + a checkpoint
+/// thread, then sleep until killed.
+#[test]
+fn m2b_crash_child_concurrent_entry() {
+    if std::env::var(CHILD_CONC_ENV_VAR).is_err() {
+        return;
+    }
+    let data_dir = std::env::var(DIR_ENV_VAR).expect("data dir required");
+    let seed: u64 = std::env::var(SEED_ENV_VAR)
+        .expect("seed required")
+        .parse()
+        .expect("seed is u64");
+    run_conc_child(Path::new(&data_dir), seed);
+
+    fs::write(Path::new(&data_dir).join(READY_MARKER), b"").unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn run_conc_child(data_dir: &Path, seed: u64) {
+    let threads = env_usize(CONC_THREADS_ENV_VAR, 4);
+    let ops = env_usize(CONC_OPS_ENV_VAR, 60);
+
+    let engine = Arc::new(Engine::open(data_dir, EngineConfig::new(data_dir)).unwrap());
+    fs::write(data_dir.join(ENGINE_READY_MARKER), b"").unwrap();
+
+    // One heap-only and one indexed (wide-key, split-heavy) table per writer.
+    for t in 0..threads {
+        engine
+            .exec(
+                None,
+                &format!("CREATE TABLE {} (id INT, name TEXT)", conc_heap_table(t)),
+            )
+            .unwrap();
+        engine
+            .exec(
+                None,
+                &format!("CREATE TABLE {} (id INT, name TEXT)", conc_index_table(t)),
+            )
+            .unwrap();
+        engine
+            .exec(
+                None,
+                &format!("CREATE INDEX ON {} (name)", conc_index_table(t)),
+            )
+            .unwrap();
+    }
+
+    // Checkpoints fire while the writers run, so a kill can land between
+    // CheckpointBegin/End with concurrent writes in flight. ON by default
+    // since the Stage T checkpoint/FPI P0 fix; `M2B_CRASH_CONC_CKPT=1`
+    // shortens the interval to 20ms for extra stress.
+    //
+    // RESOLVED ENGINE BUG (Stage T finding, reproduced ~1/3 of runs): with
+    // the checkpoint thread enabled, recovery after the kill could emit a
+    // SPURIOUS BTreeSplitCLR for an already-committed split
+    // (redo_ref_lsn=INVALID, i.e. flagged by the undo-time page scan),
+    // double-finishing it and corrupting the parent with a duplicate
+    // downlink. Forensics on the preserved failing dir (/tmp/conc_repro_35):
+    // `split_commit` appended the BTreeSplitCommit record FIRST and only
+    // then pin_mut'ed the parent and the left page; with a checkpoint cycle
+    // opened between the split's Copy and its Commit, those pin_muts fired
+    // the pages' cycle FPIs at LSNs AFTER the Commit record, capturing
+    // PRE-commit images (SPLIT_INCOMPLETE still set). FPI redo's
+    // unconditional restore then rolled the page back past the Commit (the
+    // FPI patches pd_lsn past the Commit's LSN, so the Commit redo's pd_lsn
+    // guard skipped the flag clear / downlink insert). Fixed in
+    // pg-am-btree/pg-storage: split_commit now PRE-TOUCHES every page the
+    // Commit modifies with a scoped pin_mut (emitting any due cycle FPI)
+    // before the record's WAL position is fixed, and the apply re-pins via
+    // `BufferPool::pin_mut_without_fpi` so a checkpoint publishing in the
+    // pre-touch → re-pin window cannot fire a stale post-commit FPI.
+    // Deterministic regression test:
+    // pg-am-btree/tests/btree_split_crash.rs
+    // `test_btree_split_commit_fpi_precedes_commit_record`.
+    let ckpt_interval_ms = if std::env::var("M2B_CRASH_CONC_CKPT").is_ok() {
+        20
+    } else {
+        150
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let ckpt = {
+        let engine = Arc::clone(&engine);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(ckpt_interval_ms));
+                if !stop.load(Ordering::Relaxed) {
+                    engine.checkpoint().unwrap();
+                }
+            }
+        })
+    };
+
+    let mut handles = Vec::with_capacity(threads);
+    for t in 0..threads {
+        let engine = Arc::clone(&engine);
+        let data_dir = data_dir.to_path_buf();
+        handles.push(thread::spawn(move || {
+            run_conc_worker(&engine, &data_dir, seed, t, ops);
+        }));
+    }
+    for h in handles {
+        h.join().expect("concurrent writer panicked");
+    }
+    stop.store(true, Ordering::Relaxed);
+    ckpt.join().expect("checkpoint thread panicked");
+}
+
+/// One writer thread: `ops` auto-committed ops against its own two tables,
+/// rewriting its own expectation file after each committed op. The final
+/// write is MODE full (all ops committed); every intermediate write is
+/// MODE mid.
+fn run_conc_worker(engine: &Engine, data_dir: &Path, seed: u64, t: usize, ops: usize) {
+    let heap_t = conc_heap_table(t);
+    let index_t = conc_index_table(t);
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9) ^ (t as u64 + 1));
+    let mut model = ChildModel {
+        tables: [(heap_t.clone(), Vec::new()), (index_t.clone(), Vec::new())]
+            .into_iter()
+            .collect(),
+        extra_seq: 0,
+        // Disjoint id space per thread.
+        row_seq: (t as i32) * 1_000_000,
+    };
+
+    for completed in 1..=ops {
+        do_conc_op(engine, &mut rng, &mut model, &heap_t, &index_t);
+        let done = completed == ops;
+        write_conc_expectation(engine, data_dir, &model, t, done, completed);
+    }
+}
+
+/// Every arm changes at most one row of one table, so a mid-write kill
+/// leaves the recovered state at most one op ahead of the expectation.
+fn do_conc_op(
+    engine: &Engine,
+    rng: &mut Rng,
+    model: &mut ChildModel,
+    heap_t: &str,
+    index_t: &str,
+) {
+    match rng.below(20) {
+        // Heap INSERT (30%).
+        0..=5 => {
+            let id = model.row_seq;
+            model.row_seq += 1;
+            engine
+                .exec(None, &format!("INSERT INTO {heap_t} VALUES ({id}, 'row-{id}')"))
+                .unwrap();
+            model.tables.get_mut(heap_t).unwrap().push(id);
+        }
+        // Indexed INSERT (40%): wide keys keep leaf/root splits in flight.
+        6..=13 => {
+            let id = model.row_seq;
+            model.row_seq += 1;
+            let key = ix_key(id);
+            engine
+                .exec(None, &format!("INSERT INTO {index_t} VALUES ({id}, '{key}')"))
+                .unwrap();
+            model.tables.get_mut(index_t).unwrap().push(id);
+        }
+        // HOT UPDATE (10%): only the unindexed `id` changes.
+        14..=15 => {
+            let ids = model.tables.get_mut(index_t).unwrap();
+            if ids.is_empty() {
+                return;
+            }
+            let idx = rng.below(ids.len() as u64) as usize;
+            let old_id = ids[idx];
+            let new_id = model.row_seq;
+            model.row_seq += 1;
+            engine
+                .exec(
+                    None,
+                    &format!("UPDATE {index_t} SET id = {new_id} WHERE id = {old_id}"),
+                )
+                .unwrap();
+            ids[idx] = new_id;
+        }
+        // Non-HOT UPDATE (10%): the indexed `name` changes.
+        16..=17 => {
+            let ids = model.tables.get(index_t).unwrap();
+            if ids.is_empty() {
+                return;
+            }
+            let idx = rng.below(ids.len() as u64) as usize;
+            let id = ids[idx];
+            let key_seq = model.row_seq;
+            model.row_seq += 1;
+            let key = ix_key(key_seq);
+            engine
+                .exec(
+                    None,
+                    &format!("UPDATE {index_t} SET name = '{key}' WHERE id = {id}"),
+                )
+                .unwrap();
+        }
+        // Heap DELETE (10%).
+        _ => {
+            let ids = model.tables.get_mut(heap_t).unwrap();
+            if ids.is_empty() {
+                return;
+            }
+            let idx = rng.below(ids.len() as u64) as usize;
+            let id = ids.swap_remove(idx);
+            engine
+                .exec(None, &format!("DELETE FROM {heap_t} WHERE id = {id}"))
+                .unwrap();
+        }
+    }
+}
+
+/// Rewrite this thread's expectation file atomically (tmp + fsync + rename).
+fn write_conc_expectation(
+    engine: &Engine,
+    data_dir: &Path,
+    model: &ChildModel,
+    t: usize,
+    done: bool,
+    completed_ops: usize,
+) {
+    let mut out = String::new();
+    out.push_str(if done { "MODE full\n" } else { "MODE mid\n" });
+    out.push_str(&format!("OPS {completed_ops}\n"));
+    for table in model.tables.keys() {
+        out.push_str(&format!("TABLE {table}\n"));
+        for (id, name) in scan_table(engine, table) {
+            out.push_str(&format!("ROW {table} {id} {name}\n"));
+        }
+    }
+    let tmp = data_dir.join(conc_expectation_tmp(t));
+    fs::write(&tmp, &out).unwrap();
+    fs::File::open(&tmp).unwrap().sync_all().unwrap();
+    fs::rename(&tmp, data_dir.join(conc_expectation_file(t))).unwrap();
+}
+
+/// The Stage T crash-automation acceptance: kill -9 rounds against a child
+/// running CONCURRENT writers (indexed tables, HOT updates, in-flight
+/// splits, checkpoints). `M2B_CRASH_CONC_ROUNDS` defaults to 4 for CI; the
+/// acceptance configuration is 1000 (see the module docs).
+#[test]
+fn m2b_crash_rounds_concurrent() {
+    if std::env::var(CHILD_CONC_ENV_VAR).is_ok() {
+        return; // we are the child; the entry test does the work
+    }
+    let rounds: u64 = std::env::var(CONC_ROUNDS_ENV_VAR)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let threads = env_usize(CONC_THREADS_ENV_VAR, 4);
+    let ops = env_usize(CONC_OPS_ENV_VAR, 60);
+
+    for round in 0..rounds {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let mut child = spawn_child_at(&data_dir, round, CHILD_CONC_ENV_VAR, CONC_CHILD_TEST_NAME);
+
+        // Never kill before the engine is open.
+        let engine_ready = data_dir.join(ENGINE_READY_MARKER);
+        let start = Instant::now();
+        while !engine_ready.exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "round {round}: child engine did not open in time"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        if round % 4 == 0 {
+            // One in four rounds: let the full concurrent workload commit.
+            assert!(
+                wait_for_marker(&data_dir, Duration::from_secs(300)),
+                "round {round}: concurrent child did not finish its workload in time"
+            );
+        } else {
+            // Mid-concurrent-write kill: as soon as the expectation files
+            // show a seed-derived number of committed ops in TOTAL.
+            let target_ops = 10 + (round as usize * 7) % (threads * ops / 2).max(1);
+            let start = Instant::now();
+            loop {
+                let mut total = 0usize;
+                for t in 0..threads {
+                    let path = data_dir.join(conc_expectation_file(t));
+                    if path.exists() {
+                        total += parse_expectation(&fs::read_to_string(path).unwrap()).ops;
+                    }
+                }
+                if total >= target_ops {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(300),
+                    "round {round}: concurrent child did not reach {target_ops} total ops in time"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        child.kill().expect("failed to kill crash child");
+        child.wait().expect("failed to reap crash child");
+
+        verify_conc_round(round, &data_dir, threads);
+    }
+}
+
+fn verify_conc_round(round: u64, data_dir: &Path, threads: usize) {
+    let engine = Engine::open(data_dir, EngineConfig::new(data_dir))
+        .unwrap_or_else(|e| panic!("round {round}: engine failed to reopen: {e}"));
+
+    for t in 0..threads {
+        let expectation_path = data_dir.join(conc_expectation_file(t));
+        assert!(
+            expectation_path.exists(),
+            "round {round}: expectation file for thread {t} missing — the child never committed its first op"
+        );
+        let expectation = parse_expectation(&fs::read_to_string(&expectation_path).unwrap());
+
+        if expectation.mid {
+            // Prefix-durability for a concurrent writer: the recovered
+            // state may be at most ONE op ahead of the expectation — a
+            // committed-but-unrecorded insert shows as one extra row, a
+            // delete as one missing row, an update as one of each. The
+            // divergence budget is per THREAD (one in-flight op total),
+            // accumulated across its tables and asserted once.
+            let mut missing = 0usize;
+            let mut extras = 0usize;
+            for (table, expected_rows) in &expectation.tables {
+                let rows = scan_table(&engine, table);
+                let mut remaining = rows.clone();
+                for expected in expected_rows {
+                    match remaining.iter().position(|r| r == expected) {
+                        Some(pos) => {
+                            remaining.swap_remove(pos);
+                        }
+                        None => missing += 1,
+                    }
+                }
+                extras += remaining.len();
+            }
+            assert!(
+                missing <= 1 && extras <= 1,
+                "round {round} thread {t}: recovered state diverges from the expectation by \
+                 more than one in-flight op ({missing} missing, {extras} extra)"
+            );
+        } else {
+            for (table, expected_rows) in &expectation.tables {
+                let rows = scan_table(&engine, table);
+                assert_eq!(
+                    &rows, expected_rows,
+                    "round {round} thread {t}: table {table} content diverged across crash recovery"
+                );
+            }
+        }
+        verify_conc_index(round, t, &engine, &expectation, data_dir);
+    }
+    engine.shutdown();
+}
+
+/// Preserve a failing round's data dir for WAL forensics (the harness
+/// author's triage flow kept /tmp/conc_repro_35 the same way).
+fn preserve_repro_dir(round: u64, data_dir: &Path) {
+    let dst = std::path::PathBuf::from(format!("/tmp/conc_repro_round{round}"));
+    let _ = fs::remove_dir_all(&dst);
+    if let Err(e) = fs::rename(data_dir, &dst) {
+        eprintln!("failed to preserve repro dir {data_dir:?}: {e}");
+    } else {
+        eprintln!("preserved failing round dir at {dst:?}");
+        // The rename moved the dir out of the TempDir; keep the caller's
+        // later cleanup happy by recreating an empty dir.
+        let _ = fs::create_dir_all(data_dir);
+    }
+}
+
+/// The per-thread index must agree with the heap after recovery. In mid
+/// mode a committed-but-unrecorded update may have replaced one row's key,
+/// so expectation-side lookups are only asserted for rows present in BOTH
+/// the expectation and the recovered scan, and the one "extra" recovered
+/// row gets its own reachability spot-check; `validate` (which catches a
+/// split left unfinished by undo) always runs.
+fn verify_conc_index(round: u64, t: usize, engine: &Engine, expectation: &Expectation, data_dir: &Path) {
+    let table = conc_index_table(t);
+    let index = engine
+        .btree_index(&table, "name")
+        .unwrap_or_else(|e| panic!("round {round} thread {t}: {table} index failed to open: {e}"));
+    if let Err(e) = index.validate() {
+        preserve_repro_dir(round, data_dir);
+        panic!("round {round} thread {t}: {table} index is corrupt after crash recovery: {e}");
+    }
+
+    let recovered = scan_table(engine, &table);
+    let ix_rows = recovered.len();
+    // ~15 wide keys per leaf: past 30 rows the tree cannot still be a
+    // single root leaf (keeps a round from passing vacuously with no split
+    // recovery exercised).
+    if ix_rows > 30 {
+        assert!(
+            index.tree_level() >= 1,
+            "round {round} thread {t}: {ix_rows} rows in {table} but its index never split"
+        );
+    }
+
+    let expected: Vec<_> = expectation
+        .tables
+        .get(&table)
+        .into_iter()
+        .flatten()
+        .collect();
+    for (id, name) in &expected {
+        if !recovered.iter().any(|r| r == &(*id, name.clone())) {
+            continue; // the one in-flight op may legitimately rewrite a row
+        }
+        let found = engine
+            .index_lookup(&table, "name", &Datum::Text(name.clone()))
+            .unwrap_or_else(|e| panic!("round {round} thread {t}: index lookup failed: {e}"));
+        if found.is_none() {
+            preserve_repro_dir(round, data_dir);
+            panic!("round {round} thread {t}: committed row {id} of {table} is not reachable through its index");
+        }
+    }
+
+    // Mid mode: the one committed-but-unrecorded row (an "extra" vs the
+    // expectation — e.g. the new key of an in-flight update) must ALSO be
+    // reachable through the index; validate() alone only proves structure,
+    // not heap↔index agreement for that row.
+    if expectation.mid {
+        for (id, name) in &recovered {
+            if expected.iter().any(|r| **r == (*id, name.clone())) {
+                continue;
+            }
+            let found = engine
+                .index_lookup(&table, "name", &Datum::Text(name.clone()))
+                .unwrap_or_else(|e| panic!("round {round} thread {t}: index lookup failed: {e}"));
+            if found.is_none() {
+                preserve_repro_dir(round, data_dir);
+                panic!("round {round} thread {t}: extra (committed-but-unrecorded) row {id} of {table} \
+                     is not reachable through its index");
+            }
+        }
+    }
+}
+

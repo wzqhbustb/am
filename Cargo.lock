@@ -506,6 +506,7 @@ dependencies = [
 name = "pg-am-btree"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "criterion",
  "loom",
  "pg-am-btree",
