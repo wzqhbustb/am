@@ -276,6 +276,17 @@ impl WalReader {
     ///   non-zero byte afterwards means real records exist beyond the bad
     ///   one and the log is genuinely corrupt.
     ///
+    /// Known limitation (Stage T review): the LSN field survives a torn
+    /// write but the `payload_len` field may not — a bit flip that INFLATES
+    /// `payload_len` pushes `record_end` past the real tail, so the zero
+    /// scan starts inside valid records further back; if the flipped record
+    /// sits within ~64KB of the durable end (u16 length), condition 2 sees
+    /// only zeros and valid committed records after the corrupt one are
+    /// silently truncated instead of hard-failing. Accepted because the CRC
+    /// gate makes the odds negligible and PG's tail-CRC-failure-as-EOF has
+    /// the same shape; the structural fix is a header self-CRC (PG's xl_crc
+    /// pattern), deferred.
+    ///
     /// Reads via the same segment-hopping logic as the sequential path but
     /// never advances `current_lsn`.
     fn is_torn_tail(&mut self, start_lsn: Lsn, record_end: Lsn, header: &[u8]) -> Result<bool> {

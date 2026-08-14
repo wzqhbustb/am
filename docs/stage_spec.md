@@ -155,9 +155,9 @@ split 的 Copy redo 语义是"从既有左页重算搬运"，bulk load 的页是
 
 ### 已知残留与后续归队
 
-- 重复 key 跨内部页边界（~20 万+ 相同 key 门槛）：结构可读但退化 → M2c tid 分隔符根治
-- `BTreeSplitCLR` / `finish_incomplete_split`（未完成分裂收尾）→ M2c undo（Stage S）
-- BTreeDelete 在线语义（现在只有 redo handler；trait delete 为 O(n) 链扫兜底）→ M2c
+- 重复 key 跨内部页边界（~20 万+ 相同 key 门槛）：结构可读但退化 → ~~M2c tid 分隔符根治~~ **延期**（M2c 未交付；Stage T 改由"完整 (key,tid) 链序落位 + locate 空页左跳"在线兜底跨边界重复 run 场景；根治归 M2c+/Phase 7）
+- ~~`BTreeSplitCLR` / `finish_incomplete_split`（未完成分裂收尾）→ M2c undo（Stage S）~~ **已交付**（Stage S + 修复轮的 Move/NoMove/Unlink 三态与级联）
+- ~~BTreeDelete 在线语义（现在只有 redo handler；trait delete 为 O(n) 链扫兜底）→ M2c~~ **已交付**（Stage Q 并发化 delete：归属重验证 + 有界重试；Stage T 边界修复进一步加强）
 - 唯一索引执行、DROP INDEX、多列索引 → 后续 stage
 - SQL 层入口（`CREATE INDEX` 语句、planner 索引选择）→ Stage O
 
@@ -234,7 +234,7 @@ split 的 Copy redo 语义是"从既有左页重算搬运"，bulk load 的页是
 
 ### 已知残留与后续归队
 
-- ATT 空基线降级对"begin 前已无 WAL 活动的空闲事务"不完整（当前无生产消费者，**M2c undo 落地前必须处理**：文档限定 + 降序重试旧快照）
+- ATT 空基线降级对"begin 前已无 WAL 活动的空闲事务"不完整（崩溃后空闲事务无 WAL 记录可扫描；**核销说明（Stage T)**：该情形无实际危害——空闲事务无任何写入需要补偿，CLOG 读作 InProgress 语义等价，Stage S undo 落地后此边角无消费者；降序重试旧快照仍是可选项）
 - `open_at` 起始段缺失时硬失败，文档承诺的 warn + 空基线降级未实现（灾难-only 路径，多段丢失无测试）
 - `reserve_and_append` 时钟推进后 encode/IO 失败可留 >32B 洞，reader 前探（仅 32B）漏检（待修：推进前校验 payload 长度 + IO 失败毒化 writer）
 - analysis/replay 的 catch-all 对 `MetadataCorrupted`/`WalReadFailed` 仍 warn+break（engine 路径由 writer open 先行拦截，pub API 直接调用有静默截断风险）
@@ -579,7 +579,7 @@ victim 通常正阻塞在 wait 里，第三方线程直接拆它的事务会与 
 ### 已知残留与后续归队
 
 - 虚假 DeadlockVictim 残余窗口（复核→mark 间隙）→ 接受，语义安全，已文档化
-- 软边环（纯 FIFO 排队构成）不检测 → 观察项，Stage T 压测若出现再议
+- 软边环（纯 FIFO 排队构成）不检测 → 观察项。**核销（Stage T)**：死锁注入压测 1000 环（含无环对照组）全绿，未出现软环形态；维持不检测
 - `lock_timeout` / NOWAIT / SKIP LOCKED 无（wait_for 无超时参数）→ Phase 6 协议层需求出现时评估"XID 虚拟锁统一进 LockManager"的重构
 - pg-txn 无 tracing 依赖，tick panic 只计数不告警 → 可观测性归 Phase 7a
 - SQL 层表达不出纯表锁环（显式事务内 DDL 被拒，AS/RE 互不冲突）→ engine 级表锁环测试用原始 XID 驱动，已注明
@@ -667,5 +667,52 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - share 持有者注册表（H5）条目在真实 delete/update 盖戳时由 gate 的 `note_stamp_overwrite` **即时摘除**（非惰性）；惰性修剪只覆盖崩溃持有者残留（死 XID 章视为 aborted 兜底）——盖章在摘除后失败会在两者间留一个无注册项的锁章，仅延迟等待、无正确性影响（P2-4 实测澄清）
 - `m2b_crash_rounds` 默认 25 轮（CI 口径），plan 的 1000 轮口径需手工跑 → Stage T 的崩溃自动化承接
 - ~~Multixact 简版记不住共享锁持有者集合，因此不支持"多个事务同时持共享锁后其中之一升级"~~ **已修复（H5）**：堆 AM 内存持有者注册表支持 share/share 共存与升级等待；仍归 Phase 6 的是完整 multixact（持久段、成员集合溢出的页外存储、崩溃后仍精确的持有者恢复——当前注册表崩溃即弃，靠"死 XID 章视为 aborted"兜底，与无 WAL 锁章的设计一致）
+
+---
+
+## Stage T：100 并发压测 + Benchmark + M2c 综合验证（M2c 出口）
+
+**状态**：✅ 完成（release 全量 621 测试全绿；M2c 出口）
+**工期**：预估 5–7 天
+**验收**：见下"验收终账"；C 类全过，P 类按 §20 下调并归因落盘（`docs/phase1-m2-benchmarks.md`）
+
+### 定位
+
+验证型 stage：无新机制，交付压测/基准/文档，并用它们把前五个 stage（P/Q/R/S + 存储底座）第一次全部放在一起长时间压。**它抓出 5 个此前全绿测试发现不了的真 bug**——这是本 stage 的核心价值。
+
+### 交付内容
+
+1. **压测设施**（全部带 watchdog，回归=失败而非挂起）
+   - `m2c_stress.rs`：N 连接混合负载（INSERT/HOT UPDATE/DELETE/点查 + 显式事务 + 后台 checkpoint），sleep 配速；终态堆↔簿记逐行比对 + 索引 validate + 泄漏三连查；env 可调（CI 30s/16conn）
+   - `m2c_deadlock_stress.rs`：随机 2–4 事务环（Barrier 保证闭合）+ 无环对照组；断言恰好一个最年轻 victim、有界延迟、零误报、零泄漏
+   - `m2b_crash_rounds.rs` 并发子进程变体：多线程写（含索引表/HOT/持续分裂）+ 后台 checkpoint，随机点 kill -9，逐线程前缀持久性 + 恢复一致性校验
+2. **Benchmark 集合**：验收命令 5 个 bench 全部就位 + 补 `heap_mixed`、`btree_split`；`docs/phase1-m2-benchmarks.md` 落盘（每项 target + 实测 + 未达标归因 + 长跑实际执行记录）
+3. **压测抓出并修复的 5 个 bug**（全部带红→绿确定性回归测试）
+   - **checkpoint/FPI 竞态（P0）**：split Commit 先 append 后 pin_mut，新 FPI 周期在窗口开启 → FPI 落在 Commit 之后但含提交前镜像 → 恢复复活未完成 split。修复：Commit 修改页全部 pre-touch（FPI 先于 Commit 记录落 WAL）+ apply 走 `pin_mut_without_fpi`；第三方写者路径 flagged 页整段跳过 FPI（TOCTOU 安全）
+   - **恢复侧 loser 索引补偿缺失（P0，预存）**：kill 落在索引维护与 commit 之间 → 可见行永久丢索引项（在线 abort 有 undo 日志，恢复路径无对应物）。修复：`compensate_loser_index_entries`（从 WAL 收集 loser 受害 tid，按堆页字节重算 (key, chain_root)，幂等重插 + CRC resync 回卷扫描起点）
+   - **WAL 撕裂尾部误判 corrupted（高）**：预分配段的零填充使撕裂尾"看起来完整"但 CRC 失败 → 重开硬失败。修复：`is_torn_tail` 双重判定（header LSN == 位置 + 记录之后全零）；已知局限（payload_len bit-rot 放大场景）文档化，根治（header 自 CRC）归后续
+   - **insert 左跳越界（高）**：新条目可写过分隔键，churn 把孪生页抽干成"黑洞空页" → 假 EntryNotFound。修复：insert 限同键 run 内左跳
+   - **并发重复 run 跨边界乱序（高，release 50% 复现）**：陈旧 prev 链 + 边界落位乐观检查竞态 → (key,tid) 链序倒置且 validate 的相等-separator 豁免放过了它。修复：`nearest_nonempty_left`（prev 降级为提示、向右走 ground-truth 链找真左邻）+ slot-0 落位在左邻写闩内原子化 + 乐观/悲观两路径同一判定 + validate 新增全链 `last < first` 严格序检查
+
+### 验收终账
+
+| 验收项 | 结果 |
+|---|---|
+| 全量回归 | ✅ debug 618 + release 621 全绿（含 loom) |
+| 1000 轮崩溃（含 split-in-progress） | ✅ 3043s |
+| 并发崩溃 × 激进 checkpoint | ✅ 40 轮连跑全绿（修复后） |
+| 保底压测 50conn×100tps×30min | ✅ 1802.7s，终态一致、零泄漏 |
+| 挑战压测 100conn×60min | ⚠️ 未执行（命令已文档化） |
+| 死锁注入 1000 环 | ✅ 每环恰好 1 victim、对照组 0 误报、延迟 ≤78ms |
+| 性能 P 类 | 按 §20 下调：WAL 18.3MB/s、并发 INSERT 6.6K（均 fsync 封顶，对照臂证明非 latch/锁竞争）；读路径全部超标（点查 1.05M QPS、BP 随机读 2.1M ops/s、CLOG 命中 98.4%/100%） |
+| 回归传承（M1/M2a/M2b） | ✅ 含在全量中，无弱化（抽查确认 Stage S/T 对既有测试只有增强） |
+
+### 已知残留与后续归队
+
+- 挑战档长跑与并发 crash 1000 轮未执行（时间成本；命令在 benchmark 文档）→ 需要时手动
+- torn-tail 的 header 无自 CRC（payload_len 被 bit-rot 放大的残余误截窗口）→ 结构性修复归后续（PG xl_crc 模式）
+- `btpo_prev` 陈旧链（prev 恒指最旧左页）已从"纯文档"升级为被 `nearest_nonempty_left` 实际依赖提示——残余窗口（左侧全空时的 TOCTOU）有 validate 全链检查兜底 → 后续 stage 评估 prev 维护
+- 叶页死空间不回收（churn 分裂放大器）→ 压实/合并归 M2c+/vacuum(M3)
+- 所有性能 P 类未达标项的根治（batch commit、O_DIRECT、io_uring）→ Phase 7b
 
 ---

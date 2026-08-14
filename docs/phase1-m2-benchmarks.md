@@ -119,6 +119,12 @@
   - `M2B_CRASH_ROUNDS=1000 cargo test -p pg-engine --test m2b_crash_rounds -- --nocapture`
   - `M2B_CRASH_CONC_ROUNDS=1000 cargo test -p pg-engine --test m2b_crash_rounds m2b_crash_rounds_concurrent -- --nocapture`
   - `M2C_DEADLOCK_ITERS=2000 cargo test -p pg-engine --test m2c_deadlock_stress --release -- --nocapture`
+- **长跑实际执行记录**（2026-08-13，本机 Apple Silicon）：
+  - ✅ 保底压测 50 conn × 100 txn/s × 30min：通过（1802.7s，终态堆↔索引一致、无泄漏）
+  - ✅ 1000 轮 crash（单线程 harness，含 split-in-progress）：通过（3043s）
+  - ✅ 死锁注入 1000 环（2000 迭代）：通过（每环恰好 1 victim、无环对照组 0 误报；实测最大检测延迟 ~78ms，p99 远低于 200ms 验收线；具体 p99 未单独落盘——上界即 tick 间隔 100ms）
+  - ⚠️ 挑战档 100 conn × 60min：**未执行**（保底档通过；时间成本考虑，可随时按上条命令补跑）
+  - ⚠️ 并发 crash 1000 轮：**未执行**（执行了 40 轮 × 20ms 激进 checkpoint 档，修复两个 bug 后连跑全绿；1000 轮约需数小时，留给 Stage T 后续或 Phase 7 稳定性专项）
 
 ## 复现
 

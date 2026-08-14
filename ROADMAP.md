@@ -98,18 +98,30 @@ Phase 1 ──→ Phase 2 ──→ Phase 3 ──→ Phase 4a ──→ Phase 4
 (基座+行存)   (向量)      (全文)      (SQL+PG)     (Fusion)
 
 可并行 track（不阻塞主干，有人力时可提前启动）：
-Phase 1 完成后：
-  ├── 时序 AM ──────────── 可与 Phase 2/3/4 并行；
-  │                        注意：segment merge 逻辑需等 Phase 3 完成后复用，
-  │                        或自行实现简易版（仅时间分区 seal + TTL 清理）
-  └── 列存投影原型 ──────── 可与 Phase 2/3 并行
 
-Phase 4a 完成后：
-  ├── 图 AM（轻量版）───── 需要 SQL 层就绪
-  ├── 完整 PG Protocol ─── 需要 Phase 4a 的 PG Wire 基础
-  └── MCP Server ────────── 需要 Phase 4a 的 SQL 层
+Phase 1 完成后（不依赖 4a/4b）：
+  ├── 时序 AM + TTL ──────── 可与 Phase 2/3/4 并行；
+  │                          注意：segment merge 逻辑需等 Phase 3 完成后复用，
+  │                          或自行实现简易版（仅时间分区 seal + TTL 清理）
+  ├── 列存投影原型 ────────── 可与 Phase 2/3 并行
+  ├── 记忆蒸馏 SDK ────────── 外部 LLM，可拿 stub 早期并行
+  └── 多 AM GC 协调器 ────── ≥2 个 AM 落地即可起（与 4b 正交，是 vacuum 期的事）
+
+Phase 4a 完成后（需 SQL 层，不需 4b）：
+  ├── 图 AM（轻量版）+ 图查询语法 ── 需要 SQL 层就绪
+  ├── 时间范围查询路由 ───────────── planner 谓词路由 = 4a 的活
+  ├── 遗忘曲线 / 记忆分层 SDK ────── 等 Phase 1 的 GC trait 稳定即可
+  ├── 完整 PG Protocol ───────────── 需要 Phase 4a 的 PG Wire 基础
+  └── MCP Server ─────────────────── 需要 Phase 4a 的 SQL 层
+
+Phase 4b 完成后（仅两条 Fusion 集成尾巴，不是整个 Phase 5）：
+  ├── 图参与 Fusion ──── 把 Graph 输出接进 4b 的 MultiIndexScan 算子
+  └── 时序参与 Fusion ── 把时序输出接进 4b 的 MultiIndexScan 算子
 
 注：以上可并行模块对应 Phase 5（时序+图+列存原型）和 Phase 6（协议+MCP）的内部子项。
+Phase 5 与 4b 之间是【部分、单向】依赖：仅"图/时序参与 Fusion"两条尾巴等 4b，
+其余 Phase 5 交付物全部依赖 Phase 1 或 4a，可与 4b 并行起跑。
+反过来 4b 不依赖 Phase 5（4b 只需 HNSW + 倒排 + planner）。
 
 Phase 4b + Phase 5 + Phase 6 → Phase 7
 ```
@@ -466,25 +478,25 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 
 ### 5.1 内核交付物（必做）
 
-| 模块 | 说明 |
-|------|------|
-| TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合 |
-| TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 |
-| 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 |
-| Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS |
-| 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） |
-| 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 |
-| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引 |
-| 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 |
-| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性 |
+| 模块 | 说明 | 启动门 |
+|------|------|--------|
+| TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合 | Phase 1（segment merge 复用需等 Phase 3） |
+| TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 | Phase 1（随 TimeSeries） |
+| 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
+| Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
+| 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
+| 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
+| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引 | Phase 1（≥2 个 AM 落地；与 4b 正交） |
+| 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
+| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性 | Phase 1 |
 
 ### 5.2 SDK 层交付物（必做，但不在内核）
 
-| 模块 | 说明 |
-|------|------|
-| 遗忘曲线 SDK | 基于访问频率 + 时间衰减的重要性评分，标记可淘汰记忆（应用层评分 + 触发内核 GC） |
-| 记忆蒸馏 SDK | 多条细节记忆 → 一条摘要记忆（调用外部 LLM），作为后台异步 job 执行，不阻塞写入事务；蒸馏结果以新元组写入并重新建索引 |
-| 记忆分层 SDK | 短期（会话内）→ 工作（任务级）→ 长期（持久化）的视图抽象 |
+| 模块 | 说明 | 启动门 |
+|------|------|--------|
+| 遗忘曲线 SDK | 基于访问频率 + 时间衰减的重要性评分，标记可淘汰记忆（应用层评分 + 触发内核 GC） | Phase 1（GC trait 稳定） |
+| 记忆蒸馏 SDK | 多条细节记忆 → 一条摘要记忆（调用外部 LLM），作为后台异步 job 执行，不阻塞写入事务；蒸馏结果以新元组写入并重新建索引 | Phase 1（可拿 stub 早期并行） |
+| 记忆分层 SDK | 短期（会话内）→ 工作（任务级）→ 长期（持久化）的视图抽象 | Phase 1（GC trait 稳定） |
 
 **Layer 边界说明：**
 - 内核 trait 只暴露 `mark_for_gc(tids) / vacuum_range()` 这类原子能力

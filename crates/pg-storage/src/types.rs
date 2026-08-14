@@ -89,9 +89,12 @@ impl Lsn {
     }
 
     /// Return the LSN that immediately follows a record of `record_size`
-    /// bytes. Panics in debug mode if `record_size` is not aligned.
+    /// bytes. Panics if `record_size` is not aligned — alignment is
+    /// load-bearing for the WAL reader (torn-tail detection, resync
+    /// probes), so this is a hard assert in release too, not a
+    /// debug_assert.
     pub fn advance(&self, record_size: u64) -> Lsn {
-        debug_assert!(
+        assert!(
             record_size % LSN_ALIGNMENT == 0,
             "record_size must be a multiple of {LSN_ALIGNMENT}"
         );
