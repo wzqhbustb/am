@@ -37,9 +37,14 @@ Phase 3：全文倒排索引
 Phase 4a：SQL 层 + PG Wire Protocol（基础）
 Phase 4b：Multi-Path Fusion + 跨模态 Planner
 
-Phase 5：时序 + 图索引（轻量）+ 记忆管理
-         ├── 内核：TimeSeries AM + Graph AM（轻量版）+ 列存投影原型
-         └── SDK 层：遗忘曲线 + 记忆蒸馏 + 记忆分层
+Phase 5a：时序 + 列存 + 蒸馏 stub（Phase 1 门，可与 Phase 2/3/4a 同时起步）
+         ├── 内核：TimeSeries AM + TTL、列存投影原型
+         └── SDK 层：记忆蒸馏（stub 早期并行）
+
+Phase 5b：图 + GC + 遗忘/分层 + Fusion 接入（需 4a / ≥2 AM / 4b 陆续进）
+         ├── 内核：Graph AM（轻量版）+ 图查询语法、时间范围查询路由、多 AM GC 协调器
+         ├── SDK 层：遗忘曲线、记忆分层（等 GC 协调器落地）
+         └── Fusion 接入：图/时序参与 Fusion（等 4b）
 
 Phase 6：完整协议层 + 多 Agent 隔离
 
@@ -60,7 +65,8 @@ Phase 7：生产化
 | Phase 2 (HNSW) | 9 个月 | 12–15 个月 | 24+ 个月 | 🔴 高（long pole） |
 | Phase 3 (Inverted) | 4 个月 | 6–8 个月 | 10 个月 | 🟡 中（segment 模式新） |
 | Phase 4a+4b (SQL+PG → Fusion) | 4 个月 | 6–8 个月 | 12 个月 | 🟡 中（DataFusion 集成） |
-| Phase 5 (时序+图+记忆) | 3 个月 | 5–7 个月 | 10 个月 | 🟡 中（SDK/内核边界） |
+| Phase 5a (时序+列存+蒸馏stub，可与 2/3/4a 并行) | 1.5 个月 | 2–3 个月 | 4 个月 | 🟡 中（可与主干并行） |
+| Phase 5b (图+GC+遗忘/分层+Fusion接入) | 2 个月 | 3–4 个月 | 6 个月 | 🟡 中（SDK/内核边界，门控多） |
 | Phase 6 (协议+隔离) | 6 个月 | 9–12 个月 | 18+ 个月 | 🔴 高（完整协议） |
 | Phase 7 (生产化) | 持续 | 12+ 个月 | 持续 | 🟢 低（持续优化） |
 
@@ -81,7 +87,8 @@ Phase 7：生产化
 | Phase 3 | (Tier 2 异步 IO) | (扩展) Watermark | ✓ Inverted Index（BM25） | Segment merge |
 | Phase 4a | — | — | (单路选择) | DataFusion + PG Wire Extended + EXPLAIN |
 | Phase 4b | — | (扩展) Cost hooks | (多路融合) | MultiIndexScan + Fusion + Planner |
-| Phase 5 | — | (扩展) Multi-AM GC 协调 | ✓ TimeSeries + Graph（轻量） | Fusion 接入时序+图 + 列存原型 |
+| Phase 5a | — | — | ✓ TimeSeries | 列存投影原型 |
+| Phase 5b | — | (扩展) Multi-AM GC 协调 | ✓ Graph（轻量） | Fusion 接入时序+图 |
 | Phase 6 | — | (扩展) RLS predicate | (稳定) | MCP Server + 完整 PG Wire |
 | Phase 7a | — | — | — | 备份恢复 + 监控 |
 | Phase 7b | (性能优化) | — | ✓ Columnar Projection | SIMD / io_uring / 大页 |
@@ -99,31 +106,36 @@ Phase 1 ──→ Phase 2 ──→ Phase 3 ──→ Phase 4a ──→ Phase 4
 
 可并行 track（不阻塞主干，有人力时可提前启动）：
 
-Phase 1 完成后（不依赖 4a/4b）：
+Phase 5a（Phase 1 门，可与 Phase 2/3/4a 同时起步）：
   ├── 时序 AM + TTL ──────── 可与 Phase 2/3/4 并行；
   │                          注意：segment merge 逻辑需等 Phase 3 完成后复用，
   │                          或自行实现简易版（仅时间分区 seal + TTL 清理）
   ├── 列存投影原型 ────────── 可与 Phase 2/3 并行
-  ├── 记忆蒸馏 SDK ────────── 外部 LLM，可拿 stub 早期并行
-  └── 多 AM GC 协调器 ────── ≥2 个 AM 落地即可起（与 4b 正交，是 vacuum 期的事）
+  └── 记忆蒸馏 SDK ────────── 外部 LLM，可拿 stub 早期并行
 
-Phase 4a 完成后（需 SQL 层，不需 4b）：
+Phase 5b · 4a 门（需 SQL 层，不需 4b）：
   ├── 图 AM（轻量版）+ 图查询语法 ── 需要 SQL 层就绪
-  ├── 时间范围查询路由 ───────────── planner 谓词路由 = 4a 的活
-  ├── 遗忘曲线 / 记忆分层 SDK ────── 等 Phase 1 的 GC trait 稳定即可
-  ├── 完整 PG Protocol ───────────── 需要 Phase 4a 的 PG Wire 基础
-  └── MCP Server ─────────────────── 需要 Phase 4a 的 SQL 层
+  └── 时间范围查询路由 ───────────── planner 谓词路由 = 4a 的活
 
-Phase 4b 完成后（仅两条 Fusion 集成尾巴，不是整个 Phase 5）：
+Phase 5b · ≥2 AM 门（与 4b 正交，是 vacuum 期的事）：
+  └── 多 AM GC 协调器 ── ≥2 个 AM 落地即可起；
+                          落地后遗忘曲线 / 记忆分层 SDK 才有真实 mark_for_gc trait 可用
+
+Phase 5b · 4b 门（仅两条 Fusion 集成尾巴）：
   ├── 图参与 Fusion ──── 把 Graph 输出接进 4b 的 MultiIndexScan 算子
   └── 时序参与 Fusion ── 把时序输出接进 4b 的 MultiIndexScan 算子
 
-注：以上可并行模块对应 Phase 5（时序+图+列存原型）和 Phase 6（协议+MCP）的内部子项。
-Phase 5 与 4b 之间是【部分、单向】依赖：仅"图/时序参与 Fusion"两条尾巴等 4b，
-其余 Phase 5 交付物全部依赖 Phase 1 或 4a，可与 4b 并行起跑。
-反过来 4b 不依赖 Phase 5（4b 只需 HNSW + 倒排 + planner）。
+Phase 6（4a 门，与 5b · 4a 门同批起）：
+  ├── 完整 PG Protocol ─── 需要 Phase 4a 的 PG Wire 基础
+  └── MCP Server ────────── 需要 Phase 4a 的 SQL 层
 
-Phase 4b + Phase 5 + Phase 6 → Phase 7
+注：Phase 5b 与 4b 之间是【部分、单向】依赖：仅"图/时序参与 Fusion"两条尾巴等 4b，
+其余 5b 交付物依赖 Phase 4a 或 ≥2 AM，可与 4b 并行起跑。
+反过来 4b 不依赖 Phase 5（4b 只需 HNSW + 倒排 + planner）。
+Graph AM 整体 gate 在 4a（遵循"接口可扩展但实现不提前"原则）；若团队接受 SQL 集成返工风险，
+可把 Graph AM 存储层 + BFS/DFS 原语提到 5a 起步，仅图查询语法留 5b。
+
+Phase 4b + Phase 5b + Phase 6 → Phase 7
 ```
 
 ---
@@ -469,53 +481,76 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 
 ---
 
-## Phase 5：时序 + 图索引（轻量）+ 记忆管理
+## Phase 5a：时序 + 列存 + 蒸馏 stub（与 Phase 2/3/4a 并行）
 
-**目标：支持时间维度和关联维度的记忆管理，实现记忆的自动遗忘与进化**
+**目标：交付时间维度记忆管理的基础设施，Phase 1 完成即可独立起步**
 
-**时间估算（1–2 高级 Rust 工程师）：** 乐观 3 个月 / P50 5–7 个月 / 长尾 10 个月
-**风险等级**：🟡 中（SDK/内核边界需严格把控）
+**时间估算（1–2 高级 Rust 工程师）：** 乐观 1.5 个月 / P50 2–3 个月 / 长尾 4 个月
+**风险等级**：🟡 可与主干并行（Phase 1 门；segment merge 复用需等 Phase 3 的 Tier-2 异步链路，属增量）
 
-### 5.1 内核交付物（必做）
+### 5a.1 内核交付物（必做）
 
-| 模块 | 说明 | 启动门 |
-|------|------|--------|
-| TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合 | Phase 1（segment merge 复用需等 Phase 3） |
-| TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 | Phase 1（随 TimeSeries） |
-| 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
-| Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
-| 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
-| 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
-| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引 | Phase 1（≥2 个 AM 落地；与 4b 正交） |
-| 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
-| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性 | Phase 1 |
+| 模块 | 说明 |
+|------|------|
+| TimeSeries AM | 时间分区存储（按天/小时自动分区），范围扫描，降采样聚合（segment merge 复用需等 Phase 3 的 Tier-2 异步链路就绪） |
+| TTL 自动过期 | 声明式 TTL（WITH ts_partition = 'day', ttl = '90d'），后台自动清理过期分区 |
+| 列存投影原型 | 时序/记忆分析场景的轻量列存物化视图，Tier 2 异步维护，验证 HTAP 架构可行性 |
 
-### 5.2 SDK 层交付物（必做，但不在内核）
+### 5a.2 SDK 层交付物（必做，但不在内核）
 
-| 模块 | 说明 | 启动门 |
-|------|------|--------|
-| 遗忘曲线 SDK | 基于访问频率 + 时间衰减的重要性评分，标记可淘汰记忆（应用层评分 + 触发内核 GC） | Phase 1（GC trait 稳定） |
-| 记忆蒸馏 SDK | 多条细节记忆 → 一条摘要记忆（调用外部 LLM），作为后台异步 job 执行，不阻塞写入事务；蒸馏结果以新元组写入并重新建索引 | Phase 1（可拿 stub 早期并行） |
-| 记忆分层 SDK | 短期（会话内）→ 工作（任务级）→ 长期（持久化）的视图抽象 | Phase 1（GC trait 稳定） |
-
-**Layer 边界说明：**
-- 内核 trait 只暴露 `mark_for_gc(tids) / vacuum_range()` 这类原子能力
-- 评分算法、LLM 调用、分层策略都是 SDK 层，不进内核
+| 模块 | 说明 |
+|------|------|
+| 记忆蒸馏 SDK | 多条细节记忆 → 一条摘要记忆（调用外部 LLM），作为后台异步 job 执行，不阻塞写入事务；蒸馏结果以新元组写入并重新建索引（Phase 5a 拿 stub 早期并行） |
 
 ### 验证标准
 
 - 时序查询性能：100M 时间点，热分区范围查询延迟 < 5ms（SSD，无聚合）；带降采样聚合的查询延迟 < 50ms
 - TTL 正确性：过期数据在后台清理后不可查询，空间可回收
-- 图遍历：百万边规模，3 跳遍历 < 50ms
-- GC 协调：多 AM 环境下无 TID 泄漏，无悬挂索引条目
 - 蒸馏正确性：蒸馏后的摘要记忆可被向量和全文索引正确检索
 
-### Phase 5 对 Agent 团队的价值
+---
 
-- "最近 7 天的所有交互按时间线展示" — 时序查询
-- "用户 A 上周投诉了物流 → 关联到订单 X" — 图遍历
-- 自动遗忘不重要的记忆，避免记忆库无限膨胀
-- 记忆蒸馏：Agent 自动将碎片记忆整合为结构化知识
+## Phase 5b：图 + GC + 遗忘/分层 + Fusion 接入
+
+**目标：补齐关联维度、统一 GC、遗忘/分层，并完成时序/图对 MultiIndexScan 的接入**
+
+**时间估算（1–2 高级 Rust 工程师）：** 乐观 2 个月 / P50 3–4 个月 / 长尾 6 个月
+**风险等级**：🟡 门控多（4a / ≥2 AM / 4b 三道门陆续进）
+
+### 5b.1 内核交付物（必做）
+
+| 模块 | 说明 | 启动门 |
+|------|------|--------|
+| 时间范围查询 | WHERE created_at BETWEEN ... AND ... 自动路由到时序索引 | Phase 4a（planner 路由） |
+| Graph AM（轻量版） | 邻接表存储，支持有向/无向边，边属性（JSONB），3 跳以内 BFS/DFS | Phase 4a（SQL 层就绪） |
+| 图查询语法 | SQL 扩展（LATERAL 递归或类 Cypher 子句） | Phase 4a |
+| 多 AM 统一 GC 协调器 | 统一的 Vacuum 协调：基于 oldest_active_snapshot 推进，回收死元组时通知所有引用该 TID 的索引 | ≥2 个 AM 落地（与 4b 正交） |
+| 图参与 Fusion | 图遍历结果可与向量/全文/结构化联合检索 | Phase 4b（MultiIndexScan 算子） |
+| 时序参与 Fusion | 时序索引加入 MultiIndexScan，支持"最近 7 天 + 语义相似 + 关键词匹配"组合 | Phase 4b |
+
+### 5b.2 SDK 层交付物（必做，但不在内核）
+
+| 模块 | 说明 | 启动门 |
+|------|------|--------|
+| 遗忘曲线 SDK | 基于访问频率 + 时间衰减的重要性评分，标记可淘汰记忆（应用层评分 + 触发内核 GC） | GC 协调器落地（≥2 AM） |
+| 记忆分层 SDK | 短期（会话内）→ 工作（任务级）→ 长期（持久化）的视图抽象 | GC 协调器落地（≥2 AM） |
+
+**Layer 边界说明：**
+- 内核 trait 只暴露 `mark_for_gc(tids) / vacuum_range()` 这类原子能力（由 Phase 5b 的多 AM GC 协调器提供）
+- 评分算法、LLM 调用、分层策略都是 SDK 层，不进内核
+- Graph AM 保持整体在 5b（避免在 SQL 层未定时盲建实现）；若需提前并行，可将"邻接表存储 + 遍历算子"与"SQL/查询语法"拆为 storage / query 两段，storage 段下沉到 5a，但 query 段仍需 4a — 需承担 storage 接口返工风险
+
+### 验证标准
+
+- 图遍历：百万边规模，3 跳遍历 < 50ms
+- GC 协调：多 AM 环境下无 TID 泄漏，无悬挂索引条目
+
+### Phase 5（5a+5b）对 Agent 团队的价值
+
+- "最近 7 天的所有交互按时间线展示" — 时序查询（5a）
+- "用户 A 上周投诉了物流 → 关联到订单 X" — 图遍历（5b）
+- 自动遗忘不重要的记忆，避免记忆库无限膨胀（5b）
+- 记忆蒸馏：Agent 自动将碎片记忆整合为结构化知识（5a stub → 5b 完整）
 
 ---
 
@@ -621,7 +656,8 @@ MultiIndexScan (fusion=hybrid, hard_filter=[btree, inverted], soft_rank=[hnsw])
 | Phase 2c | 语义记忆检索（持久化 + 并发安全） | pgvector / Qdrant |
 | Phase 3 | 关键词记忆检索（BM25 全文） | Elasticsearch / Meilisearch |
 | Phase 4b | **一条 SQL 完成混合召回**（核心 demo） | 应用层多服务拼装 |
-| Phase 5 | 完整记忆生命周期管理 + 时间线 + 图关联 | 自研遗忘/蒸馏逻辑 |
+| Phase 5a | 时序记忆 + 蒸馏 stub（与 2/3/4a 并行交付） | — |
+| Phase 5b | 完整记忆生命周期管理 + 图关联 + 遗忘/分层 | 自研遗忘/蒸馏逻辑 |
 | Phase 6 | 标准协议对外服务 + 多 Agent 隔离 | — |
 | Phase 7 | 生产级部署 | 整套多引擎架构 |
 
