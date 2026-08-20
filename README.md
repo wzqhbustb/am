@@ -1,4 +1,4 @@
-# pg_rust
+# agent memory storage engine
 
 A database kernel written from scratch in Rust — storage engine, MVCC
 transactions, and concurrent B+Tree indexing — built toward a unified
