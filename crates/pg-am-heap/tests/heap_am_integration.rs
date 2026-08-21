@@ -25,7 +25,7 @@ const REL_OID: Oid = Oid(16_384);
 /// `t_xmin = xid`), otherwise "see everything committed".
 fn writer_snapshot(xid: u64) -> Snapshot {
     let mut snap = Snapshot::everything();
-    snap.current_xid = TxnId(xid);
+    snap.set_current_xid(TxnId(xid));
     snap
 }
 

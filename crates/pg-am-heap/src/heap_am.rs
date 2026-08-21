@@ -45,7 +45,7 @@
 //! # `t_xmin` stamping (Stage K, coding-plan Stage K row 3)
 //!
 //! `insert` / `update` overwrite the tuple header's fixed `t_xmin` field
-//! (offset 0..8, §三) with `snapshot.current_xid` before the tuple bytes
+//! (offset 0..8, §三) with `snapshot.current_xid()` before the tuple bytes
 //! reach the WAL record or the page. This is the one sanctioned exception to
 //! "the AM treats tuples as opaque bytes" — it touches only the fixed header
 //! field, never column data — and it closes the Stage J P2 #2 hole where a
@@ -542,7 +542,7 @@ impl HeapAM {
     /// `tid`'s slot (under the page write latch the caller holds) and decide
     /// whether the caller may stamp the tuple.
     ///
-    /// `self_xid` is the writer's own XID (`snapshot.current_xid`) — the
+    /// `self_xid` is the writer's own XID (`snapshot.current_xid()`) — the
     /// row-lock identity. A `t_xmax` naming `self_xid` is a self-conflict:
     /// the caller already locked/deleted/updated this row version inside its
     /// own transaction and simply proceeds (never waits on itself).
@@ -697,13 +697,15 @@ impl HeapAM {
                     //   set, so observing not-active orders us after the
                     //   terminal write — re-reading the CLOG now yields the
                     //   terminal state, which the match below handles.
-                    // - The stamper CRASHED (post-recovery; recovery-end
-                    //   ATT abort marking is still open, §11.3): the CLOG
-                    //   re-read still says InProgress. WAL replay rebuilt
-                    //   every durable commit's bit, so this means "never
-                    //   committed" — treat the stamp as aborted (Proceed).
-                    //   Waiting would spin forever on a transaction that
-                    //   can never end.
+                    // - The stamper CRASHED: recovery undo (Stage S
+                    //   `HeapUndoHandler`) stamps every ATT member
+                    //   Aborted in the CLOG, so post-recovery this branch
+                    //   is defensive only — the re-read normally yields
+                    //   Aborted. If an InProgress stamp survives anyway,
+                    //   WAL replay has rebuilt every durable commit's
+                    //   bit, so it means "never committed" — treat it as
+                    //   aborted (Proceed). Waiting would spin forever on
+                    //   a transaction that can never end.
                     state = clog.get_state(xmax);
                 }
                 None => return Err(HeapError::TupleNotFound(tid)), // legacy mode
@@ -922,8 +924,8 @@ impl HeapAM {
 
     /// Acquire the §9.1 row lock on the tuple at `tid` WITHOUT deleting it
     /// (M2c Stage P: `SELECT ... FOR UPDATE`): stamps
-    /// `t_xmax = snapshot.current_xid` with [`HEAP_XMAX_LOCK_ONLY`] set and
-    /// `t_cid = snapshot.curcid`.
+    /// `t_xmax = snapshot.current_xid()` with [`HEAP_XMAX_LOCK_ONLY`] set and
+    /// `t_cid = snapshot.curcid()`.
     ///
     /// Same 5-step protocol as delete/update: an INVALID/self/terminal
     /// stamp is (re)acquired immediately under the page write latch; a
@@ -947,7 +949,7 @@ impl HeapAM {
         snapshot: &Snapshot,
         clog: &dyn ClogAccessor,
     ) -> Result<()> {
-        let self_xid = snapshot.current_xid;
+        let self_xid = snapshot.current_xid();
         debug_assert!(
             self_xid != TxnId::INVALID,
             "lock_tuple with INVALID current_xid would stamp a no-op lock"
@@ -971,7 +973,7 @@ impl HeapAM {
             match gate {
                 RowLockGate::Proceed => {
                     let page = as_page_mut(&mut guard);
-                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, false)?;
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid(), false)?;
                     return Ok(());
                 }
                 RowLockGate::ProceedNoStamp => {
@@ -1004,7 +1006,7 @@ impl HeapAM {
         snapshot: &Snapshot,
         clog: &dyn ClogAccessor,
     ) -> Result<()> {
-        let self_xid = snapshot.current_xid;
+        let self_xid = snapshot.current_xid();
         debug_assert!(
             self_xid != TxnId::INVALID,
             "lock_tuple_shared with INVALID current_xid would stamp a no-op lock"
@@ -1027,7 +1029,7 @@ impl HeapAM {
                     // becomes mine and the gate reset the holder registry
                     // to just me.
                     let page = as_page_mut(&mut guard);
-                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid, true)?;
+                    Self::stamp_lock_only(page, tid, self_xid, snapshot.curcid(), true)?;
                     return Ok(());
                 }
                 RowLockGate::ProceedNoStamp => {
@@ -1263,12 +1265,12 @@ impl AccessMethod for HeapAM {
         // every scan forever (`is_effectively_committed` rejects INVALID on
         // sight) — a silent dead row. That is always a caller bug; catch it.
         debug_assert!(
-            snapshot.current_xid != pg_storage::types::TxnId::INVALID,
+            snapshot.current_xid() != pg_storage::types::TxnId::INVALID,
             "heap insert with INVALID current_xid produces an unreadable tuple"
         );
         // Stamp t_xmin with the writer's own XID before the bytes reach the
         // WAL record or the page (see the module docs).
-        let tuple = Self::stamp_xmin(tuple, snapshot.current_xid)?;
+        let tuple = Self::stamp_xmin(tuple, snapshot.current_xid())?;
 
         let needed = tuple.len() + LINE_POINTER_SIZE;
         let mut guard = self.acquire_page_with_room(&rel, needed, PageId::INVALID)?;
@@ -1278,7 +1280,7 @@ impl AccessMethod for HeapAM {
         // add_tuple always appends on a heap page (no Unused slots to recycle),
         // so the slot is known before the mutation — build the WAL record first.
         let slot = SlottedPage::slot_count(page) as u16;
-        let rec = WalRecord::heap_insert(page_id, slot, tuple.clone(), snapshot.current_xid)?;
+        let rec = WalRecord::heap_insert(page_id, slot, tuple.clone(), snapshot.current_xid())?;
         let lsn = self.wal_writer.append(rec)?;
         let actual = SlottedPage::add_tuple(page, &tuple)?;
         debug_assert_eq!(actual, slot, "heap slot prediction diverged from add_tuple");
@@ -1353,7 +1355,7 @@ impl AccessMethod for HeapAM {
 
     fn delete(&self, ctx: DeleteContext<'_>) -> Result<()> {
         let tid = ctx.tid;
-        let xmax = ctx.snapshot.current_xid;
+        let xmax = ctx.snapshot.current_xid();
 
         // §9.1 restart loop: each iteration re-pins the page and re-runs the
         // gate from step 1; only a `Proceed` verdict falls through to the
@@ -1392,7 +1394,7 @@ impl AccessMethod for HeapAM {
             // recovery to choke on.
             let rec = WalRecord::heap_delete(tid, xmax, xmax)?;
             let lsn = self.wal_writer.append(rec)?;
-            Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid, false)?;
+            Self::stamp_deleted(page, tid, xmax, ctx.snapshot.curcid(), false)?;
             stamp_pd_lsn(page, lsn);
             return Ok(());
         }
@@ -1419,7 +1421,7 @@ impl UpdatableAM for HeapAM {
             hot_eligible,
         } = ctx;
         Self::validate_tuple_len(new_tuple)?;
-        let xmax = snapshot.current_xid;
+        let xmax = snapshot.current_xid();
         // Stamp the new version's t_xmin with the writer's own XID (module
         // docs); t_xmax of the old version is stamped by `stamp_deleted`.
         let new_tuple = Self::stamp_xmin(new_tuple, xmax)?;
@@ -1484,7 +1486,7 @@ impl UpdatableAM for HeapAM {
                         old_page,
                         old_tid,
                         xmax,
-                        snapshot.curcid,
+                        snapshot.curcid(),
                         new_tid,
                     )?;
                     let actual = SlottedPage::add_tuple(old_page, &hot_tuple)?;
@@ -1494,7 +1496,7 @@ impl UpdatableAM for HeapAM {
                     let rec =
                         WalRecord::heap_update(old_tid, new_tid, xmax, new_tuple.clone(), xmax)?;
                     let lsn = self.wal_writer.append(rec)?;
-                    Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                    Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid(), true)?;
                     let actual = SlottedPage::add_tuple(old_page, &new_tuple)?;
                     debug_assert_eq!(actual, new_slot);
                     stamp_pd_lsn(old_page, lsn);
@@ -1588,7 +1590,7 @@ impl UpdatableAM for HeapAM {
 
             {
                 let old_page = as_page_mut(&mut old_guard);
-                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid, true)?;
+                Self::stamp_deleted(old_page, old_tid, xmax, snapshot.curcid(), true)?;
                 stamp_pd_lsn(old_page, lsn);
             }
             {
@@ -1615,11 +1617,12 @@ impl Vacuumable for HeapAM {
     /// relies on (pg-storage `analysis` module docs) holds ONLY for
     /// visibility, not for reclamation: a tuple inserted by a crashed
     /// transaction has `t_xmin` whose CLOG entry reads `InProgress` (no
-    /// terminal record exists), so case 1 below does NOT collect it. Such
-    /// orphan tuples are reclaimed only once the crashed XIDs are
-    /// explicitly stamped ABORTED — recovery-end ATT marking is M2c work
-    /// (and vacuum/autovacuum M3); until then they are dead weight but
-    /// never visible.
+    /// terminal record exists), so case 1 below would NOT collect it until
+    /// the crashed XID is explicitly stamped ABORTED. That stamping is
+    /// exactly what Stage S's `HeapUndoHandler` does during recovery undo
+    /// (crates/pg-am-heap/src/undo.rs: every ATT member is marked Aborted
+    /// in the CLOG), so by the time vacuum runs post-recovery, crashed
+    /// inserters read Aborted and case 1 collects their orphans.
     fn scan_dead_tuples(
         &self,
         rel: RelationDesc<'_>,

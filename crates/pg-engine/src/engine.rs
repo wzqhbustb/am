@@ -150,7 +150,7 @@ use pg_storage::wal::record::{HeapDeleteRecord, HeapUpdateRecord, WalRecord, Wal
 use pg_storage::wal::WalWriter;
 use pg_txn::{
     is_visible, txn_redo_handlers, ClogAccessor, ClogBuffer, CommitWal, DeadlockDetector,
-    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, TxnManager,
+    DeadlockVictims, LockManager, LockMode, RowWaiter, Snapshot, SnapshotGuard, TxnManager,
 };
 
 use crate::error::{EngineError, Result};
@@ -447,6 +447,13 @@ pub struct TxnHandle {
     txn: Arc<TxnManager>,
     xid: Option<TxnId>,
     snapshot: RefCell<Snapshot>,
+    /// Keeps the snapshot's `xmin` registered in the vacuum-horizon
+    /// registry for the handle's whole lifetime (M3 Stage A, §3.3): dropped
+    /// — and thus unregistered — when the handle is consumed by
+    /// `commit`/`abort` or auto-aborted by `Drop` (field drops run after
+    /// `Drop::drop`, so the best-effort abort still sees the registration;
+    /// either order would be correct). Never read — RAII only.
+    _snapshot_guard: SnapshotGuard,
     /// Identity of the creating engine (see `NEXT_ENGINE_INSTANCE_ID`).
     instance_id: u64,
     /// Shared with the engine: table locks are keyed by XID, so commit /
@@ -950,7 +957,7 @@ impl Engine {
         // it fixes the DDL lock mode by construction and covers the
         // catalog-row writes like any other DDL.
         let first_page = self.auto_commit(|snap| {
-            self.lock_oid(snap.current_xid, oid, LockMode::AccessExclusive)?;
+            self.lock_oid(snap.current_xid(), oid, LockMode::AccessExclusive)?;
             self.create_table_inner(snap, oid, name, schema)
         });
         match first_page {
@@ -1070,7 +1077,7 @@ impl Engine {
             // AccessExclusive (§9.2): blocks — and is blocked by — every
             // other lock mode on this table, so a DROP waits for in-flight
             // readers/writers and new ones queue behind it (M2c Stage P).
-            self.lock_table(snap.current_xid, &entry, LockMode::AccessExclusive)?;
+            self.lock_table(snap.current_xid(), &entry, LockMode::AccessExclusive)?;
             self.drop_table_inner(snap, name, &entry)?;
             // Remove BEFORE commit releases the lock (see the fn docs).
             self.registry.write().remove(name);
@@ -1092,7 +1099,7 @@ impl Engine {
             Some(Datum::Int8(0)),
             Some(Datum::Int8(HEAP_AM_OID.0 as i64)),
         ];
-        let header = tuple_header(snap.curcid);
+        let header = tuple_header(snap.curcid());
         let new_tuple = encode_tuple(header, &columns, &class_row)?;
         self.ensure_catalog_room(&PG_CLASS, new_tuple.len())?;
         self.heap.update(UpdateContext {
@@ -1191,15 +1198,16 @@ impl Engine {
         // "leak, never corruption" policy.
         let col_types = column_types(&entry);
         let meta_page = self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::Exclusive)?;
+            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::Exclusive)?;
             // Re-take the snapshot AFTER the lock wait (M2c Stage P
             // review): `auto_commit`'s snapshot was taken before we queued
             // on Exclusive, so a writer we blocked behind would be stuck in
             // its `xip` and its rows would silently never enter the index.
             // The lock guarantees no writer can be in flight now, so a
             // fresh snapshot sees exactly the committed contents the index
-            // must cover.
-            let mut snap = self.txn.snapshot(snap.current_xid);
+            // must cover. `_re_guard` keeps the re-snapshot registered
+            // until this auto-commit closure ends (M3 Stage A, §3.3).
+            let (mut snap, _re_guard) = self.txn.snapshot(snap.current_xid());
             snap.advance_curcid();
 
             // Collect (key_bytes, tid) from a full heap scan (M2b: simple
@@ -1401,7 +1409,8 @@ impl Engine {
     /// Takes no table lock, for the same reason as [`Engine::scan`] (no
     /// owning transaction; M2c Stage P).
     pub fn index_lookup(&self, table: &str, column: &str, key: &Datum) -> Result<Option<Tid>> {
-        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        // `_guard`: registered for this call frame (M3 Stage A, §3.3).
+        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
         snap.advance_curcid();
         let index = self.btree_index(table, column)?;
         let key_bytes = encode_key(key)?;
@@ -1519,7 +1528,7 @@ impl Engine {
     /// (NULL keys are skipped, matching `create_index`).
     pub fn insert(&self, table: &str, values: &[Value]) -> Result<Tid> {
         self.auto_commit(|snap| {
-            let entry = self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            let entry = self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.insert_inner(snap, &entry, values)
         })
     }
@@ -1530,7 +1539,7 @@ impl Engine {
     /// redundant recursive `registry.read()` per row.
     fn insert_inner(&self, snap: &Snapshot, entry: &TableEntry, values: &[Value]) -> Result<Tid> {
         let col_types = column_types(entry);
-        let tuple = encode_row(entry, &col_types, values, snap.curcid)?;
+        let tuple = encode_row(entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(entry);
         let mut out_tid = Tid {
             page_id: PageId::INVALID,
@@ -1546,7 +1555,7 @@ impl Engine {
             if let Some(datum) = &values[*col_index] {
                 let key = encode_key(datum)?;
                 self.open_btree(idx)?.insert(&key, out_tid)?;
-                self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+                self.record_index_undo(snap.current_xid(), idx, key, out_tid, IndexUndoOp::Inserted);
             }
         }
         Ok(out_tid)
@@ -1568,7 +1577,8 @@ impl Engine {
         table: &str,
         predicate: Option<Predicate>,
     ) -> Result<Vec<(Tid, Vec<Value>)>> {
-        let mut snap = self.txn.snapshot(TxnId::INVALID);
+        // `_guard`: registered for this call frame (M3 Stage A, §3.3).
+        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
         snap.advance_curcid();
         self.scan_inner(&snap, table, predicate.as_ref())
     }
@@ -1601,7 +1611,7 @@ impl Engine {
     /// are skipped on both sides.
     pub fn update(&self, table: &str, tid: Tid, values: &[Value]) -> Result<Tid> {
         self.auto_commit(|snap| {
-            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.update_inner(snap, table, tid, values)
         })
     }
@@ -1615,7 +1625,7 @@ impl Engine {
     ) -> Result<Tid> {
         let entry = self.table_entry(table)?;
         let col_types = column_types(&entry);
-        let tuple = encode_row(&entry, &col_types, values, snap.curcid)?;
+        let tuple = encode_row(&entry, &col_types, values, snap.curcid())?;
         let indexes = self.indexes_of(&entry);
         let old_values = if indexes.is_empty() {
             Vec::new()
@@ -1658,7 +1668,7 @@ impl Engine {
                     let key = encode_key(old_datum)?;
                     index.delete(&key, index_tid)?;
                     self.record_index_undo(
-                        snap.current_xid,
+                        snap.current_xid(),
                         idx,
                         key,
                         index_tid,
@@ -1668,7 +1678,7 @@ impl Engine {
                 if let Some(new_datum) = &values[*col_index] {
                     let key = encode_key(new_datum)?;
                     index.insert(&key, out_tid)?;
-                    self.record_index_undo(snap.current_xid, idx, key, out_tid, IndexUndoOp::Inserted);
+                    self.record_index_undo(snap.current_xid(), idx, key, out_tid, IndexUndoOp::Inserted);
                 }
             }
         }
@@ -1686,7 +1696,7 @@ impl Engine {
     /// table already disagreed). NULL keys are skipped.
     pub fn delete(&self, table: &str, tid: Tid) -> Result<()> {
         self.auto_commit(|snap| {
-            self.lock_table_entry(snap.current_xid, table, LockMode::RowExclusive)?;
+            self.lock_table_entry(snap.current_xid(), table, LockMode::RowExclusive)?;
             self.delete_inner(snap, table, tid)
         })
     }
@@ -1718,7 +1728,7 @@ impl Engine {
                 let key = encode_key(old_datum)?;
                 self.open_btree(idx)?.delete(&key, index_tid)?;
                 self.record_index_undo(
-                    snap.current_xid,
+                    snap.current_xid(),
                     idx,
                     key,
                     index_tid,
@@ -2024,11 +2034,12 @@ fn first_record_lsn_in_segment(
     /// release everything (`LockManager::release_all`).
     pub fn begin_txn(&self) -> Result<TxnHandle> {
         let xid = self.txn.begin_txn();
-        let snapshot = self.txn.snapshot(xid);
+        let (snapshot, snapshot_guard) = self.txn.snapshot(xid);
         Ok(TxnHandle {
             txn: Arc::clone(&self.txn),
             xid: Some(xid),
             snapshot: RefCell::new(snapshot),
+            _snapshot_guard: snapshot_guard,
             instance_id: self.instance_id,
             lock_manager: Arc::clone(&self.lock_manager),
             index_undo: Arc::clone(&self.index_undo),
@@ -2102,7 +2113,7 @@ fn first_record_lsn_in_segment(
             } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let mut count = 0;
                     for row in &rows {
                         let values = build_insert_values(&entry, &columns, row)?;
@@ -2127,7 +2138,11 @@ fn first_record_lsn_in_segment(
                     // (see its doc). MVCC makes the read consistent; a
                     // racing DROP TABLE is the documented DDL-vs-DML gap.
                     None => {
-                        let mut snap = self.txn.snapshot(TxnId::INVALID);
+                        // `_guard` registers this lock-free reader's
+                        // snapshot for the duration of the statement
+                        // (M3 Stage A, §3.1/§3.3 — the exact hole the
+                        // registry closes).
+                        let (mut snap, _guard) = self.txn.snapshot(TxnId::INVALID);
                         snap.advance_curcid();
                         self.exec_select(&snap, &columns, &table, &filter, &order_by, &limit, false, false)
                     }
@@ -2138,14 +2153,14 @@ fn first_record_lsn_in_segment(
                     // statement-level FOR UPDATE's locks die with the
                     // statement).
                     Some(LockClause::ForUpdate) => self.auto_commit(|snap| {
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, false)
                     }),
                     // FOR SHARE (Stage S multixact lite): stamps a shared
                     // row lock (HEAP_XMAX_LOCK_ONLY + HEAP_XMAX_IS_SHARE).
                     // The row stays visible to all snapshots.
                     Some(LockClause::ForShare) => self.auto_commit(|snap| {
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                         self.exec_select(snap, &columns, &table, &filter, &order_by, &limit, true, true)
                     }),
                 }
@@ -2157,7 +2172,7 @@ fn first_record_lsn_in_segment(
             } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -2173,7 +2188,7 @@ fn first_record_lsn_in_segment(
             Statement::Delete { table, filter } => {
                 let count = self.auto_commit(|snap| {
                     let entry =
-                        self.lock_table_entry(snap.current_xid, &table, LockMode::RowExclusive)?;
+                        self.lock_table_entry(snap.current_xid(), &table, LockMode::RowExclusive)?;
                     let pred = filter.as_ref().map(|f| filter_to_predicate(&entry, f)).transpose()?;
                     let rows = self.scan_inner(snap, &table, pred.as_ref())?;
                     let mut count = 0;
@@ -2287,7 +2302,7 @@ fn first_record_lsn_in_segment(
     /// stamped with a lock-only `t_xmax` via [`HeapAM::lock_tuple`] BEFORE
     /// projection — locking after LIMIT matches PG (only returned rows are
     /// locked). The caller must have already taken the statement's table
-    /// lock, and `snap.current_xid` must be a real transaction XID (auto-
+    /// lock, and `snap.current_xid()` must be a real transaction XID (auto-
     /// commit FOR UPDATE runs inside `auto_commit` for exactly this
     /// reason); the locks are released when that transaction ends.
     ///
@@ -2401,7 +2416,14 @@ fn first_record_lsn_in_segment(
     /// applies rather than a best-effort cleanup that might make it worse.
     fn auto_commit<T>(&self, op: impl FnOnce(&Snapshot) -> Result<T>) -> Result<T> {
         let xid = self.txn.begin_txn();
-        let mut snap = self.txn.snapshot(xid);
+        // `_snap_guard` unregisters the snapshot at the end of this frame
+        // on BOTH the success and the failure path (M3 Stage A, §3.3). A
+        // panic in `op` still runs the guard's Drop during unwinding (the
+        // default panic policy), so the snapshot unregisters normally; only
+        // panic=abort or mem::forget would skip it — the documented O1
+        // semantics (horizon pinned low, vacuum degrades to no-reclaim,
+        // safe), matching this function's existing panic policy below.
+        let (mut snap, _snap_guard) = self.txn.snapshot(xid);
         snap.advance_curcid();
         match op(&snap) {
             Ok(v) => {
@@ -2439,7 +2461,7 @@ fn first_record_lsn_in_segment(
         row: &[Value],
     ) -> Result<()> {
         let columns = def.column_types();
-        let tuple = encode_tuple(tuple_header(snap.curcid), &columns, row)?;
+        let tuple = encode_tuple(tuple_header(snap.curcid()), &columns, row)?;
         self.ensure_catalog_room(def, tuple.len())?;
         self.heap.insert(InsertContext {
             rel: RelationDesc {
@@ -2617,6 +2639,15 @@ fn first_record_lsn_in_segment(
     /// later DDL on those tables wedges.
     pub fn txn_manager(&self) -> &TxnManager {
         &self.txn
+    }
+
+    /// The vacuum horizon: smallest `xmin` among all live registered
+    /// snapshots, or the XID clock's current value when no snapshot is
+    /// registered (M3 Stage A, tech-selection §3.3). Passthrough to
+    /// [`TxnManager::oldest_snapshot_xmin`] for §6.2 introspection and the
+    /// upcoming `Engine::vacuum`.
+    pub fn oldest_snapshot_xmin(&self) -> TxnId {
+        self.txn.oldest_snapshot_xmin()
     }
 
     /// The table lock manager (testing / observability, M2c Stage P):

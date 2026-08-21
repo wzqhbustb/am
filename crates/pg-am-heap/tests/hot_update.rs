@@ -59,7 +59,7 @@ fn rel(first_page: PageId) -> RelationDesc<'static> {
 
 fn writer_snapshot(xid: TxnId) -> Snapshot {
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     snap
 }
 

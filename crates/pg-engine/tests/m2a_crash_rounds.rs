@@ -342,7 +342,7 @@ fn drive_back_door_txns(engine: &Engine) -> Vec<(TxnId, TxnState)> {
     for (id, commit) in [(9_000_001, true), (9_000_002, false)] {
         let xid = engine.txn_manager().begin_txn();
         let mut snap = Snapshot::everything();
-        snap.current_xid = xid;
+        snap.set_current_xid(xid);
         let tuple = encode_tuple(
             TupleHeader::new(
                 TxnId::INVALID,

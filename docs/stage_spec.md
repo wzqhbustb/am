@@ -713,6 +713,47 @@ Prepare 已经把左页标 `SPLIT_INCOMPLETE`、右页初始化完毕，Copy 可
 - torn-tail 的 header 无自 CRC（payload_len 被 bit-rot 放大的残余误截窗口）→ 结构性修复归后续（PG xl_crc 模式）
 - `btpo_prev` 陈旧链（prev 恒指最旧左页）已从"纯文档"升级为被 `nearest_nonempty_left` 实际依赖提示——残余窗口（左侧全空时的 TOCTOU）有 validate 全链检查兜底 → 后续 stage 评估 prev 维护
 - 叶页死空间不回收（churn 分裂放大器）→ 压实/合并归 M2c+/vacuum(M3)
+- **已知 flaky（M3 Stage A 期间发现，预存）**：`btree_concurrent` 套件在 release 下存在间歇性失败。观测记录：早期实测 15 跑出现 **5 个不同测试** flaky（`concurrent_disjoint_inserts_all_found` 丢 key 0 占 2/15，疑 root split 路径丢失更新）；边界落位修复（乱序治理）后复测 15 跑仅 `concurrent_duplicate_keys_lookup_all` 失败 1 次——说明多数 flaky 与该修复同源，但**仍有残余**。干净 HEAD worktree 复跑可复现，零依赖 pg-txn，非 Stage A 回归 → 单开修复会话处理（重点：剩余重复键并发路径），未阻塞 Stage A 收口
 - 所有性能 P 类未达标项的根治（batch commit、O_DIRECT、io_uring）→ Phase 7b
+
+---
+
+## Stage A（M3）：快照注册表 + horizon
+
+**状态**：✅ 完成（debug 全量 636 绿 + clippy/loom-check 全绿；S2 性能验收通过）
+**工期**：预估 3–4 天
+**验收**：六路径注册覆盖 / 泄漏自由 / horizon 并发与原子性专项 / 100 线程 churn 全部带 watchdog 落地；**性能（S2 协议，5×300s 取均值）：87.2 txn/s vs M2c 基线 86.8（+0.5%，噪声界 ±3% 内，无统计显著回归）——注册开销不可测，R2 通过**
+
+### 交付内容
+
+1. **注册与构造原子化（B1，tech-selection §3.3 v1.3）**
+   - `TxnManager` 新增 `TxnShared { active, snapshot_xmins: BTreeMap<TxnId, usize> }`（xmin → 引用计数），active set 与 registry 合并进**同一把锁**（`crates/pg-txn/src/manager.rs`）；`snapshot()` 在读取 active set + XID clock 的**同一临界区**完成 xmin 注册，签名改为 `snapshot(current_xid) -> (Snapshot, SnapshotGuard)`，guard `Drop` 减计数、归零删键
+   - caller-wrapper（先构造后注册）形态按 B1 否决，反例（U xid=15 未注册 → vacuum 取空 registry horizon → 删除者提交 → U 必见行被回收）写入 `snapshot()` 的 doc
+2. **反枚举护栏（v1.4 口径）**
+   - `Snapshot` 五个字段收为 `pub(crate)`；外部读取走访问器（`xmin()/xmax()/xip()/current_xid()/curcid()`），engine.rs 约 21 处与 heap_am.rs 17 处字段访问随迁
+   - `Snapshot::everything()` 保持 pub，是明确的**不注册**特例（目录引导 `Engine::open` + 测试路径）；doc 明示 xmin=0 注册即 horizon 钉死
+   - pg-txn 集成测试的全字段构造走 `#[doc(hidden)] Snapshot::new_unregistered`（crate 内实现，CI grep 不拦）；测试/bench 的 writer 场景改造用 `set_current_xid`/`set_curcid`
+   - 计数断言：`TxnManager::live_registered_snapshots()`（AtomicUsize 镜像）== registry 引用计数和（静息点断言，`snapshot_registry.rs` / `m3_snapshot_coverage.rs`）
+   - CI grep（loom job）：`Snapshot[[:space:]]*\{` 字面构造（豁免"整行即 `-> Snapshot {` 签名"）与 `impl Snapshot` 块均禁止出现在 `crates/pg-txn` 之外；模式只用 POSIX 字符类（`\b`/`\s` 在 BSD grep 下静默失效——设计终审发现原护栏从未真正生效，已修复并做正反注入验证：现状绿、注入 crate 外字面构造被拦）
+3. **六调用点适配**：`begin_txn`（guard 随 `TxnHandle`，commit/abort/Drop 注销）、`auto_commit`（`_snap_guard` 绑到帧尾，成功与失败两路径都注销）、`create_index` re-snapshot（`_re_guard` 随外层闭包）、纯 SELECT / `Engine::scan` / `Engine::index_lookup`（guard 随调用帧）
+4. **horizon API**：`TxnManager::oldest_snapshot_xmin()`（registry 最小键；registry 空则取 **active set 最小 XID**——覆盖 begin→snapshot 窗口的结构性修正（review P2，PG OldestXmin 同构：backend xid 与快照 xmin 都参与水位）；二者皆空才取 `txn_id_clock.current()`）+ `Engine::oldest_snapshot_xmin()` 透传
+5. **panic 语义（O1 决定：不加护栏）**：默认 unwind 策略下 panic **会**执行 guard 的 `Drop`，快照正常注销、horizon 不受影响；仅 `panic=abort`/`mem::forget` 跳过 Drop → horizon 永久偏低（vacuum 退化为不回收，安全但失效），与 `auto_commit` 既有 panic 策略代价一致。写入 `SnapshotGuard` 与 `auto_commit` 的 doc（review F1 修正：初版误写为"panic 跳过 Drop"，与 unwind 实际行为相反）
+6. **测试**：`pg-txn/tests/snapshot_registry.rs`（注册/注销/引用计数、空 registry→clock horizon、horizon=min key、everything() 不注册、并发注册注销无漂移、**B1 原子性专项**——horizon 永不越过任一已返回未销毁快照的 xmin）；`pg-engine/tests/m3_snapshot_coverage.rs`（六路径注册覆盖、auto_commit 失败路径与 TxnHandle::Drop 泄漏自由、**auto-commit DML 快照先于锁等待注册**（v1.4 路径）、100 线程 churn 归零）；全部并发用例带 watchdog
+
+### 与 PG 的 trade-off
+
+| 维度 | PG | 本实现 | 取舍 |
+|---|---|---|---|
+| 快照登记 | 每后端 ProcArray 自有槽位，无共享锁 | 全局单 mutex 的 `BTreeMap` registry | 临界区变长是新共享热点（§11 R2）；S2 判定无统计显著回归则维持，超标备选分片 registry（xmin 聚合仍取全局 min） |
+| horizon | OldestXmin 综合 backend xid / KnownAssignedXids 等多源 | registry 最小键；空取 XID clock 当前值 | 单源语义更简单；安全论证靠 XID 单调性（§3.3 v1.2 重写版），不允许改回"集合包含"式 |
+| panic 路径 | 后端退出即清理 proc 条目 | unwind 会执行 guard Drop 正常注销；仅 panic=abort/forget 使 horizon 永久偏低 | 决定（§11 O1）：与 auto_commit 既有 panic 泄漏 XID/锁的进程级失败策略代价一致，不加护栏（review F1 修正了初版的错误描述） |
+
+### 已知残留与后续归队
+
+- registry 全局单锁在高并发短查询下是共享热点（§11 R2）→ **S2 已判定通过**（87.2 vs 86.8，噪声界内；数字见 `docs/phase1-m2-benchmarks.md` 基线条目与本文"验收"行）；分片 registry 备选保留
+- panic 泄漏 horizon 无护栏（已决定的语义）→ 若未来改进程级 panic 策略需重估
+- `#[doc(hidden)] Snapshot::new_unregistered` / `set_current_xid` / `set_curcid` 是全字段构造/改写逃生口（供 pg-txn 集成测试与 AM 测试）；CI grep 只拦 crate 外的构造，crate 内新增关联构造函数靠 review 把关
+- horizon 自省目前仅 API（`oldest_snapshot_xmin()`）；§6.2 的指标暴露归 Stage E（可观测性）
+- vacuum 本体（取 horizon 一次、全程使用）归 Stage C/D
 
 ---

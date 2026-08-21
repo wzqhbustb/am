@@ -111,7 +111,7 @@ fn setup() -> Fixture {
 fn mixed_unit(mgr: &TxnManager, clog: &dyn ClogAccessor, heap: &HeapAM, first_page: PageId, i: i32) {
     let xid = mgr.begin_txn();
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
 
     let mut tid = Tid {
         page_id: PageId::INVALID,

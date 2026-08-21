@@ -108,7 +108,7 @@ fn encode_row(xid: TxnId, id: i32, name: &str) -> Vec<u8> {
 
 fn snap_for(xid: TxnId) -> Snapshot {
     let mut snap = Snapshot::everything();
-    snap.current_xid = xid;
+    snap.set_current_xid(xid);
     snap
 }
 
